@@ -1,0 +1,22 @@
+# notebooks
+.ipynb_checkpoints/
+
+# data / outputs
+data/
+dataset/
+runs/
+targets_debug/
+
+# python
+__pycache__/
+*.pyc
+
+# large artifacts
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.tar.gz
+*.zip

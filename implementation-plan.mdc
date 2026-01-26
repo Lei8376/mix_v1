@@ -1,0 +1,66 @@
+# Implementation Plan
+
+## Phase 1: Core Implementation (Complete)
+
+1. Define dataset wrapper and config interfaces. Status: Done
+Summary:
+- Added OpenVocabScannetDataset wrapper with collate function.
+- Established dataclass configs for dataset, model, trainer.
+
+2. Implement open-vocabulary fusion model. Status: Done
+Summary:
+- Created OpenVocab3DFusionModel that fuses LSeg pixel + ODISE mask embeddings.
+- Added gated fusion network (ODISEPixelMaskFusionNet) and normalized similarity.
+
+3. Add trainer and training entrypoint. Status: Done
+Summary:
+- Created OpenVocabTrainer with BCE+Dice loss, gradient clipping, logging.
+- Added train_open_vocab.py with YAML/CLI configuration.
+
+## Phase 2: Training Pipeline Optimization (Complete)
+
+4. Create precompute script for 2D features. Status: Done
+Summary:
+- Added scripts/precompute_2d_features.py to extract LSeg + ODISE features offline.
+- Saves masks (bool), embeddings (float16), and metadata to .npz files.
+
+5. Update dataset to load precomputed features. Status: Done
+Summary:
+- Created dataset/open_vocab_dataset_v2.py with precomputed feature support.
+- Falls back to online extraction if precomputed features not found.
+
+6. Enhance trainer with AMP, validation, resumption. Status: Done
+Summary:
+- Created trainer/open_vocab_trainer_v2.py with mixed precision (AMP).
+- Added validation loop with IoU/accuracy metrics, checkpoint resumption.
+- Added learning rate warmup, early stopping, detailed logging.
+
+7. Create optimized training entrypoint. Status: Done
+Summary:
+- Created train_open_vocab_v2.py with full configuration support.
+- Supports both precomputed and online feature extraction modes.
+
+## Usage
+
+### Step 1: Precompute 2D Features (Recommended)
+```bash
+python scripts/precompute_2d_features.py \
+    --data-config-path /path/to/config.yaml \
+    --output-dir /path/to/precomputed_2d
+```
+
+### Step 2: Train with Precomputed Features
+```bash
+python train_open_vocab_v2.py \
+    --precomputed-dir /path/to/precomputed_2d \
+    --num-epochs 50 \
+    --batch-size 4
+```
+
+### Step 3 (Alternative): Train with Online Extraction
+```bash
+python train_open_vocab_v2.py \
+    --label-path lang_seg/label_files/ade20k_objectInfo150.txt \
+    --lseg-ckpt-path lang_seg/checkpoints/demo_e200.ckpt \
+    --odise-model-config-path Panoptic/odise_caption_coco_50e.py
+```
