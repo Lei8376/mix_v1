@@ -18,9 +18,7 @@ from mask2former.modeling.transformer_decoder.mask2former_transformer_decoder im
 from .pc_net import PC_Processor, PC_Binary_Processor
 
 from lang_seg import lseg_feature as lf
-from ODISE import odise_feature as of
-from dataset import data_loader as dl
-
+# ODISE 仅在 MaskStablePixle 中使用；V2 用预计算 npz 时不加载，避免 ModuleNotFoundError: odise
 from torch import nn
 from torch.nn import functional as F
 
@@ -28,6 +26,7 @@ from torch.nn import functional as F
 class MaskStablePixle(nn.Module): 
     def __init__(self, lsg_label_path, lsg_ckpt_path, odise_model_config_path, threshold=0.5, device="cuda"):
         super(MaskStablePixle, self).__init__()
+        from ODISE import odise_feature as of
         self.lsg_label_path = lsg_label_path
         self.lsg_ckpt_path = lsg_ckpt_path
         self.threshold = threshold
@@ -295,30 +294,36 @@ class ODISEPixelMaskFusionNet(nn.Module):
 
     def forward(self, pixel_embed, mask_embed, masks, valid_mask):
         """
+        pixel_embed: either (B, H, W, Cp) pixel-level features, or (B, K, Cp) pre-pooled per-mask features.
         Returns:
             fused_embed: (B, K, C_out)
         """
-        assert pixel_embed.dim() == 4, "pixel_embed must be (B,H,W,C)"
         assert mask_embed.dim() == 3, "mask_embed must be (B,K,C)"
         assert masks.dim() == 4, "masks must be (B,K,H,W)"
         assert valid_mask.dim() == 2, "valid_mask must be (B,K)"
 
-        B, H, W, Cp = pixel_embed.shape
         Bm, K, Hm, Wm = masks.shape
-        assert B == Bm, "batch size must match"
-        
-        # Resize masks to match pixel feature resolution if needed
-        if H != Hm or W != Wm:
-            masks = F.interpolate(masks, size=(H, W), mode='bilinear', align_corners=False)
 
         mask_tokens = self.mask_proj(mask_embed)  # (B,K,C_out)
 
-        # Aggregate pixel features per mask (mask-dominant fusion)
-        weights = masks.float() * valid_mask.unsqueeze(-1).unsqueeze(-1).float()
-        denom = weights.sum(dim=(-1, -2)).clamp_min(1.0)  # (B,K)
-        pixel_flat = pixel_embed.view(B, H * W, Cp)
-        weights_flat = weights.view(B, K, H * W)
-        pixel_pooled = torch.matmul(weights_flat, pixel_flat) / denom.unsqueeze(-1)  # (B,K,Cp)
+        if pixel_embed.dim() == 4:
+            # Pixel-level (B,H,W,Cp): aggregate per mask then project
+            B, H, W, Cp = pixel_embed.shape
+            assert B == Bm, "batch size must match"
+            if H != Hm or W != Wm:
+                masks = F.interpolate(masks, size=(H, W), mode='bilinear', align_corners=False)
+            weights = masks.float() * valid_mask.unsqueeze(-1).unsqueeze(-1).float()
+            denom = weights.sum(dim=(-1, -2)).clamp_min(1.0)  # (B,K)
+            pixel_flat = pixel_embed.view(B, H * W, Cp)
+            weights_flat = weights.view(B, K, H * W)
+            pixel_pooled = torch.matmul(weights_flat, pixel_flat) / denom.unsqueeze(-1)  # (B,K,Cp)
+        elif pixel_embed.dim() == 3:
+            # Pre-pooled (B,K,Cp): skip aggregation, only project (e.g. from run_all_pixel_pooled npz)
+            assert pixel_embed.shape[:2] == (Bm, K), "pixel_embed (B,K,Cp) must match masks batch and K"
+            pixel_pooled = pixel_embed
+        else:
+            raise AssertionError("pixel_embed must be (B,H,W,C) or (B,K,C)")
+
         pixel_tokens = self.pixel_proj(pixel_pooled)  # (B,K,C_out)
 
         gate = torch.sigmoid(self.gate(torch.cat([mask_tokens, pixel_tokens], dim=-1)))
@@ -326,8 +331,6 @@ class ODISEPixelMaskFusionNet(nn.Module):
         fused = self.refine(fused)
 
         fused = fused * valid_mask.unsqueeze(-1).float()
-        #fused = F.normalize(fused, dim=1)
-        #print(fused.shape)
         return fused
 
 

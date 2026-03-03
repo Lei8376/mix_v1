@@ -20,3 +20,36 @@ __pycache__/
 *.tar
 *.tar.gz
 *.zip
+
+# training outputs
+runs/
+**/runs/
+output/
+outputs/
+log/
+logs/
+tb/
+tensorboard/
+wandb/
+
+# checkpoints / weights
+checkpoints/
+**/checkpoints/
+ODISE/checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.engine
+
+# caches
+__pycache__/
+*.pyc
+.cache/
+.DS_Store
+
+# large arrays
+*.npz
+*.npy
+*.pkl

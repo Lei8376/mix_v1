@@ -18,7 +18,8 @@ from detectron2.data.datasets.builtin_meta import COCO_CATEGORIES
 from detectron2.evaluation import inference_context
 from detectron2.utils.env import seed_all_rng
 from detectron2.utils.visualizer import ColorMode, Visualizer, random_color
-from mask2former.data.datasets.register_ade20k_panoptic import ADE20K_150_CATEGORIES
+# Delay import to avoid circular dependency
+# from mask2former.data.datasets.register_ade20k_panoptic import ADE20K_150_CATEGORIES
 
 from odise import model_zoo
 from odise.checkpoint import ODISECheckpointer
@@ -46,26 +47,55 @@ COCO_STUFF_CLASSES = [
 ]
 COCO_STUFF_COLORS = [c["color"] for c in COCO_CATEGORIES if c["isthing"] == 0]
 
+# Lazy load ADE categories to avoid circular import
+def _get_ade_categories():
+    try:
+        from mask2former.data.datasets.register_ade20k_panoptic import ADE20K_150_CATEGORIES
+        return ADE20K_150_CATEGORIES
+    except ImportError:
+        # Fallback: create dummy categories
+        return [{"isthing": 1 if i < 75 else 0} for i in range(150)]
+
+_ADE20K_150_CATEGORIES = None
+def get_ade_categories():
+    global _ADE20K_150_CATEGORIES
+    if _ADE20K_150_CATEGORIES is None:
+        _ADE20K_150_CATEGORIES = _get_ade_categories()
+    return _ADE20K_150_CATEGORIES
+
 ADE_THING_CLASSES = [
     label
     for idx, label in enumerate(get_openseg_labels("ade20k_150", True))
-    if ADE20K_150_CATEGORIES[idx]["isthing"] == 1
+    if get_ade_categories()[idx]["isthing"] == 1
 ]
-ADE_THING_COLORS = [c["color"] for c in ADE20K_150_CATEGORIES if c["isthing"] == 1]
+ADE_THING_COLORS = [c["color"] for c in get_ade_categories() if c["isthing"] == 1]
 ADE_STUFF_CLASSES = [
     label
     for idx, label in enumerate(get_openseg_labels("ade20k_150", True))
-    if ADE20K_150_CATEGORIES[idx]["isthing"] == 0
+    if get_ade_categories()[idx]["isthing"] == 0
 ]
-ADE_STUFF_COLORS = [c["color"] for c in ADE20K_150_CATEGORIES if c["isthing"] == 0]
+ADE_STUFF_COLORS = [c["color"] for c in get_ade_categories() if c["isthing"] == 0]
 
 LVIS_CLASSES = get_openseg_labels("lvis_1203", True)
 LVIS_COLORS = list(
     itertools.islice(itertools.cycle([c["color"] for c in COCO_CATEGORIES]), len(LVIS_CLASSES))
 )
 
-SCANNET_20_THINGS_CLASSES = list(SCANNET_LABELS_20)
-SCANNET_20_THINGS_COLOR = [list(x) for x in SCANNET_COLOR_MAP_20.values()]
+# SCANNET_20: 转换为 openseg 格式（双层列表）以匹配 COCO/ADE/LVIS 的格式
+SCANNET_20_STUFF_LABELS = {'wall', 'floor'}  # 背景/材质类别
+SCANNET_20_THINGS_CLASSES = [[label] for label in SCANNET_LABELS_20 if label not in SCANNET_20_STUFF_LABELS]
+SCANNET_20_STUFF_CLASSES = [[label] for label in SCANNET_LABELS_20 if label in SCANNET_20_STUFF_LABELS]
+SCANNET_20_ALL_COLORS = [list(x) for x in SCANNET_COLOR_MAP_20.values() if x != SCANNET_COLOR_MAP_20[0]]
+SCANNET_20_THINGS_COLOR = SCANNET_20_ALL_COLORS[:len(SCANNET_20_THINGS_CLASSES)]
+SCANNET_20_STUFF_COLOR = SCANNET_20_ALL_COLORS[len(SCANNET_20_THINGS_CLASSES):len(SCANNET_20_THINGS_CLASSES)+len(SCANNET_20_STUFF_CLASSES)]
+
+# SCANNET_200: 转换为 openseg 格式
+SCANNET_200_STUFF_LABELS = {'wall', 'floor', 'ceiling', 'door way', 'stairs'}
+SCANNET_200_THINGS_CLASSES = [[label] for label in SCANNET_LABELS_200 if label not in SCANNET_200_STUFF_LABELS]
+SCANNET_200_STUFF_CLASSES = [[label] for label in SCANNET_LABELS_200 if label in SCANNET_200_STUFF_LABELS]
+SCANNET_200_ALL_COLORS = [list(x) for x in SCANNET_COLOR_MAP_200.values() if x != SCANNET_COLOR_MAP_200[0]]
+SCANNET_200_THINGS_COLOR = SCANNET_200_ALL_COLORS[:len(SCANNET_200_THINGS_CLASSES)]
+SCANNET_200_STUFF_COLOR = SCANNET_200_ALL_COLORS[len(SCANNET_200_THINGS_CLASSES):len(SCANNET_200_THINGS_CLASSES)+len(SCANNET_200_STUFF_CLASSES)]
 
 
 @dataclass
@@ -183,13 +213,23 @@ class ODISEMaskEmbeddingExtractor:
             demo_thing_colors += LVIS_COLORS
         if "SCANNET_20" in label_sets:
             demo_thing_classes += SCANNET_20_THINGS_CLASSES
+            demo_stuff_classes += SCANNET_20_STUFF_CLASSES
             demo_thing_colors += SCANNET_20_THINGS_COLOR
+            demo_stuff_colors += SCANNET_20_STUFF_COLOR
+        
+        if "SCANNET_200" in label_sets:
+            demo_thing_classes += SCANNET_200_THINGS_CLASSES
+            demo_stuff_classes += SCANNET_200_STUFF_CLASSES
+            demo_thing_colors += SCANNET_200_THINGS_COLOR
+            demo_stuff_colors += SCANNET_200_STUFF_COLOR
+        
         MetadataCatalog.pop("odise_extractor_metadata", None)
         metadata = MetadataCatalog.get("odise_extractor_metadata")
-        metadata.thing_classes = [c[0] for c in demo_thing_classes]
+        # 处理 openseg 格式：[['chair']] -> 'chair'
+        metadata.thing_classes = [c[0] if isinstance(c, list) else c for c in demo_thing_classes]
         metadata.stuff_classes = [
             *metadata.thing_classes,
-            *[c[0] for c in demo_stuff_classes],
+            *[c[0] if isinstance(c, list) else c for c in demo_stuff_classes],
         ]
         metadata.thing_colors = demo_thing_colors
         metadata.stuff_colors = demo_thing_colors + demo_stuff_colors

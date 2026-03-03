@@ -1,0 +1,128 @@
+--- a/dataset/open_vocab_dataset_v2.py
++++ b/dataset/open_vocab_dataset_v2.py
+@@ -10,6 +10,7 @@ import os
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
++from glob import glob
+ 
+ import numpy as np
+ import torch
+@@ -96,7 +97,9 @@ def _load_npz_pooled(npz_path: Path) -> Dict[str, torch.Tensor]:
+     }
+ 
+ 
+-def _load_3d_simple(data_root: Path, split: str, scene_name: str) -> Dict[str, torch.Tensor]:
++def _load_3d_simple(data_root: Path, split: str, scene_name: str,
++                    data_2d_root: Optional[Path] = None,
++                    enable_runtime_projection: bool = True) -> Dict[str, torch.Tensor]:
+     """
+     简单 3D 加载：从 data_root/split/scene_name.pth 读 (locs, feats, labels)。
+     若没有 .pth 或格式不同，返回占位张量以便调试；x_label/y_label 需另行提供或为 0。
+@@ -154,8 +157,63 @@ def _load_3d_simple(data_root: Path, split: str, scene_name: str) -> Dict[str,
+     y_label = data.get("y_label") if isinstance(data, dict) else None
+     
+     if x_label is None or y_label is None:
+-        print(f"Warning: x_label/y_label not found in {pth_path}, using zeros. This may cause training issues.")
+-        x_label = torch.zeros(N, dtype=torch.long)
+-        y_label = torch.zeros(N, dtype=torch.long)
++        # 🔥 新增: 运行时计算投影(参考 data_loader.py 的逻辑)
++        if enable_runtime_projection and data_2d_root is not None and data_2d_root.exists():
++            try:
++                from utils.mapping_util import getMapping
++                import imageio.v2 as imageio
++                
++                scene_2d_dir = data_2d_root / scene_name
++                if not scene_2d_dir.exists():
++                    raise FileNotFoundError(f"2D scene dir not found: {scene_2d_dir}")
++                
++                # 获取图像列表
++                img_dirs = sorted(
++                    glob(str(scene_2d_dir / "color" / "*")),
++                    key=lambda x: int(os.path.basename(x)[:-4])
++                )
++                
++                if len(img_dirs) == 0:
++                    raise FileNotFoundError(f"No images in {scene_2d_dir / 'color'}")
++                
++                # 选择中间帧(通常投影效果较好)
++                img_dir = img_dirs[len(img_dirs) // 2]
++                
++                # 读取位姿和深度
++                pose_path = img_dir.replace("color", "pose").replace(".jpg", ".txt")
++                depth_path = img_dir.replace("color", "depth").replace("jpg", "png")
++                
++                if not os.path.exists(pose_path):
++                    raise FileNotFoundError(f"Pose not found: {pose_path}")
++                if not os.path.exists(depth_path):
++                    raise FileNotFoundError(f"Depth not found: {depth_path}")
++                
++                pose = np.loadtxt(pose_path)
++                depth = imageio.imread(depth_path) / 1000.0
++                
++                # 计算投影
++                mapper = getMapping()
++                locs_np = locs.numpy() if isinstance(locs, torch.Tensor) else locs
++                single_mapping = mapper.compute_mapping(pose, locs_np, depth)
++                
++                # 提取有效投影
++                zero_rows = np.all(single_mapping != 0, axis=1)
++                valid_indices = np.where(zero_rows)[0]
++                
++                # 创建完整的 x_label 和 y_label
++                x_label_np = np.zeros(N, dtype=np.int64)
++                y_label_np = np.zeros(N, dtype=np.int64)
++                x_label_np[valid_indices] = single_mapping[valid_indices, 0].astype(np.int64)
++                y_label_np[valid_indices] = single_mapping[valid_indices, 1].astype(np.int64)
++                
++                x_label = torch.from_numpy(x_label_np)
++                y_label = torch.from_numpy(y_label_np)
++                
++                print(f"✅ Computed runtime projection for {scene_name}: {len(valid_indices)}/{N} points ({len(valid_indices)/N*100:.1f}%)")
++                
++            except Exception as e:
++                print(f"⚠️  Failed to compute runtime projection for {scene_name}: {e}")
++                print(f"   Falling back to zeros (training may fail)")
++                x_label = torch.zeros(N, dtype=torch.long)
++                y_label = torch.zeros(N, dtype=torch.long)
++        else:
++            if data_2d_root is None or not data_2d_root.exists():
++                print(f"⚠️  No 2D data available for {scene_name}, using zero labels")
++            else:
++                print(f"⚠️  Runtime projection disabled, using zero labels for {scene_name}")
++            x_label = torch.zeros(N, dtype=torch.long)
++            y_label = torch.zeros(N, dtype=torch.long)
+     else:
+         if isinstance(x_label, np.ndarray):
+             x_label = torch.from_numpy(x_label)
+@@ -189,6 +247,8 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
+ 
+     def __init__(self, config: OpenVocabDatasetV2Config):
+         self.config = config
++        self.enable_runtime_projection = True  # 可通过 config 控制
++        
+         self.precomputed_dir = Path(config.precomputed_dir) if config.precomputed_dir else None
+         if not self.precomputed_dir or not self.precomputed_dir.exists():
+             raise FileNotFoundError(f"precomputed_dir 不存在: {config.precomputed_dir}")
+@@ -197,6 +257,7 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
+         data_cfg = _load_yaml(config.data_config_path)
+         data_root = data_cfg.get("DATA", {}).get("data_root", "")
+         self.data_root = Path(data_root) if data_root else None
++        self.data_2d_root = Path(data_cfg.get("DATA", {}).get("data_root_2d", ""))
+         self.split = config.split
+ 
+         # 列出样本，只包含有 3D 数据的场景
+@@ -233,7 +294,11 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
+         out = _load_npz_pooled(npz_path)
+ 
+         if self.data_root and self.data_root.exists():
+-            out_3d = _load_3d_simple(self.data_root, self.split, scene_name)
++            out_3d = _load_3d_simple(
++                self.data_root, 
++                self.split, 
++                scene_name,
++                data_2d_root=self.data_2d_root if self.enable_runtime_projection else None,
++                enable_runtime_projection=self.enable_runtime_projection
++            )
+         else:
+             out_3d = _load_3d_simple(Path("/none"), self.split, scene_name)

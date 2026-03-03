@@ -165,19 +165,30 @@ class OpenVocab3DFusionModelV2(nn.Module):
                 For online extraction:
                 - img: (B, H, W, 3) RGB images
         """
-        # Check if using precomputed features
+        # Check if using precomputed features (pixel-level or pre-pooled from npz)
         use_precomputed = (
-            "pixel_embeddings" in batch_input
+            ("pixel_embeddings" in batch_input or "pixel_pooled" in batch_input)
             and "mask_embeddings" in batch_input
             and "masks" in batch_input
         )
 
         if use_precomputed:
-            pixel_embeddings = batch_input["pixel_embeddings"].float()
+            # 确保数据类型一致性，避免 AMP 训练中的类型问题
             mask_tensors = batch_input["masks"].float()
             mask_embeddings = batch_input["mask_embeddings"].float()
             mask_valid = batch_input.get("mask_valid", None)
             mask_valid_from_masks = mask_valid  # Same for precomputed
+            # Pixel: (B,H,W,C) from *_lseg.npy, or (B,K,C) pre-pooled from npz pixel_pooled
+            if "pixel_pooled" in batch_input:
+                pixel_embeddings = batch_input["pixel_pooled"].float()  # (B,K,512)
+            else:
+                pixel_embeddings = batch_input["pixel_embeddings"].float()  # (B,H,W,512)
+            
+            # 验证预计算数据的有效性
+            if mask_tensors.numel() == 0 or mask_embeddings.numel() == 0:
+                raise ValueError("Empty precomputed masks or mask_embeddings")
+            if pixel_embeddings.numel() == 0:
+                raise ValueError("Empty precomputed pixel_embeddings or pixel_pooled")
         else:
             # Online extraction
             if "img" not in batch_input:
@@ -192,6 +203,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
 
         # Validate dimensions
         batch_size = pixel_embeddings.shape[0]
+        # pixel_embeddings may be (B,H,W,C) or (B,K,C); last dim must be pixel_embedding_dim
         if pixel_embeddings.shape[-1] != self.config.pixel_embedding_dim:
             raise ValueError(
                 f"pixel embedding dim mismatch: "
@@ -208,9 +220,63 @@ class OpenVocab3DFusionModelV2(nn.Module):
             pixel_embeddings, mask_embeddings, mask_tensors, mask_valid
         )
 
-        # Process 3D points
-        implicit_condition, pred_3d, _ = self.pc_processor(batch_input["sinput"])
-        pred_3d = pred_3d[batch_input["inds_reconstruct"], :].float()
+        # Process 3D points（MinkowskiEngine 体素化后输出点数 M 可能 < 输入点数 N）
+        # 🔥 关键修复：正确映射每个输入点到其对应的体素特征
+        implicit_condition, pred_3d_voxel, _ = self.pc_processor(batch_input["sinput"])
+        sinput = batch_input["sinput"]
+        
+        # 输入坐标 (N_total, 4): [batch, x, y, z]
+        # 体素坐标 (M_voxels, 4): [batch, x_quantized, y_quantized, z_quantized]
+        # 目标：为每个输入点找到其量化后对应的体素索引
+        
+        input_coords = batch_input["coords_3d"].int().to(sinput.device)  # (N_total, 4)
+        voxel_coords = sinput.C  # (M_voxels, 4)
+        
+        # 使用向量化哈希映射（比 for 循环 + cpu().tolist() 快 10-100 倍）
+        # 将 4D 坐标编码为单个整数，然后用 searchsorted 查找
+        def _encode_coords(coords_4d):
+            """将 (N, 4) 坐标编码为 (N,) 整数，用于快速匹配"""
+            c = coords_4d.long() + 20000  # 偏移确保非负
+            BASE = 40001  # 大于最大坐标范围
+            return c[:, 0] * (BASE ** 3) + c[:, 1] * (BASE ** 2) + c[:, 2] * BASE + c[:, 3]
+        
+        voxel_hash = _encode_coords(voxel_coords)
+        input_hash = _encode_coords(input_coords)
+        
+        # 排序 voxel_hash 以使用 searchsorted
+        sort_idx = torch.argsort(voxel_hash)
+        sorted_voxel_hash = voxel_hash[sort_idx]
+        
+        # 查找每个 input 点的 voxel 索引
+        pos = torch.searchsorted(sorted_voxel_hash, input_hash)
+        pos = pos.clamp(max=sorted_voxel_hash.shape[0] - 1)
+        
+        # 检查是否真正匹配
+        matched = sorted_voxel_hash[pos] == input_hash
+        point_to_voxel_idx = sort_idx[pos]
+        
+        # 🔥 关键检查：验证 point→voxel 映射是否 100% 匹配
+        matched_ratio = matched.float().mean().item()
+        if matched_ratio < 0.999:
+            print(f'[FATAL] point→voxel matched_ratio={matched_ratio:.6f}')
+            print(f'  input_coords shape: {input_coords.shape}')
+            print(f'  voxel_coords shape: {voxel_coords.shape}')
+            print(f'  input_coords range: batch={input_coords[:, 0].unique()}, '
+                  f'x=[{input_coords[:, 1].min()},{input_coords[:, 1].max()}], '
+                  f'y=[{input_coords[:, 2].min()},{input_coords[:, 2].max()}], '
+                  f'z=[{input_coords[:, 3].min()},{input_coords[:, 3].max()}]')
+            print(f'  voxel_coords range: batch={voxel_coords[:, 0].unique()}, '
+                  f'x=[{voxel_coords[:, 1].min()},{voxel_coords[:, 1].max()}], '
+                  f'y=[{voxel_coords[:, 2].min()},{voxel_coords[:, 2].max()}], '
+                  f'z=[{voxel_coords[:, 3].min()},{voxel_coords[:, 3].max()}]')
+            num_unmatched = (~matched).sum().item()
+            print(f'  未匹配点数: {num_unmatched}/{input_coords.shape[0]} ({100*(1-matched_ratio):.3f}%)')
+            raise RuntimeError('point→voxel mapping mismatch: 未匹配的点会被错误映射到 voxel[0]')
+        
+        point_to_voxel_idx[~matched] = 0  # 未匹配的用 0 兜底（理论上不会执行到）
+        
+        # 用正确的映射索引体素特征：每个点 → 其体素索引 → 体素特征
+        pred_3d = pred_3d_voxel[point_to_voxel_idx, :].float()
 
         # Compute per-point, per-mask similarity
         batch_indices = batch_input["ori_coords_3d"][:, 0].long()
@@ -226,8 +292,12 @@ class OpenVocab3DFusionModelV2(nn.Module):
             mask_tokens = fused_embeddings[b].float()
             if mask_valid is not None:
                 valid_mask = mask_valid[b].to(mask_tokens.device)
+                if not valid_mask.any():
+                    print(f"Warning: No valid masks for batch {b}, skipping")
+                    continue
                 mask_tokens = mask_tokens[valid_mask]
             if mask_tokens.numel() == 0:
+                print(f"Warning: Empty mask_tokens for batch {b}, skipping")
                 continue
 
             # Normalize and compute similarity
@@ -235,17 +305,17 @@ class OpenVocab3DFusionModelV2(nn.Module):
             mask_tokens = F.normalize(mask_tokens, dim=-1)
             logits = logit_scale * (point_features @ mask_tokens.t())
 
-            # Expand to full mask count
+            # Expand to full mask count（AMP 下 logits 可能为 float16，与 full_logits 一致再赋值）
             if mask_valid is not None:
                 num_masks = fused_embeddings.shape[1]
                 full_logits = pred_3d.new_full(
                     (logits.shape[0], num_masks), float("-inf")
                 )
-                full_logits[:, valid_mask] = logits
+                full_logits[:, valid_mask] = logits.to(full_logits.dtype)
                 logits = full_logits
 
-            mask_logits = torch.sigmoid(logits)
-            outputs[b].append({"pred_mask_logits": mask_logits})
+            # 传 logits 给 criterion，便于 AMP 下用 BCEWithLogitsLoss（autocast 安全）
+            outputs[b].append({"pred_mask_logits": logits})
 
         return {
             "outputs": outputs,

@@ -1,0 +1,28 @@
+# 配置1: COCO + ADE + LVIS + SCANNET_20
+data:
+  data_root: "/home/sunl/work"
+  output_dir: "./compare_output/config1_coco_ade_lvis_s20"
+  scene_pattern: "scene*"
+  image_extensions: ["jpg", "png"]
+
+processing:
+  batch_size: 1              
+  max_scenes: 1              
+  max_images_per_scene: 10   # 只处理10张
+  skip_existing: true        # 跳过已存在的（加速）
+  device: "cuda"
+  verbose: true
+
+odise:
+  model_config: "Panoptic/odise_caption_coco_50e.py"
+  label_sets: ["COCO", "ADE", "LVIS", "SCANNET_20"]
+  vocab: ""
+  overlap_threshold: 0.0
+  object_mask_threshold: 0.0
+
+output:
+  output_name_template: "{img_idx}_odise.npz"
+  compressed: true
+  save_masks: true
+  save_embeddings: true
+  save_metadata: true
