@@ -1,0 +1,27 @@
+[06:18:25] 
+============================================================
+[06:18:25] Mix 开放词汇3D模型评估
+[06:18:25] ============================================================
+[06:18:25] 权重: checkpoints/full.4/checkpoint_epoch_36.pth
+[06:18:25] 配置: config/train_scannet_v2_full_multi_gpu.yaml
+[06:18:25] ============================================================
+
+[06:18:25] 提取CLIP文本特征...
+[06:18:34] ✓ 文本特征: torch.Size([20, 768])
+[06:18:34] 
+创建数据集...
+[06:18:34] ✓ 数据集: 26687 个样本
+[06:18:34] 
+创建模型...
+[06:18:35] 从checkpoint读取配置...
+当前目录: /home/featurize/work/mix
+Python路径前3项: ['/home/featurize/work/openscene', '/home/featurize/work/mix', '/home/featurize/work/mix']
+✓ 所有模块导入成功
+✅ 使用预计算投影: /home/featurize/data/scannet_projections
+Found 26687/27130 samples with precomputed projections
+Traceback (most recent call last):
+  File "eval_model_simple.py", line 368, in <module>
+    main()
+  File "eval_model_simple.py", line 335, in main
+    elif 'pc_arch' in ckpt_config:
+TypeError: argument of type 'OpenVocabTrainerV2Config' is not iterable
