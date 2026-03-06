@@ -1,0 +1,28 @@
+# ODISE 测试配置 (参考 F/ODISE/config.yaml 格式)
+
+input:
+  path: /home/sunl/work/scene0000_00/color
+  pattern: "auto"  # 自动匹配 jpg/png
+  recursive: false
+
+output:
+  dir: /home/sunl/work/mix/test_output4
+  keep_dir_structure: false
+  postfix: "_odise"
+  suffix: ".npz"
+
+model:
+  config: Panoptic/odise_caption_coco_50e.py
+  caption: "a photo of"
+  label_sets: ["SCANNET_20","SCANNET_200"]
+  extra_vocab: ""
+  overlap_threshold: 0
+  object_mask_threshold: 0.0
+
+runtime:
+  gpus: [0]
+  workers: 1
+  batch_size: 1
+  preload: false
+  fp16: false
+  xformers: false # 如果安装了 xFormers 可以设为 true，会更快

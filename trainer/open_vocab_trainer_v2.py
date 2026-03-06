@@ -10,9 +10,11 @@ Enhanced Open Vocabulary 3D Trainer with:
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
+import contextlib
 
 import os
 import time
+import math
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
@@ -49,23 +51,42 @@ class OpenVocabTrainerV2Config:
     # Loss weights
     bce_weight: float = 1.0
     dice_weight: float = 1.0
+    # GT 过滤阈值（与 Criteria 一致）
+    min_points_per_mask: int = 10
     # Resume
     resume_checkpoint: Optional[str] = None
+    # Resume behavior
+    # NOTE: optimizer/scheduler state in checkpoint will override YAML hyperparams unless we re-apply them.
+    override_optimizer_hparams_on_resume: bool = True
+    # For iteration-stepped schedulers, changing batch_size changes steps_per_epoch and breaks old scheduler state.
+    reset_scheduler_on_resume: bool = True
+    # Quick run: limit batches per epoch (e.g. 100 for smoke test)
+    max_batches_per_epoch: Optional[int] = None
+    # Use float16 for model parameters (reduces VRAM; use with AMP)
+    use_model_half: bool = False
+    # 🔥 梯度累积：用于降低显存峰值，同时保持有效 batch size
+    # 例：batch_size=16, gradient_accumulation_steps=2 → 有效 batch=32
+    gradient_accumulation_steps: int = 1
 
 
 class MetricsTracker:
-    """Track and compute evaluation metrics."""
+    """Track and compute evaluation metrics with per-mask mIoU and mAcc."""
 
     def __init__(self):
         self.reset()
 
     def reset(self):
+        # 全局统计（用于计算全局 IoU）
         self.total_intersection = 0.0
         self.total_union = 0.0
         self.total_correct = 0
         self.total_points = 0
-        self.per_class_intersection = {}
-        self.per_class_union = {}
+        # 🔥 OOM 修复：Per-mask 统计改用增量算法（O(1) 显存）而非 list 累积（O(N) 显存）
+        # 计算逻辑完全一致，只是存储方式从 list.append → sum/count 累加
+        self.per_mask_iou_sum = 0.0
+        self.per_mask_iou_count = 0
+        self.per_mask_acc_sum = 0.0
+        self.per_mask_acc_count = 0
 
     def update(
         self,
@@ -77,39 +98,89 @@ class MetricsTracker:
         pred_binary = (pred_masks > threshold).float()
         gt_binary = gt_masks.float()
 
-        # IoU computation
+        # 全局 IoU（所有点加在一起）
         intersection = (pred_binary * gt_binary).sum()
         union = ((pred_binary + gt_binary) > 0).float().sum()
-
         self.total_intersection += intersection.item()
         self.total_union += union.item()
 
-        # Accuracy
+        # 全局 Accuracy
         correct = (pred_binary == gt_binary).sum()
         total = pred_binary.numel()
         self.total_correct += correct.item()
         self.total_points += total
 
+        # Per-mask IoU 和 Acc（每个 mask 单独计算，然后平均 = mIoU/mAcc）
+        # 🔥 关键修复 C: 只对 GT 中有正样本的 mask 计算 IoU/Acc
+        # 否则 GT=0 + pred>0 会导致 IoU=0，严重拉低 mIoU
+        K = pred_binary.shape[1] if pred_binary.dim() > 1 else 1
+        for k in range(K):
+            if pred_binary.dim() > 1:
+                pred_k = pred_binary[:, k]
+                gt_k = gt_binary[:, k]
+            else:
+                pred_k = pred_binary
+                gt_k = gt_binary
+            
+            gt_pos = gt_k.sum().item()
+            
+            # 🔥 只有当 GT 中有正样本（gt_pos > 0）才计算该 mask 的 IoU
+            # 这与 mIoU 的标准定义一致：只对"存在的类别"计算平均
+            if gt_pos > 0:
+                inter_k = (pred_k * gt_k).sum().item()
+                union_k = ((pred_k + gt_k) > 0).float().sum().item()
+                if union_k > 0:
+                    iou_k = inter_k / union_k
+                    # 🔥 OOM 修复：改用增量累加（而非 list.append）
+                    self.per_mask_iou_sum += iou_k
+                    self.per_mask_iou_count += 1
+                
+                # Per-mask Accuracy（也只对 GT 有正样本的 mask 计入）
+                correct_k = (pred_k == gt_k).sum().item()
+                total_k = pred_k.numel()
+                if total_k > 0:
+                    acc_k = correct_k / total_k
+                    # 🔥 OOM 修复：改用增量累加（而非 list.append）
+                    self.per_mask_acc_sum += acc_k
+                    self.per_mask_acc_count += 1
+
     def compute(self) -> Dict[str, float]:
         """Compute final metrics."""
-        iou = (
+        # 全局 IoU（所有点）
+        global_iou = (
             self.total_intersection / (self.total_union + 1e-6)
             if self.total_union > 0
             else 0.0
         )
-        accuracy = (
+        # 全局 Accuracy
+        global_acc = (
             self.total_correct / (self.total_points + 1e-6)
             if self.total_points > 0
             else 0.0
         )
+        # mIoU（per-mask IoU 的平均值）
+        # 🔥 OOM 修复：从 sum(list)/len(list) 改为 sum/count（计算结果完全一致）
+        miou = (
+            self.per_mask_iou_sum / self.per_mask_iou_count
+            if self.per_mask_iou_count > 0
+            else 0.0
+        )
+        # mAcc（per-mask Accuracy 的平均值）
+        macc = (
+            self.per_mask_acc_sum / self.per_mask_acc_count
+            if self.per_mask_acc_count > 0
+            else 0.0
+        )
         return {
-            "iou": iou,
-            "accuracy": accuracy,
+            "iou": global_iou,      # 全局 IoU（向后兼容）
+            "miou": miou,           # mIoU（per-mask 平均）
+            "accuracy": global_acc, # 全局 Accuracy（向后兼容）
+            "macc": macc,           # mAcc（per-mask 平均）
         }
 
 
 class OpenVocabTrainerV2:
-    """Enhanced trainer for open vocabulary 3D segmentation."""
+    """Enhanced trainer for open vocabulary 3D segmentation with DDP support."""
 
     def __init__(
         self,
@@ -118,12 +189,23 @@ class OpenVocabTrainerV2:
         config: OpenVocabTrainerV2Config,
         device: str = "cuda",
         val_loader: Optional[torch.utils.data.DataLoader] = None,
+        train_sampler=None,  # DistributedSampler for DDP
+        is_distributed: bool = False,
+        is_main_process: bool = True,
     ):
-        self.model = model.to(device)
+        if config.use_model_half and device != "cpu":
+            model = model.half()
+        # Don't call .to(device) if model is already DDP-wrapped
+        if not isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model = model.to(device)
+        self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
         self.device = device
+        self.train_sampler = train_sampler
+        self.is_distributed = is_distributed
+        self.is_main_process = is_main_process
 
         # Optimizer
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
@@ -133,22 +215,32 @@ class OpenVocabTrainerV2:
             weight_decay=config.weight_decay,
         )
 
-        # Scheduler with warmup
-        self.steps_per_epoch = max(1, len(train_loader))
-        self.total_steps = self.steps_per_epoch * config.num_epochs
-        self.warmup_steps = self.steps_per_epoch * config.warmup_epochs
+        # Scheduler with warmup (cap steps if max_batches_per_epoch set for quick run)
+        full_steps = len(train_loader)
+        self.steps_per_epoch = (
+            min(full_steps, config.max_batches_per_epoch)
+            if config.max_batches_per_epoch is not None
+            else full_steps
+        )
+        self.steps_per_epoch = max(1, self.steps_per_epoch)
+        # 🔥 梯度累积后，scheduler/warmup/global_step 都应该以“优化步数(optimizer.step 次数)”为单位
+        # 否则会出现：T_0 用 micro-step 计算，但 scheduler.step() 只在 optimizer.step() 调用 → LR 周期错误（你日志里 epoch12 LR 重置就是这个）
+        self.accum_steps = max(1, int(getattr(config, "gradient_accumulation_steps", 1)))
+        self.optim_steps_per_epoch = int(math.ceil(self.steps_per_epoch / self.accum_steps))
+        self.total_steps = self.optim_steps_per_epoch * config.num_epochs
+        self.warmup_steps = self.optim_steps_per_epoch * config.warmup_epochs
 
         if config.scheduler_type == "cosine":
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self.optimizer,
-                T_0=self.steps_per_epoch * config.scheduler_t0,
+                T_0=self.optim_steps_per_epoch * config.scheduler_t0,
                 T_mult=config.scheduler_t_mult,
                 eta_min=config.scheduler_eta_min,
             )
         elif config.scheduler_type == "step":
             self.scheduler = torch.optim.lr_scheduler.StepLR(
                 self.optimizer,
-                step_size=self.steps_per_epoch * 10,
+                step_size=self.optim_steps_per_epoch * 10,
                 gamma=0.5,
             )
         else:
@@ -162,10 +254,17 @@ class OpenVocabTrainerV2:
         # AMP scaler
         self.scaler = GradScaler(enabled=config.use_amp)
 
-        # Logging
-        os.makedirs(config.log_dir, exist_ok=True)
-        os.makedirs(config.checkpoint_dir, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=config.log_dir)
+        # Logging (only on main process)
+        if self.is_main_process:
+            os.makedirs(config.checkpoint_dir, exist_ok=True)
+            # 只有当 log_dir 非空时才创建 TensorBoard
+            if config.log_dir and config.log_dir.strip():
+                os.makedirs(config.log_dir, exist_ok=True)
+                self.writer = SummaryWriter(log_dir=config.log_dir)
+            else:
+                self.writer = None
+        else:
+            self.writer = None
 
         # State
         self.global_step = 0
@@ -178,12 +277,13 @@ class OpenVocabTrainerV2:
         if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
             self._load_checkpoint(config.resume_checkpoint)
 
-        # Count parameters
+        # Count parameters (only print on main process)
         trainable_count = sum(
             p.numel() for p in self.model.parameters() if p.requires_grad
         )
         total_count = sum(p.numel() for p in self.model.parameters())
-        print(f"Parameters: {trainable_count:,} trainable / {total_count:,} total")
+        if self.is_main_process:
+            print(f"Parameters: {trainable_count:,} trainable / {total_count:,} total")
 
     def _get_warmup_lr(self, step: int) -> float:
         """Compute learning rate with linear warmup."""
@@ -207,9 +307,9 @@ class OpenVocabTrainerV2:
             "binary_label_3d", "binary_label_2d", "label_2d",
             "img", "x_label", "y_label", "inds_reconstruct",
         ]
-        # Also move precomputed features if present
+        # Also move precomputed features if present (pixel_pooled = pre-pooled from npz)
         precomputed_keys = [
-            "pixel_embeddings", "masks", "mask_embeddings", "mask_valid",
+            "pixel_embeddings", "pixel_pooled", "masks", "mask_embeddings", "mask_valid",
         ]
         moved = dict(batch)
         for key in tensor_keys + precomputed_keys:
@@ -219,7 +319,8 @@ class OpenVocabTrainerV2:
 
     def _build_sparse_tensor(self, batch: Dict[str, Any]) -> SparseTensor:
         """Build MinkowskiEngine SparseTensor from batch."""
-        return SparseTensor(batch["feat_3d"], batch["coords_3d"])
+        # 使用 .int() 避免 MinkowskiEngine 的 "coordinates implicitly converted to torch.IntTensor" 警告
+        return SparseTensor(batch["feat_3d"], batch["coords_3d"].int())
 
     def _train_epoch(self, epoch: int) -> float:
         """Run one training epoch."""
@@ -231,30 +332,116 @@ class OpenVocabTrainerV2:
 
         end_time = time.time()
 
+        # 🔥 梯度累积配置
+        accum_steps = getattr(self.config, "gradient_accumulation_steps", 1)
+        is_distributed = hasattr(self.model, "no_sync")  # DDP 模型有 no_sync 方法
+        
+        # 在 epoch 开始时清零梯度
+        self.optimizer.zero_grad(set_to_none=True)
+
+        max_steps = self.config.max_batches_per_epoch
+        micro_steps_done = 0
         for step, batch in enumerate(self.train_loader):
+            if max_steps is not None and step >= max_steps:
+                break
+            micro_steps_done += 1
             batch = self._move_batch_to_device(batch)
             batch["sinput"] = self._build_sparse_tensor(batch)
 
-            # Apply warmup
+            # 🔥 梯度累积：判断是否为累积中间步（不需要同步梯度）
+            is_accum_step = ((step + 1) % accum_steps != 0)
+            
+            # 🔥 DDP 优化：累积中间步使用 no_sync() 避免每次都 all-reduce
+            sync_context = self.model.no_sync() if (is_accum_step and is_distributed) else contextlib.nullcontext()
+
+            with sync_context:
+                # Forward pass with AMP
+                with autocast(enabled=self.config.use_amp):
+                    try:
+                        results = self.model(batch)
+                        criteria = Criteria(
+                            results,
+                            batch,
+                            bce_weight=self.config.bce_weight,
+                            dice_weight=self.config.dice_weight,
+                            min_points_per_mask=self.config.min_points_per_mask,
+                            use_pos_weight=True,
+                            use_per_mask_dice=True,
+                        )
+                        loss = criteria.loss_pt()
+                        
+                        # 检查 loss 是否有效
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            raise ValueError(f"Invalid loss detected: {loss}. This indicates a training instability issue.")
+                            
+                    except Exception as e:
+                        # 打印诊断信息，然后重新抛出错误（不跳过 batch）
+                        print(f"\n❌ Error in forward pass: {e}")
+                        print(f"Batch keys: {list(batch.keys())}")
+                        if "x_label" in batch and "y_label" in batch:
+                            print(f"x_label range: [{batch['x_label'].min()}, {batch['x_label'].max()}]")
+                            print(f"y_label range: [{batch['y_label'].min()}, {batch['y_label'].max()}]")
+                        raise
+
+                # 🔥 梯度累积：loss 除以累积步数，保证累积后的梯度量级与原来一致
+                scaled_loss = loss / accum_steps
+                
+                # Backward（累积梯度，不清零）
+                self.scaler.scale(scaled_loss).backward()
+
+            # 记录原始 loss（用于日志，不是 scaled_loss）
+            epoch_loss.update(loss.item())
+            
+            # Logging（每个 micro-step 都记录 loss）
+            batch_time.update(time.time() - end_time)
+            end_time = time.time()
+
+            # 🔥 只在累积边界（每 accum_steps 个 step）执行 optimizer.step()
+            if (step + 1) % accum_steps == 0:
+                # Unscale + Clip + Step + Update
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda p: p.requires_grad, self.model.parameters()),
+                    self.config.grad_clip_norm,
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+
+                # 🔥 scheduler 只在 optimizer.step() 时更新（与优化步数对齐）
+                if self.global_step >= self.warmup_steps:
+                    if self.config.scheduler_type != "plateau":
+                        self.scheduler.step()
+
+                # 🔥 global_step 按优化步数更新（而不是 micro-step）
+                if self.writer is not None:
+                    self.writer.add_scalar("Loss/Train_Step", loss.item(), self.global_step)
+                    self.writer.add_scalar(
+                        "LR", self.optimizer.param_groups[0]["lr"], self.global_step
+                    )
+                self.global_step += 1
+
+            # Apply warmup（基于 global_step，即优化步数）
             self._adjust_learning_rate_warmup(self.global_step)
 
-            # Forward pass with AMP
-            with autocast(enabled=self.config.use_amp):
-                results = self.model(batch)
-                criteria = Criteria(
-                    results,
-                    batch,
-                    bce_weight=self.config.bce_weight,
-                    dice_weight=self.config.dice_weight,
+            # 日志打印（每 log_every_steps 个 micro-step 打印一次）
+            if step % self.config.log_every_steps == 0 and self.is_main_process:
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                eta = batch_time.avg * (len(self.train_loader) - step)
+                accum_info = f" (accum {accum_steps})" if accum_steps > 1 else ""
+                print(
+                    f"Epoch [{epoch + 1}/{self.config.num_epochs}] "
+                    f"Step [{step}/{len(self.train_loader)}]{accum_info} "
+                    f"Loss: {loss.item():.4f} ({epoch_loss.avg:.4f}) "
+                    f"LR: {current_lr:.2e} "
+                    f"ETA: {eta:.0f}s"
                 )
-                loss = criteria.loss_pt()
 
-            if loss.item() == 0:
-                continue
-
-            # Backward pass
-            self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
+        # 🔥 处理 epoch 结束时剩余的未累积完的梯度
+        # 如果 total_steps % accum_steps != 0，最后几个 step 的梯度还没 step
+        remaining_steps = micro_steps_done % accum_steps
+        if remaining_steps > 0 and max_steps is None:
+            # 执行最后一次 optimizer.step()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
                 filter(lambda p: p.requires_grad, self.model.parameters()),
@@ -262,33 +449,12 @@ class OpenVocabTrainerV2:
             )
             self.scaler.step(self.optimizer)
             self.scaler.update()
-
-            # Update scheduler (after warmup)
+            self.optimizer.zero_grad(set_to_none=True)
+            
             if self.global_step >= self.warmup_steps:
                 if self.config.scheduler_type != "plateau":
                     self.scheduler.step()
-
-            # Logging
-            epoch_loss.update(loss.item())
-            batch_time.update(time.time() - end_time)
-            end_time = time.time()
-
-            self.writer.add_scalar("Loss/Train_Step", loss.item(), self.global_step)
-            self.writer.add_scalar(
-                "LR", self.optimizer.param_groups[0]["lr"], self.global_step
-            )
             self.global_step += 1
-
-            if step % self.config.log_every_steps == 0:
-                current_lr = self.optimizer.param_groups[0]["lr"]
-                eta = batch_time.avg * (len(self.train_loader) - step)
-                print(
-                    f"Epoch [{epoch + 1}/{self.config.num_epochs}] "
-                    f"Step [{step}/{len(self.train_loader)}] "
-                    f"Loss: {loss.item():.4f} ({epoch_loss.avg:.4f}) "
-                    f"LR: {current_lr:.2e} "
-                    f"ETA: {eta:.0f}s"
-                )
 
         return epoch_loss.avg
 
@@ -302,7 +468,7 @@ class OpenVocabTrainerV2:
         val_loss = AverageMeter()
         metrics = MetricsTracker()
 
-        for batch in self.val_loader:
+        for batch_idx, batch in enumerate(self.val_loader):
             batch = self._move_batch_to_device(batch)
             batch["sinput"] = self._build_sparse_tensor(batch)
 
@@ -312,11 +478,13 @@ class OpenVocabTrainerV2:
                     results, batch,
                     bce_weight=self.config.bce_weight,
                     dice_weight=self.config.dice_weight,
+                    min_points_per_mask=self.config.min_points_per_mask,  # 🔥 GT 过滤阈值
+                    use_pos_weight=True,  # 🔥 启用 pos_weight 平衡正负样本
+                    use_per_mask_dice=True,  # 🔥 使用 per-mask dice loss
                 )
                 loss = criteria.loss_pt()
 
-            if loss.item() > 0:
-                val_loss.update(loss.item())
+            val_loss.update(loss.item())
 
             # Compute metrics for each batch item
             for b in range(len(results["outputs"])):
@@ -328,22 +496,64 @@ class OpenVocabTrainerV2:
                 # Get GT masks
                 mask_2d = results["mask_masks"][b][valid]
                 point_mask = results["batch_indices"] == b
-                x_idx = batch["x_label"][point_mask].long()
-                y_idx = batch["y_label"][point_mask].long()
+                x_idx = batch["x_label"][point_mask].float()  # 先转 float 以便缩放
+                y_idx = batch["y_label"][point_mask].float()
 
                 if x_idx.numel() == 0:
                     continue
-                if (
-                    x_idx.max().item() >= mask_2d.shape[2]
-                    or y_idx.max().item() >= mask_2d.shape[1]
-                ):
+
+                # mask 尺寸
+                H, W = mask_2d.shape[1], mask_2d.shape[2]
+                
+                # 🔥 与训练时一致的缩放逻辑
+                x_max = x_idx.max().item() if x_idx.numel() > 0 else 0
+                y_max = y_idx.max().item() if y_idx.numel() > 0 else 0
+                
+                # 判断是否需要缩放（容差 20 像素）
+                need_scale = (x_max > W + 20) or (y_max > H + 20)
+                
+                if need_scale:
+                    # 原图尺寸投影，需要缩放到 mask 尺寸
+                    orig_W = max(640, x_max + 10)
+                    orig_H = max(480, y_max + 10)
+                    scale_x = W / orig_W
+                    scale_y = H / orig_H
+                    x_idx = (x_idx * scale_x).long()
+                    y_idx = (y_idx * scale_y).long()
+                else:
+                    # 已经是 mask 尺寸，直接转 long
+                    x_idx = x_idx.long()
+                    y_idx = y_idx.long()
+                
+                # 越界过滤（与训练时一致）
+                valid_mask = (x_idx >= 0) & (x_idx < W) & (y_idx >= 0) & (y_idx < H)
+                if valid_mask.sum() == 0:
                     continue
+                
+                x_idx = x_idx[valid_mask]
+                y_idx = y_idx[valid_mask]
+                pred_logits_filtered = pred_logits[valid_mask, :]
 
                 gt_3d = mask_2d[:, y_idx, x_idx]
-                gt_3d = (gt_3d > 0.5).float().transpose(0, 1)
+                gt_3d = (gt_3d > 0.5).float().transpose(0, 1)  # (N_valid, K_valid)
 
-                pred_valid = pred_logits[:, valid]
-                metrics.update(pred_valid, gt_3d)
+                pred_valid = pred_logits_filtered[:, valid]  # (N_valid, K_valid)
+                
+                # 🔥 验证时与训练一致：过滤 GT 正样本数不足的 mask
+                # 这确保训练指标和验证指标使用相同的 mask 定义
+                gt_pos = gt_3d.sum(dim=0)  # (K_valid,)
+                min_points = self.config.min_points_per_mask
+                keep_gt = gt_pos >= min_points
+                
+                if keep_gt.any():
+                    pred_valid = pred_valid[:, keep_gt]
+                    gt_3d = gt_3d[:, keep_gt]
+                    # MetricsTracker 期望概率；pred_logits 为 logits，需先 sigmoid
+                    metrics.update(torch.sigmoid(pred_valid).float(), gt_3d)
+            
+            # 🔥 OOM 修复：每 50 个 batch 清理一次 CUDA 缓存（不影响计算结果）
+            if (batch_idx + 1) % 50 == 0:
+                torch.cuda.empty_cache()
 
         val_metrics = metrics.compute()
         val_metrics["loss"] = val_loss.avg
@@ -367,25 +577,95 @@ class OpenVocabTrainerV2:
         }
 
         if suffix:
+            # 定期保存：checkpoint_epoch_5.pth, checkpoint_epoch_10.pth, ...
             path = f"{self.config.checkpoint_dir}/checkpoint_{suffix}.pth"
-        else:
-            path = f"{self.config.checkpoint_dir}/checkpoint_epoch_{epoch + 1}.pth"
-
-        torch.save(checkpoint, path)
-
+            torch.save(checkpoint, path)
+        
         if is_best:
+            # 最佳模型：best_model.pth
             best_path = f"{self.config.checkpoint_dir}/best_model.pth"
             torch.save(checkpoint, best_path)
-            print(f"  -> Saved best model (loss: {loss:.4f})")
+            print(f"  -> Saved best model (mIoU/loss: {loss:.4f})")
+
+    def _reset_scheduler_to_current_config(self):
+        """Recreate scheduler with current config & steps_per_epoch.
+
+        This avoids broken LR schedules when resuming with different batch_size
+        (steps_per_epoch changes) or when you intentionally change schedule hyperparams.
+        """
+        cfg = self.config
+        if cfg.scheduler_type == "cosine":
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=self.optim_steps_per_epoch * cfg.scheduler_t0,
+                T_mult=cfg.scheduler_t_mult,
+                eta_min=cfg.scheduler_eta_min,
+            )
+            # We call scheduler.step() once per optimizer.step, so treat global_step as the scheduler "epoch".
+            if self.global_step > 0:
+                self.scheduler.step(self.global_step)
+        elif cfg.scheduler_type == "step":
+            self.scheduler = torch.optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=self.optim_steps_per_epoch * 10,
+                gamma=0.5,
+            )
+        else:
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=0.5,
+                patience=5,
+            )
 
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint to resume training."""
         print(f"Loading checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        # Handle DDP vs non-DDP checkpoint loading
+        state_dict = checkpoint["model_state_dict"]
+        model_state_dict = self.model.state_dict()
+        
+        # Check if we need to add or remove 'module.' prefix
+        model_keys = list(model_state_dict.keys())
+        ckpt_keys = list(state_dict.keys())
+        
+        is_model_ddp = model_keys[0].startswith('module.')
+        is_ckpt_ddp = ckpt_keys[0].startswith('module.')
+        
+        if is_model_ddp and not is_ckpt_ddp:
+            # Model is DDP but checkpoint is not -> add 'module.' prefix
+            print("Adding 'module.' prefix to checkpoint keys for DDP model")
+            state_dict = {'module.' + k: v for k, v in state_dict.items()}
+        elif not is_model_ddp and is_ckpt_ddp:
+            # Model is not DDP but checkpoint is -> remove 'module.' prefix
+            print("Removing 'module.' prefix from checkpoint keys")
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        self.model.load_state_dict(state_dict)
+
+        # Optimizer state (will override lr/weight_decay in param_groups)
+        if "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Re-apply YAML hyperparams if requested (otherwise config changes won't take effect on resume)
+        if getattr(self.config, "override_optimizer_hparams_on_resume", True):
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = self.config.base_lr
+                pg["weight_decay"] = self.config.weight_decay
+
+        # Scheduler
+        if self.config.scheduler_type == "plateau":
+            if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            if getattr(self.config, "reset_scheduler_on_resume", True):
+                self._reset_scheduler_to_current_config()
+            else:
+                if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
+                    self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
         if "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
 
@@ -394,79 +674,154 @@ class OpenVocabTrainerV2:
         self.best_loss = checkpoint.get("best_loss", float("inf"))
         self.best_iou = checkpoint.get("best_iou", 0.0)
 
+        if self.is_main_process:
+            lr_now = self.optimizer.param_groups[0].get("lr", None)
+            wd_now = self.optimizer.param_groups[0].get("weight_decay", None)
+            print(
+                f"After resume: lr={lr_now} weight_decay={wd_now} "
+                f"steps_per_epoch={self.steps_per_epoch} warmup_steps={self.warmup_steps}"
+            )
+
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
 
     def train(self) -> Dict[str, float]:
-        """Run full training loop."""
-        print(f"Starting training for {self.config.num_epochs} epochs")
-        print(f"Steps per epoch: {self.steps_per_epoch}")
-        print(f"Total steps: {self.total_steps}")
-        print(f"Warmup steps: {self.warmup_steps}")
-        print(f"AMP enabled: {self.config.use_amp}")
+        """Run full training loop with DDP support."""
+        if self.is_main_process:
+            print(f"Starting training for {self.config.num_epochs} epochs")
+            print(f"Steps per epoch: {self.steps_per_epoch}")
+            if getattr(self.config, "gradient_accumulation_steps", 1) > 1:
+                print(
+                    f"Optimizer steps/epoch: {self.optim_steps_per_epoch} "
+                    f"(accum={self.accum_steps})"
+                )
+            print(f"Total steps: {self.total_steps}")
+            print(f"Warmup steps: {self.warmup_steps}")
+            print(f"AMP enabled: {self.config.use_amp}")
 
+        final_epoch = self.current_epoch
         for epoch in range(self.current_epoch, self.config.num_epochs):
+            final_epoch = epoch + 1
             epoch_start = time.time()
+            
+            # Set epoch for distributed sampler (required for proper shuffling)
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(epoch)
+            
+            if self.is_main_process:
+                print(f"\n>> Starting Epoch [{epoch + 1}/{self.config.num_epochs}] ...")
 
             # Training
             train_loss = self._train_epoch(epoch)
-            self.writer.add_scalar("Loss/Train_Epoch", train_loss, epoch)
+            if self.writer is not None:
+                self.writer.add_scalar("Loss/Train_Epoch", train_loss, epoch)
 
             epoch_time = time.time() - epoch_start
-            print(
-                f"Epoch [{epoch + 1}/{self.config.num_epochs}] "
-                f"Train Loss: {train_loss:.4f} "
-                f"Time: {epoch_time:.1f}s"
-            )
+            if self.is_main_process:
+                print(
+                    f"Epoch [{epoch + 1}/{self.config.num_epochs}] "
+                    f"Train Loss: {train_loss:.4f} "
+                    f"Time: {epoch_time:.1f}s"
+                )
 
             # Validation
+            val_metrics = None
             if (epoch + 1) % self.config.val_every_epochs == 0:
                 val_metrics = self._validate(epoch)
-                if val_metrics:
-                    self.writer.add_scalar("Loss/Val", val_metrics["loss"], epoch)
-                    self.writer.add_scalar("Metrics/IoU", val_metrics["iou"], epoch)
-                    self.writer.add_scalar(
-                        "Metrics/Accuracy", val_metrics["accuracy"], epoch
-                    )
+                if val_metrics and self.is_main_process:
+                    if self.writer is not None:
+                        self.writer.add_scalar("Loss/Val", val_metrics["loss"], epoch)
+                        self.writer.add_scalar("Metrics/IoU", val_metrics["iou"], epoch)
+                        self.writer.add_scalar("Metrics/mIoU", val_metrics.get("miou", 0), epoch)
+                        self.writer.add_scalar("Metrics/Accuracy", val_metrics["accuracy"], epoch)
+                        self.writer.add_scalar("Metrics/mAcc", val_metrics.get("macc", 0), epoch)
                     print(
                         f"  Val Loss: {val_metrics['loss']:.4f} "
                         f"IoU: {val_metrics['iou']:.4f} "
-                        f"Acc: {val_metrics['accuracy']:.4f}"
+                        f"mIoU: {val_metrics.get('miou', 0):.4f} "
+                        f"Acc: {val_metrics['accuracy']:.4f} "
+                        f"mAcc: {val_metrics.get('macc', 0):.4f}"
                     )
+                    
+                    # Update best IoU
+                    current_iou = val_metrics.get('miou', val_metrics['iou'])
+                    if current_iou > self.best_iou:
+                        self.best_iou = current_iou
 
                     # Update plateau scheduler with validation loss
                     if self.config.scheduler_type == "plateau":
                         self.scheduler.step(val_metrics["loss"])
 
-            # Save best model
-            is_best = train_loss < self.best_loss - self.config.early_stopping_min_delta
-            if is_best:
-                self.best_loss = train_loss
-                self.epochs_without_improvement = 0
+            # Save best model (only on main process)
+            # 🔥 关键修复：按 mIoU 而非 loss 保存 best model
+            # 只在有验证结果时判断 is_best，避免用 train_loss 误判过拟合
+            is_best = False
+            if val_metrics is not None and isinstance(val_metrics, dict):
+                # 优先监控 mIoU
+                monitored_metric = val_metrics.get('miou', val_metrics.get('iou', 0))
+                is_best = monitored_metric > self.best_iou + self.config.early_stopping_min_delta
+                
+                if is_best:
+                    prev_best = self.best_iou
+                    self.best_iou = monitored_metric
+                    self.epochs_without_improvement = 0
+                    if self.is_main_process:
+                        print(f"  🎯 New best mIoU: {monitored_metric:.4f} (prev: {prev_best:.4f})")
+                else:
+                    self.epochs_without_improvement += 1
+                
+                # 同时更新 best_loss（用于日志）
+                if val_metrics["loss"] < self.best_loss:
+                    self.best_loss = val_metrics["loss"]
+                
+                monitored_value = monitored_metric  # 用于 checkpoint 文件名
             else:
-                self.epochs_without_improvement += 1
+                # 没有 val_metrics 时，不判断 is_best（避免过拟合）
+                monitored_value = train_loss
+                # 注意：不更新 epochs_without_improvement（只在验证时更新）
 
-            self._save_checkpoint(epoch, train_loss, is_best=is_best)
-
-            # Periodic checkpoint
-            if (epoch + 1) % self.config.save_every_epochs == 0:
-                self._save_checkpoint(
-                    epoch, train_loss, suffix=f"epoch_{epoch + 1}"
-                )
+            # Save checkpoints (only on main process)
+            if self.is_main_process:
+                # 🔥 修复：只在两种情况下保存 checkpoint
+                # 1. 定期保存：每 save_every_epochs 个 epoch
+                # 2. 最佳模型：is_best=True 时保存 best_model.pth
+                
+                # 定期保存（每 N 个 epoch）
+                if (epoch + 1) % self.config.save_every_epochs == 0:
+                    self._save_checkpoint(
+                        epoch, monitored_value, 
+                        is_best=False,  # 定期保存不标记为 best
+                        suffix=f"epoch_{epoch + 1}"
+                    )
+                
+                # 最佳模型保存（仅当 is_best=True）
+                if is_best:
+                    self._save_checkpoint(
+                        epoch, monitored_value, 
+                        is_best=True,  # 保存为 best_model.pth
+                        suffix=""  # 空 suffix 表示保存为 best_model.pth
+                    )
 
             # Early stopping
-            if self.epochs_without_improvement >= self.config.early_stopping_patience:
-                print(
-                    f"Early stopping triggered after {epoch + 1} epochs "
-                    f"({self.epochs_without_improvement} epochs without improvement)"
-                )
+            # 🔥 修复：只在有验证结果时检查早停（避免误判）
+            if (
+                val_metrics is not None 
+                and self.epochs_without_improvement >= self.config.early_stopping_patience
+            ):
+                if self.is_main_process:
+                    print(
+                        f"Early stopping triggered after {epoch + 1} epochs "
+                        f"({self.epochs_without_improvement} epochs without improvement)"
+                    )
                 break
 
-        self.writer.close()
-        print(f"Training complete! Best loss: {self.best_loss:.4f}")
+        if self.writer is not None:
+            self.writer.close()
+        if self.is_main_process:
+            print(f"Training complete! Best loss: {self.best_loss:.4f}")
 
         return {
             "best_loss": self.best_loss,
             "best_iou": self.best_iou,
-            "final_epoch": epoch + 1,
+            "final_epoch": final_epoch,
         }
 

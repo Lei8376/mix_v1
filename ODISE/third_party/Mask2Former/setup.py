@@ -83,16 +83,18 @@ setup(
     packages=find_packages(exclude=("configs", "tests*")),
     python_requires=">=3.6",
     install_requires=[
-        "detectron2 @ https://github.com/facebookresearch/detectron2/archive/v0.6.zip",
+        # detectron2/panopticapi/lvis 请按需单独安装，避免 pip 从 GitHub 拉取失败
         "scipy>=1.7.3",
         "boto3>=1.21.25",
         "hydra-core==1.1.1",
         # there is BC breaking in omegaconf 2.2.1
         # see: https://github.com/omry/omegaconf/issues/939
         "omegaconf==2.1.1",
-        "panopticapi @ https://github.com/cocodataset/panopticapi/archive/master.zip",
-        "lvis @ https://github.com/lvis-dataset/lvis-api/archive/master.zip",
     ],
+    # 可选：需要 LVIS 评测时再装。有网络时执行: pip install "lvis @ https://github.com/lvis-dataset/lvis-api/archive/master.zip" --no-deps
+    extras_require={
+        "lvis": ["lvis @ https://github.com/lvis-dataset/lvis-api/archive/master.zip"],
+    },
     ext_modules=get_extensions(),
     cmdclass={"build_ext": torch.utils.cpp_extension.BuildExtension},
 )

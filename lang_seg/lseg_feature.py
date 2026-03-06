@@ -17,12 +17,13 @@ if current_dir not in sys.path:
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from dataset import data_loader as dl
+# data_loader 仅下方 __main__ 使用，延迟导入避免 train_open_vocab_v2 时拉取 SharedArray
 from lang_seg.modules.models.lseg_net import LSegNet
 
-#for LSeg module
-os.environ.setdefault("TORCH_HOME", "/home/featurize/.cache/torch")
-os.makedirs("/home/featurize/.cache/torch/checkpoints", exist_ok=True)
+# for LSeg module：使用用户可写路径，避免 /home/featurize 权限错误
+_torch_home = os.environ.get("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+os.environ.setdefault("TORCH_HOME", _torch_home)
+os.makedirs(os.path.join(_torch_home, "checkpoints"), exist_ok=True)
 
 class LSegExtractor(nn.Module):
     def __init__(self, label_path, ckpt_path, backbone = "clip_vitl16_384", crop_size=512, feat_dim = 256):
@@ -124,6 +125,7 @@ class LSegExtractor(nn.Module):
 
 """
 if __name__ == "__main__":
+    from dataset import data_loader as dl
 
     label_path = "label_files/ade20k_objectInfo150.txt"
     ckpt_path = "checkpoints/demo_e200.ckpt"

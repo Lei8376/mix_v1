@@ -56,3 +56,8 @@ def getMapping():
     )
     return point2img_mapper
 
+
+def get_point2img_mapper():
+    """Alias for getMapping() for consistency"""
+    return getMapping()
+

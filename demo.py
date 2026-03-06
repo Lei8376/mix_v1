@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from utils.util import AverageMeter
-#from model.modeling import MaskStablePixle
+from model.modeling import MaskStablePixle
 from dataset import data_loader as dl
 from MinkowskiEngine import SparseTensor
 import random
@@ -123,9 +123,10 @@ for epoch in range(num_epochs):
     model.train()
     
     for i, batch_data in enumerate(train_loader):
-        (ori_coords_3d, coords_3d, feat_3d, labels_3d, binary_label_3d, 
-         binary_label_2d, label_2d, img, x_label, y_label, 
-         inds_reconstruct, captions) = batch_data
+        # collation_fn 返回 16 项，训练只用前 12 项（model 里用 img 现场跑 LSeg+ODISE）
+        (ori_coords_3d, coords_3d, feat_3d, labels_3d, binary_label_3d,
+         binary_label_2d, label_2d, img, x_label, y_label,
+         inds_reconstruct, captions, *_) = batch_data
         
         sinput = SparseTensor(
             feat_3d.cuda(non_blocking=True), 

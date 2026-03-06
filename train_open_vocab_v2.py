@@ -106,6 +106,7 @@ def create_data_loaders(
         val_config = OpenVocabDatasetV2Config(
             data_config_path=dataset_config.data_config_path,
             precomputed_dir=dataset_config.precomputed_dir,
+            projection_dir=dataset_config.projection_dir,
             split=val_split,
             scannet200=dataset_config.scannet200,
             voxel_size=dataset_config.voxel_size,
@@ -115,6 +116,8 @@ def create_data_loaders(
             loop=1,
             eval_all=True,
             input_color=dataset_config.input_color,
+            max_samples=getattr(dataset_config, "max_samples", None),
+            max_samples_ratio=getattr(dataset_config, "max_samples_ratio", None),
         )
         val_dataset = OpenVocabScannetDatasetV2(val_config)
         val_loader = torch.utils.data.DataLoader(
@@ -151,8 +154,8 @@ def main() -> None:
     parser.add_argument(
         "--data-config-path",
         type=str,
-        default="/home/featurize/work/XMask3D/config/scannet/xmask3d_scannet_B10N9.yaml",
-        help="Path to dataset config YAML",
+        default="config/data_scannet_3d.yaml",
+        help="Path to dataset config YAML (DATA.data_root for 3D); relative to repo root if not abs",
     )
     parser.add_argument(
         "--precomputed-dir",
@@ -209,9 +212,11 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory")
     parser.add_argument("--resume", type=str, default="", help="Resume from checkpoint")
     parser.add_argument("--save-every-epochs", type=int, default=5, help="Save checkpoint interval")
+    parser.add_argument("--val-every-epochs", type=int, default=1, help="Validation interval")  # 🔥 修复
 
     # AMP and early stopping
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
+    parser.add_argument("--model-half", action="store_true", help="Store model in float16 to reduce VRAM (use with AMP)")
     parser.add_argument("--early-stopping-patience", type=int, default=10, help="Early stopping patience")
 
     # Misc
@@ -221,23 +226,33 @@ def main() -> None:
     args = parser.parse_args()
 
     # Load YAML config and override with command line args
-    yaml_config = load_yaml_config(args.config)
+    yaml_config = load_yaml_config(args.config) or {}
 
     # Set seed
     seed = yaml_config.get("seed", args.seed)
     set_seed(seed)
 
-    # Device
+    # Device and GPU selection
     device = yaml_config.get("device", args.device)
+    gpu_ids = yaml_config.get("gpu_ids", [0])
+    if isinstance(gpu_ids, int):
+        gpu_ids = [gpu_ids]
+    
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
         print("CUDA not available, using CPU")
+    elif device == "cuda" and gpu_ids:
+        # Set specific GPU
+        torch.cuda.set_device(gpu_ids[0])
+        device = f"cuda:{gpu_ids[0]}"
+        print(f"Using GPU: {gpu_ids[0]}")
 
     # Resolve paths
     repo_root = os.path.abspath(os.path.dirname(__file__))
 
-    # Dataset config
-    precomputed_dir = yaml_config.get("dataset", {}).get(
+    # Dataset config（YAML 中 dataset/model 等可能为 null，用 or {} 避免 .get 得到 None）
+    _dataset = yaml_config.get("dataset") or {}
+    precomputed_dir = _dataset.get(
         "precomputed_dir", args.precomputed_dir
     )
     if precomputed_dir and not os.path.isabs(precomputed_dir):
@@ -246,26 +261,48 @@ def main() -> None:
         print(f"Warning: precomputed_dir not found: {precomputed_dir}")
         precomputed_dir = None
 
+    data_config_path = _dataset.get(
+        "data_config_path", args.data_config_path
+    )
+    if data_config_path and not os.path.isabs(data_config_path):
+        data_config_path = os.path.join(repo_root, data_config_path)
+    if not data_config_path or not os.path.exists(data_config_path):
+        data_config_path = os.path.join(repo_root, "config/data_scannet_3d.yaml")
+    # 方案 B: 预计算投影目录
+    projection_dir = _dataset.get("projection_dir", None)
+    if projection_dir and not os.path.isabs(projection_dir):
+        projection_dir = os.path.join(repo_root, projection_dir)
+
     dataset_config = OpenVocabDatasetV2Config(
-        data_config_path=yaml_config.get("dataset", {}).get(
-            "data_config_path", args.data_config_path
-        ),
+        data_config_path=data_config_path,
         precomputed_dir=precomputed_dir,
-        split=yaml_config.get("dataset", {}).get("split", "train"),
-        scannet200=yaml_config.get("dataset", {}).get("scannet200", args.scannet200),
-        voxel_size=yaml_config.get("dataset", {}).get("voxel_size", args.voxel_size),
-        aug=yaml_config.get("dataset", {}).get("aug", args.aug),
+        projection_dir=projection_dir,
+        split=_dataset.get("split", "train"),
+        scannet200=_dataset.get("scannet200", args.scannet200),
+        voxel_size=_dataset.get("voxel_size", args.voxel_size),
+        aug=_dataset.get("aug", args.aug),
+        max_samples=_dataset.get("max_samples") or None,
+        max_samples_ratio=_dataset.get("max_samples_ratio") or None,
     )
 
+    _dataloader = yaml_config.get("dataloader") or {}
+    raw_batch_size = _dataloader.get("batch_size", args.batch_size)
+    # MinkowskiEngine BatchNorm requires >1 value per channel in training; batch_size 1 causes "Expected more than 1 value per channel".
+    if raw_batch_size < 2:
+        print(
+            f"Warning: batch_size={raw_batch_size} is not supported (MinkowskiEngine BatchNorm). Using batch_size=2."
+        )
+        raw_batch_size = 2
     dataloader_config = DataLoaderConfig(
-        batch_size=yaml_config.get("dataloader", {}).get("batch_size", args.batch_size),
-        num_workers=yaml_config.get("dataloader", {}).get("num_workers", args.num_workers),
+        batch_size=raw_batch_size,
+        num_workers=_dataloader.get("num_workers", args.num_workers),
     )
 
     # Model config
-    label_path = yaml_config.get("model", {}).get("label_path", args.label_path)
-    lseg_ckpt_path = yaml_config.get("model", {}).get("lseg_ckpt_path", args.lseg_ckpt_path)
-    odise_config_path = yaml_config.get("model", {}).get(
+    _model = yaml_config.get("model") or {}
+    label_path = _model.get("label_path", args.label_path)
+    lseg_ckpt_path = _model.get("lseg_ckpt_path", args.lseg_ckpt_path)
+    odise_config_path = _model.get(
         "odise_model_config_path", args.odise_model_config_path
     )
 
@@ -282,32 +319,38 @@ def main() -> None:
         label_path=label_path if label_path and os.path.exists(label_path) else None,
         lseg_ckpt_path=lseg_ckpt_path if lseg_ckpt_path and os.path.exists(lseg_ckpt_path) else None,
         odise_model_config_path=odise_config_path,
+        pc_arch=_model.get("pc_arch", "MinkUNet34C"),
     )
 
     # Trainer config
-    resume_checkpoint = yaml_config.get("trainer", {}).get("resume", args.resume)
+    _trainer = yaml_config.get("trainer") or {}
+    resume_checkpoint = _trainer.get("resume", args.resume)
     if resume_checkpoint and not os.path.isabs(resume_checkpoint):
         resume_checkpoint = os.path.join(repo_root, resume_checkpoint)
     if resume_checkpoint and not os.path.exists(resume_checkpoint):
         resume_checkpoint = None
 
     trainer_config = OpenVocabTrainerV2Config(
-        num_epochs=yaml_config.get("trainer", {}).get("num_epochs", args.num_epochs),
-        base_lr=yaml_config.get("trainer", {}).get("base_lr", args.base_lr),
-        weight_decay=yaml_config.get("trainer", {}).get("weight_decay", args.weight_decay),
-        grad_clip_norm=yaml_config.get("trainer", {}).get("grad_clip_norm", args.grad_clip_norm),
-        warmup_epochs=yaml_config.get("trainer", {}).get("warmup_epochs", args.warmup_epochs),
-        scheduler_type=yaml_config.get("trainer", {}).get("scheduler_type", args.scheduler_type),
-        bce_weight=yaml_config.get("trainer", {}).get("bce_weight", args.bce_weight),
-        dice_weight=yaml_config.get("trainer", {}).get("dice_weight", args.dice_weight),
-        log_dir=yaml_config.get("trainer", {}).get("log_dir", args.log_dir),
-        checkpoint_dir=yaml_config.get("trainer", {}).get("checkpoint_dir", args.checkpoint_dir),
-        save_every_epochs=yaml_config.get("trainer", {}).get("save_every_epochs", args.save_every_epochs),
+        num_epochs=_trainer.get("num_epochs", args.num_epochs),
+        base_lr=_trainer.get("base_lr", args.base_lr),
+        weight_decay=_trainer.get("weight_decay", args.weight_decay),
+        grad_clip_norm=_trainer.get("grad_clip_norm", args.grad_clip_norm),
+        warmup_epochs=_trainer.get("warmup_epochs", args.warmup_epochs),
+        scheduler_type=_trainer.get("scheduler_type", args.scheduler_type),
+        bce_weight=_trainer.get("bce_weight", args.bce_weight),
+        dice_weight=_trainer.get("dice_weight", args.dice_weight),
+        min_points_per_mask=_trainer.get("min_points_per_mask", 10),  # 🔥 从配置读取
+        log_dir=_trainer.get("log_dir", args.log_dir),
+        checkpoint_dir=_trainer.get("checkpoint_dir", args.checkpoint_dir),
+        save_every_epochs=_trainer.get("save_every_epochs", args.save_every_epochs),
+        val_every_epochs=_trainer.get("val_every_epochs", args.val_every_epochs),  # 🔥 修复：从配置读取
         use_amp=not args.no_amp,
-        early_stopping_patience=yaml_config.get("trainer", {}).get(
+        early_stopping_patience=_trainer.get(
             "early_stopping_patience", args.early_stopping_patience
         ),
         resume_checkpoint=resume_checkpoint,
+        use_model_half=_trainer.get("use_model_half", args.model_half),
+        gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),  # 🔥 梯度累积
     )
 
     # Validate configuration
@@ -338,12 +381,19 @@ def main() -> None:
     print("Configuration:")
     print(f"  Device: {device}")
     print(f"  Precomputed features: {use_precomputed}")
+    print(f"  Precomputed projections: {projection_dir if projection_dir and os.path.exists(projection_dir or '') else 'No (runtime)'}")
     print(f"  Online extraction: {can_extract_online}")
-    print(f"  Batch size: {dataloader_config.batch_size}")
+    print(f"  Batch size: {dataloader_config.batch_size} (min 2 for MinkowskiEngine BatchNorm)")
+    print(f"  3D backbone: {model_config.pc_arch}")
     print(f"  Epochs: {trainer_config.num_epochs}")
     print(f"  Learning rate: {trainer_config.base_lr}")
     print(f"  AMP enabled: {trainer_config.use_amp}")
+    print(f"  Model half (float16): {trainer_config.use_model_half}")
     print("=" * 60)
+
+    # Free GPU memory before creating model (helps avoid OOM when model is large)
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     # Create data loaders
     train_loader, val_loader = create_data_loaders(
@@ -351,7 +401,7 @@ def main() -> None:
     )
     print(f"Train loader: {len(train_loader)} batches")
 
-    # Create model
+    # Create model (smaller backbone via config model.pc_arch, e.g. MinkUNet18A, reduces VRAM)
     model = OpenVocab3DFusionModelV2(model_config)
 
     # Create trainer and run
