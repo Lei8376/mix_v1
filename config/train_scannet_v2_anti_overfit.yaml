@@ -26,8 +26,8 @@ dataloader:
 # ============================================================
 dataset:
   data_config_path: config/data_scannet_3d.yaml
-  precomputed_dir: /home/featurize/data/pixel_pooled
-  projection_dir: /home/featurize/data/scannet_projections
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
+  projection_dir: /home/sunl/work/mix/data/scannet_projections
   split: train
 
 # ============================================================

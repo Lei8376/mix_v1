@@ -232,7 +232,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
         input_coords = batch_input["coords_3d"].int().to(sinput.device)  # (N_total, 4)
         voxel_coords = sinput.C  # (M_voxels, 4)
         
-        # 使用向量化哈希映射（比 for 循环 + cpu().tolist() 快 10-100 倍）
+        # 使用向量化哈希映射（比 for 循环 + cpu().tolist() 
         # 将 4D 坐标编码为单个整数，然后用 searchsorted 查找
         def _encode_coords(coords_4d):
             """将 (N, 4) 坐标编码为 (N,) 整数，用于快速匹配"""

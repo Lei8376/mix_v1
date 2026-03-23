@@ -137,10 +137,10 @@ def process_one_scene(scene_name, data_root_3d, data_root_2d, npz_dir, output_di
 
 def main():
     parser = argparse.ArgumentParser(description="方案 B: 预计算投影坐标")
-    parser.add_argument("--data-root-3d", type=str, default="/home/featurize/data/scannet_3d")
-    parser.add_argument("--data-root-2d", type=str, default="/home/featurize/data/scannet_2d")
-    parser.add_argument("--npz-dir", type=str, default="/home/featurize/data/pixel_pooled")
-    parser.add_argument("--output-dir", type=str, default="/home/featurize/data/scannet_projections")
+    parser.add_argument("--data-root-3d", type=str, default="/home/sunl/work/mix/data/scannet_3d")
+    parser.add_argument("--data-root-2d", type=str, default="/home/sunl/work/mix/data/scannet_2d")
+    parser.add_argument("--npz-dir", type=str, default="/home/sunl/work/mix/data/pixel_pooled")
+    parser.add_argument("--output-dir", type=str, default="/home/sunl/work/mix/data/scannet_projections")
     parser.add_argument("--splits", type=str, nargs="+", default=["train", "val"])
     parser.add_argument("--min-visible", type=int, default=400,
                         help="最少可见点数，低于此值的帧跳过")

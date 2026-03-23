@@ -4,7 +4,7 @@ dataloader:
 dataset:
   data_config_path: config/data_scannet_3d.yaml
   max_samples_ratio: 0.25
-  precomputed_dir: /home/featurize/data/pixel_pooled
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
   split: train
 # model: null
 # For low VRAM, use smaller 3D backbone and/or enable use_model_half in trainer

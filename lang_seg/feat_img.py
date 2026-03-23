@@ -1,10 +1,10 @@
-#python feat_img.py --img /home/featurize/data/scannet_2d/scene0000_00/color/0.jpg --out out/feat.npy
+#python feat_img.py --img /home/sunl/work/mix/data/scannet_2d/scene0000_00/color/0.jpg --out out/feat.npy
 ## choose a writable cache root
-#export TORCH_HOME=/home/featurize/.cache/torch
+#export TORCH_HOME=/home/sunl/.cache/torch
 #mkdir -p "$TORCH_HOME/hub/checkpoints"
 
 # copy your existing file into the cache
-#cp /home/featurize/work/lang-seg/checkpoints/L_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.1-sd_0.1--imagenet2012-steps_20k-lr_0.01-res_384.npz \
+#cp /home/sunl/work/mix/lang_seg/checkpoints/L_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.1-sd_0.1--imagenet2012-steps_20k-lr_0.01-res_384.npz \
 #   "$TORCH_HOME/hub/checkpoints/"
 
 import os
@@ -22,8 +22,8 @@ from modules.models.lseg_net import LSegNet
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(device)
 
-os.environ.setdefault("TORCH_HOME", "/home/featurize/.cache/torch")
-os.makedirs("/home/featurize/.cache/torch/checkpoints", exist_ok=True)
+os.environ.setdefault("TORCH_HOME", "/home/sunl/.cache/torch")
+os.makedirs("/home/sunl/.cache/torch/checkpoints", exist_ok=True)
 
 def load_ade_labels():
     path = "label_files/ade20k_objectInfo150.txt"

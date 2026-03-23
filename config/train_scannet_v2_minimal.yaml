@@ -14,8 +14,8 @@ dataset:
   data_config_path: config/data_scannet_3d.yaml
   max_samples_ratio: 0.2  # 只使用 20% 数据 (19,044 samples)
                           # 修改为 0.1 = 10%, 1.0 = 100%, 删除 = 100%
-  precomputed_dir: /home/featurize/data/pixel_pooled
-  projection_dir: /home/featurize/data/scannet_projections
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
+  projection_dir: /home/sunl/work/mix/data/scannet_projections
   split: train
 
 # 模型

@@ -14,7 +14,7 @@ _gt_stats_global = {
 }
 
 
-def dice_loss(pred, target, smooth=1.0):
+def dice_loss(pred, target, smooth=1.0):#这个点是否属于这个 mask
     """
     Compute Dice loss for binary masks (legacy global version).
     pred: (N, K) - soft predictions (sigmoid output)
@@ -252,8 +252,8 @@ class Criteria(nn.Module):
                     # 原始 BCE（不推荐用于类别不均衡任务）
                     bce = F.binary_cross_entropy_with_logits(pred_logits, gt_3d, reduction='mean')
                 
-                # 🔥 修复 2: 使用 per-mask dice loss
-                pred_probs_kept = torch.sigmoid(pred_logits)
+                # 🔥 修复 2: 使用 per-mask dice loss 
+                pred_probs_kept = torch.sigmoid(pred_logits) #预测出来的前景区域和 GT 前景区域重合得好不好
                 if self.use_per_mask_dice:
                     dice = dice_loss_per_mask(pred_probs_kept, gt_3d)
                 else:

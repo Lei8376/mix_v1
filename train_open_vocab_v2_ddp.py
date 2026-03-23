@@ -37,6 +37,21 @@ from trainer.open_vocab_trainer_v2 import (
     OpenVocabTrainerV2,
     OpenVocabTrainerV2Config,
 )
+# 新版蒸馏 trainer（通过 --use-distill 启用）
+try:
+    from experiment_distill.trainer_distill import DistillTrainer, DistillTrainerConfig
+    _DISTILL_AVAILABLE = True
+except ImportError:
+    _DISTILL_AVAILABLE = False
+
+# Mask Distillation trainer（通过 --use-mask-distill 启用，Diff2Scene 方案）
+try:
+    from experiment_mask_distill.trainer_mask_distill import (
+        MaskDistillTrainer, MaskDistillTrainerConfig,
+    )
+    _MASK_DISTILL_AVAILABLE = True
+except ImportError:
+    _MASK_DISTILL_AVAILABLE = False
 
 
 def is_main_process():
@@ -271,6 +286,12 @@ def main() -> None:
     # Misc
     parser.add_argument("--seed", type=int, default=1342)
     parser.add_argument("--device", type=str, default="cuda")
+    # 新版蒸馏训练开关
+    parser.add_argument("--use-distill", action="store_true",
+                        help="Use distillation trainer (experiment_distill)")
+    # Mask distillation 训练开关（Diff2Scene 方案）
+    parser.add_argument("--use-mask-distill", action="store_true",
+                        help="Use mask distillation trainer (experiment_mask_distill, Diff2Scene)")
 
     args = parser.parse_args()
     
@@ -381,7 +402,8 @@ def main() -> None:
     base_lr = _trainer.get("base_lr", args.base_lr)
     scaled_lr = base_lr * world_size if world_size > 1 else base_lr
 
-    trainer_config = OpenVocabTrainerV2Config(
+    # 共用的 trainer 超参（旧版和新版都有的字段）
+    _common_trainer_kwargs = dict(
         num_epochs=_trainer.get("num_epochs", args.num_epochs),
         base_lr=scaled_lr,
         weight_decay=_trainer.get("weight_decay", args.weight_decay),
@@ -390,17 +412,50 @@ def main() -> None:
         scheduler_type=_trainer.get("scheduler_type", args.scheduler_type),
         bce_weight=_trainer.get("bce_weight", args.bce_weight),
         dice_weight=_trainer.get("dice_weight", args.dice_weight),
-        min_points_per_mask=_trainer.get("min_points_per_mask", 10),  # 🔥 从配置读取
+        min_points_per_mask=_trainer.get("min_points_per_mask", 10),
         log_dir=_trainer.get("log_dir", args.log_dir),
         checkpoint_dir=_trainer.get("checkpoint_dir", args.checkpoint_dir),
         save_every_epochs=_trainer.get("save_every_epochs", args.save_every_epochs),
-        val_every_epochs=_trainer.get("val_every_epochs", args.val_every_epochs),  # 🔥 修复：从配置读取
+        val_every_epochs=_trainer.get("val_every_epochs", args.val_every_epochs),
         use_amp=not args.no_amp,
         early_stopping_patience=_trainer.get("early_stopping_patience", args.early_stopping_patience),
         resume_checkpoint=resume_checkpoint,
         use_model_half=_trainer.get("use_model_half", args.model_half),
-        gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),  # 🔥 梯度累积
+        gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),
     )
+
+    use_distill      = args.use_distill      or _trainer.get("use_distill",      False)
+    use_mask_distill = args.use_mask_distill or _trainer.get("use_mask_distill", False)
+
+    if use_mask_distill:
+        if not _MASK_DISTILL_AVAILABLE:
+            raise ImportError("experiment_mask_distill not found; cannot use --use-mask-distill")
+        # _common_trainer_kwargs 已含 bce_weight/dice_weight，mask distill 用独立值覆盖
+        _mask_distill_kwargs = {k: v for k, v in _common_trainer_kwargs.items()
+                                if k not in ("bce_weight", "dice_weight")}
+        trainer_config = MaskDistillTrainerConfig(
+            **_mask_distill_kwargs,
+            mask_distill_weight=_trainer.get("mask_distill_weight", 1.0),
+            bce_weight=_trainer.get("bce_weight", 0.0),
+            dice_weight=_trainer.get("dice_weight", 0.0),
+        )
+        if is_main_process():
+            print(f"[MaskDistill] mask_distill_weight={trainer_config.mask_distill_weight}  "
+                  f"bce_weight={trainer_config.bce_weight}  "
+                  f"dice_weight={trainer_config.dice_weight}")
+    elif use_distill:
+        if not _DISTILL_AVAILABLE:
+            raise ImportError("experiment_distill not found; cannot use --use-distill")
+        trainer_config = DistillTrainerConfig(
+            **_common_trainer_kwargs,
+            feat_loss_weight=_trainer.get("feat_loss_weight", 1.0),
+            mask_loss_weight=_trainer.get("mask_loss_weight", 0.1),
+        )
+        if is_main_process():
+            print(f"[Distill] feat_loss_weight={trainer_config.feat_loss_weight}  "
+                  f"mask_loss_weight={trainer_config.mask_loss_weight}")
+    else:
+        trainer_config = OpenVocabTrainerV2Config(**_common_trainer_kwargs)
 
     # Validate configuration
     if not os.path.exists(dataset_config.data_config_path):
@@ -460,16 +515,37 @@ def main() -> None:
             print("Model wrapped with DistributedDataParallel")
 
     # Create trainer and run
-    trainer = OpenVocabTrainerV2(
-        model=model,
-        train_loader=train_loader,
-        config=trainer_config,
-        device=device,
-        val_loader=val_loader,
-        train_sampler=train_sampler,  # Pass sampler for epoch shuffling
-        is_distributed=use_distributed,
-        is_main_process=is_main_process(),
-    )
+    if use_mask_distill:
+        trainer = MaskDistillTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=trainer_config,
+            device=device,
+            rank=get_rank(),
+            train_sampler=train_sampler,
+        )
+    elif use_distill:
+        trainer = DistillTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=trainer_config,
+            device=device,
+            rank=get_rank(),
+            train_sampler=train_sampler,
+        )
+    else:
+        trainer = OpenVocabTrainerV2(
+            model=model,
+            train_loader=train_loader,
+            config=trainer_config,
+            device=device,
+            val_loader=val_loader,
+            train_sampler=train_sampler,
+            is_distributed=use_distributed,
+            is_main_process=is_main_process(),
+        )
 
     try:
         results = trainer.train()

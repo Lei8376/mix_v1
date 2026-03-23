@@ -130,7 +130,7 @@ if __name__ == "__main__":
     label_path = "label_files/ade20k_objectInfo150.txt"
     ckpt_path = "checkpoints/demo_e200.ckpt"
 
-    file = "/home/featurize/work/XMask3D/config/scannet/xmask3d_scannet_B10N9.yaml"
+    file = "/home/sunl/work/mix/config/data_scannet_3d.yaml"
     res = dl.read_yaml(file)
     data_loader = dl.ScannetLoader(
         datapath_prefix=res['DATA']['data_root'],

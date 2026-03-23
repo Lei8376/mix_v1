@@ -288,10 +288,10 @@ def main():
     
     # 数据集参数
     parser.add_argument('--data-root', type=str,
-                        default='/home/featurize/data/scannet_3d',
+                        default='/home/sunl/work/mix/data/scannet_3d',
                         help='数据集根目录')
     parser.add_argument('--precomputed-dir', type=str,
-                        default='/home/featurize/data/pixel_pooled',
+                        default='/home/sunl/work/mix/data/pixel_pooled',
                         help='预计算特征目录')
     parser.add_argument('--data-config-path', type=str,
                         default='config/data_scannet_3d.yaml',

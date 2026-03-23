@@ -1,0 +1,62 @@
+# ============================================================
+# Mask Distillation 训练配置（experiment_mask_distill）
+# 对应 Diff2Scene 论文 Eq.1&2：mask-level cosine distillation
+#
+# 主损失：
+#   L = (1/K) * sum_k [1 - cos(B_k^{3d'}, B_k^{3d})]
+#   B_k^{3d'} = sigmoid(<F^{3d}, f_k^{2d}>)
+#   B_k^{3d}  = lifted 2D soft mask（直接取概率值，不二值化）
+#
+# 辅助损失（bce_weight=0 表示不使用）：
+#   L_aux = bce_weight * L_bce + dice_weight * L_dice
+# ============================================================
+
+gpu_ids: [0]
+
+dataloader:
+  batch_size: 16
+  num_workers: 8
+
+dataset:
+  data_config_path: config/data_scannet_3d.yaml
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
+  projection_dir: /home/sunl/work/mix/data/scannet_projections
+  split: train
+  # 快速验证先用 30% 数据，确认能跑通再放开
+  max_samples_ratio: 1
+
+model: null
+
+trainer:
+  # ----- 学习率 -----
+  base_lr: 0.0001
+  warmup_epochs: 1
+  scheduler_type: cosine
+  weight_decay: 0.0004
+
+  # ----- 训练轮数 -----
+  num_epochs: 60
+
+  # ----- 验证和保存 -----
+  val_every_epochs: 1
+  save_every_epochs: 5
+  checkpoint_dir: checkpoints/mask_distill.2
+  log_dir: runs/mask_distill.2
+
+  # ----- Mask Distillation Loss 权重（Diff2Scene 方案）-----
+  mask_distill_weight: 1.0   # L_mask_distill 主损失权重
+  bce_weight: 0.0            # 辅助 BCE（先纯试 mask distillation，设为 0）
+  dice_weight: 0.0           # 辅助 Dice（同上，设为 0）
+  min_points_per_mask: 10    # GT mask 至少需要多少个正样本点才参与 loss
+
+  # ----- 稳定性 -----
+  grad_clip_norm: 1.0
+  early_stopping_patience: 999    # 关闭 early stopping（设为足够大的值）
+  gradient_accumulation_steps: 2
+
+  # ----- 启用 mask distillation trainer -----
+  use_mask_distill: true
+
+  # # ----- 恢复训练（可选）-----
+  resume: checkpoints/mask_distill.2/checkpoint_epoch_20.pth
+seed: 1342

@@ -1,0 +1,54 @@
+# ============================================================
+# 新版蒸馏训练配置（experiment_distill）
+# 主损失: point-level feature distillation (cosine)
+# 辅助损失: mask BCE+Dice (weight=0.1)
+# 评估指标: 语义 mIoU（OpenScene 风格，20类）
+# ============================================================
+
+gpu_ids: [0]
+
+dataloader:
+  batch_size: 16         # 蒸馏 loss 里有 teacher 构建循环，比旧版略慢，建议先用 4
+  num_workers: 8
+dataset:
+  data_config_path: config/data_scannet_3d.yaml
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
+  projection_dir: /home/sunl/work/mix/data/scannet_projections
+  split: train
+  # 快速验证先用 10% 数据（约 9000 样本），确认能跑通再放开
+  max_samples_ratio: 0.3
+
+model: null
+
+trainer:
+  # ----- 学习率 -----
+  base_lr: 0.0001
+  warmup_epochs: 1
+  scheduler_type: cosine
+  weight_decay: 0.0004
+
+  # ----- 训练轮数 -----
+  num_epochs: 60
+
+  # ----- 验证和保存 -----
+  val_every_epochs: 2
+  save_every_epochs: 5
+  checkpoint_dir: checkpoints/distill.1
+  log_dir: runs/distill.1
+
+  # ----- 新版 Loss 权重 -----
+  feat_loss_weight: 1.0    # L_feat 主损失（cosine distillation）
+  mask_loss_weight: 0.1    # L_mask 辅助损失（旧 BCE+Dice 降权）
+  bce_weight: 1.0
+  dice_weight: 1.0
+  min_points_per_mask: 10
+
+  # ----- 稳定性 -----
+  grad_clip_norm: 1.0
+  early_stopping_patience: 15
+  gradient_accumulation_steps: 2
+
+  # ----- 恢复训练（可选） -----
+  # resume: checkpoints/distill.1/best_model.pth
+
+seed: 1342

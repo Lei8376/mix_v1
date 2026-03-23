@@ -20,9 +20,9 @@ import torch
 import timm
 
 import os
-os.environ["TORCH_HOME"] = "/home/featurize/.cache/torch"
-os.environ["XDG_CACHE_HOME"] = "/home/featurize/.cache"
-os.makedirs("/home/featurize/.cache/torch/checkpoints", exist_ok=True)
+os.environ["TORCH_HOME"] = "/home/sunl/.cache/torch"
+os.environ["XDG_CACHE_HOME"] = "/home/sunl/.cache"
+os.makedirs("/home/sunl/.cache/torch/checkpoints", exist_ok=True)
 
 import fusion_util
 
@@ -58,7 +58,7 @@ module = LSegModule.load_from_checkpoint(
 )
 
 def load_ade_labels():
-    path = "/home/featurize/work/lang-seg/label_files/ade20k_objectInfo150.txt"
+    path = "/home/sunl/work/mix/lang_seg/label_files/ade20k_objectInfo150.txt"
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing {path}. Run in repo root.")
     labels = []
@@ -96,7 +96,7 @@ transform = transforms.Compose(
 )
 
 
-img_dir = "/home/featurize/data/scannet_2d/scene0000_00/color/0.jpg"
+img_dir = "/home/sunl/work/mix/data/scannet_2d/scene0000_00/color/0.jpg"
 feat_2d = fusion_util.extract_lseg_img_feature(img_dir, transform, evaluator, labels)
 
 print(feat_2d.shape)

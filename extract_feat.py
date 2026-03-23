@@ -22,7 +22,7 @@ os.makedirs("/home/featurize/.cache/torch/checkpoints", exist_ok=True)
 
 if __name__ == "__main__":
 
-    file = "/home/featurize/work/XMask3D/config/scannet/xmask3d_scannet_B10N9.yaml"
+    file = "/home/sunl/work/mix/config/data_scannet_3d.yaml"
     
     label_path = "lang_seg/label_files/ade20k_objectInfo150.txt"
     ckpt_path = "lang_seg/checkpoints/demo_e200.ckpt"

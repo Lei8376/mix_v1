@@ -25,8 +25,8 @@ def test_criterion_with_negative_logits():
     # 加载数据
     config = OpenVocabDatasetV2Config(
         data_config_path='config/data_scannet_3d.yaml',
-        precomputed_dir='/home/featurize/data/pixel_pooled',
-        projection_dir='/home/featurize/data/scannet_projections',
+        precomputed_dir='/home/sunl/work/mix/data/pixel_pooled',
+        projection_dir='/home/sunl/work/mix/data/scannet_projections',
         split='train',
         max_samples_ratio=0.01,
         voxel_size=0.05,
@@ -90,8 +90,8 @@ def test_validation_iou():
     # 加载 val 数据
     config = OpenVocabDatasetV2Config(
         data_config_path='config/data_scannet_3d.yaml',
-        precomputed_dir='/home/featurize/data/pixel_pooled',
-        projection_dir='/home/featurize/data/scannet_projections',
+        precomputed_dir='/home/sunl/work/mix/data/pixel_pooled',
+        projection_dir='/home/sunl/work/mix/data/scannet_projections',
         split='val',
         max_samples_ratio=0.01,
         voxel_size=0.05,

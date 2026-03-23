@@ -13,8 +13,12 @@ import numpy as np
 import torch
 from PIL import Image
 import matplotlib.pyplot as plt
+import matplotlib
+# 修复中文乱码：使用系统自带的中文字体
+matplotlib.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'AR PL UMing CN', 'WenQuanYi Micro Hei', 'SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False  # 修复负号显示
 
-sys.path.insert(0, '/home/featurize/work/mix')
+sys.path.insert(0, '/home/sunl/work/mix')
 
 def verify_projection(scene_name, frame_idx, 
                      data_root_3d, data_root_2d, npz_dir, proj_dir):
@@ -80,13 +84,13 @@ def verify_projection(scene_name, frame_idx,
     
     # 原图
     axes[0, 0].imshow(img)
-    axes[0, 0].set_title(f"原图 {img.shape}")
+    axes[0, 0].set_title(f"原始RGB图 {img.shape}", fontsize=10)
     axes[0, 0].axis('off')
     
     # Mask 缩放后的图
     axes[0, 1].imshow(img_resized)
     axes[0, 1].scatter(x_label[::10], y_label[::10], c='red', s=1, alpha=0.5)
-    axes[0, 1].set_title(f"投影点（每 10 个取 1）")
+    axes[0, 1].set_title(f"投影点（每10个采样1个）", fontsize=10)
     axes[0, 1].set_xlim(0, W)
     axes[0, 1].set_ylim(H, 0)
     
@@ -96,30 +100,32 @@ def verify_projection(scene_name, frame_idx,
         in_mask_0 = masks[0][y_label, x_label] > 0.5
         axes[0, 2].scatter(x_label[in_mask_0][::5], y_label[in_mask_0][::5], 
                           c='red', s=2, alpha=0.8)
-        axes[0, 2].set_title(f"Mask 0 + 投影点（在内）")
+        axes[0, 2].set_title(f"Mask 0 + 投影点（在内部）", fontsize=10)
     
     # 所有 mask 叠加
     all_masks = masks.sum(axis=0) > 0
     axes[1, 0].imshow(all_masks, cmap='gray')
     axes[1, 0].scatter(x_label[::10], y_label[::10], c='red', s=1, alpha=0.5)
-    axes[1, 0].set_title("所有 Mask + 投影点")
+    axes[1, 0].set_title("所有Mask + 投影点", fontsize=10)
     
     # 每个点的 mask 数量分布
     point_mask_map = np.zeros((H, W), dtype=int)
     point_mask_map[y_label, x_label] = num_masks_per_point
     im = axes[1, 1].imshow(point_mask_map, cmap='viridis')
-    axes[1, 1].set_title("每个点属于多少个 mask")
+    axes[1, 1].set_title("每个点属于的Mask数量", fontsize=10)
     plt.colorbar(im, ax=axes[1, 1])
     
     # 统计图
     unique, counts = np.unique(num_masks_per_point, return_counts=True)
     axes[1, 2].bar(unique, counts)
-    axes[1, 2].set_xlabel("Mask 数量")
-    axes[1, 2].set_ylabel("点数")
-    axes[1, 2].set_title("Mask 数量分布")
+    axes[1, 2].set_xlabel("Mask数量", fontsize=10)
+    axes[1, 2].set_ylabel("点的数量", fontsize=10)
+    axes[1, 2].set_title("Mask数量分布", fontsize=10)
     
     plt.tight_layout()
-    output_path = f"/home/featurize/work/mix/verify_proj_{scene_name}_{frame_idx}.png"
+    output_dir = "/home/sunl/work/mix/test"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = f"{output_dir}/verify_proj_{scene_name}_{frame_idx}.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"\n✅ 可视化保存到: {output_path}")
     plt.close()
@@ -133,15 +139,15 @@ def verify_projection(scene_name, frame_idx,
 
 if __name__ == "__main__":
     # 测试几个帧
-    data_root_3d = "/home/featurize/data/scannet_3d"
-    data_root_2d = "/home/featurize/data/scannet_2d"
-    npz_dir = "/home/featurize/data/pixel_pooled"
-    proj_dir = "/home/featurize/data/scannet_projections"
+    data_root_3d = "/home/sunl/work/mix/data/scannet_3d"
+    data_root_2d = "/home/sunl/work/mix/data/scannet_2d"
+    npz_dir = "/home/sunl/work/mix/data/pixel_pooled"
+    proj_dir = "/home/sunl/work/mix/data/scannet_projections"
     
     test_cases = [
-        ("scene0000_00", "0"),
-        ("scene0000_00", "100"),
-        ("scene0000_00", "500"),
+        ("scene0002_01", "0"),
+        ("scene0003_02", "100"),
+        ("scene0004_00", "100"),
     ]
     
     print("=" * 80)
@@ -152,5 +158,5 @@ if __name__ == "__main__":
         print(f"\n{'=' * 80}")
         result = verify_projection(scene, frame, data_root_3d, data_root_2d, 
                                    npz_dir, proj_dir)
-        print(f"结果: 可见点 {result['total_visible']}, 有 mask {result['has_mask']} ({result['has_mask']/result['total_visible']*100:.1f}%)")
+        print(f"结果: 可见点 {result['total_visible']}, 有mask {result['has_mask']} ({result['has_mask']/result['total_visible']*100:.1f}%)")
         print()

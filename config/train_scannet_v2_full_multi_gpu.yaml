@@ -8,7 +8,7 @@
 # ============================================================
 # GPU 配置
 # ============================================================
-gpu_ids: [0, 1]  # 单卡模式使用的 GPU 编号（0=第一张卡）
+gpu_ids: [0]  # 单卡模式使用的 GPU 编号（0=第一张卡）
                  # 🔥 多卡训练时，由命令行 CUDA_VISIBLE_DEVICES 控制
                  # 例: CUDA_VISIBLE_DEVICES=0,1 表示使用第1、2张卡
 
@@ -16,14 +16,15 @@ gpu_ids: [0, 1]  # 单卡模式使用的 GPU 编号（0=第一张卡）
 # 数据加载配置
 # ============================================================
 dataloader:
-  batch_size: 16  # 🔥 多卡训练：每个 GPU 的批大小
-                  # - 2 卡时总批大小 = 16 × 2 = 32
-                  # - 显存不足时可减小 (8, 4)
+  batch_size: 8   # 🔥 单卡训练建议值（显存足够可用 16）
+                  # - 多卡时: 每个 GPU 的批大小
+                  # - 单卡时: 总批大小
+                  # - 显存不足时可减小到 4 或 2
   
-  num_workers: 12  # 数据加载线程数
-                   # - 增大可加速数据加载
-                   # - 推荐值: 4-16
-                   # - 过大会占用过多内存
+  num_workers: 8  # 数据加载线程数
+                  # - 单卡建议: 4-8
+                  # - 多卡建议: 8-16
+                  # - 过大会占用过多内存
 
 # ============================================================
 # 数据集配置
@@ -31,11 +32,11 @@ dataloader:
 dataset:
   data_config_path: config/data_scannet_3d.yaml  # 3D 数据集路径配置文件
   
-  precomputed_dir: /home/featurize/data/pixel_pooled  # 预计算的 2D 特征目录
-                                                       # 包含 ODISE 生成的 .npz 文件
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled  # 预计算的 2D 特征目录
+                                                           # 包含 ODISE 生成的 .npz 文件
   
-  projection_dir: /home/featurize/data/scannet_projections  # 预计算的投影坐标目录
-                                                             # 包含 3D→2D 投影对应关系
+  projection_dir: /home/sunl/work/mix/data/scannet_projections  # 预计算的投影坐标目录
+                                                                 # 包含 3D→2D 投影对应关系
   
   split: train  # 数据集划分: train (训练集) / val (验证集) / test (测试集)
   
@@ -128,7 +129,7 @@ trainer:
                                   # - DDP 下使用 no_sync() 优化，速度只慢 5-15%
   
   # 【可选】恢复训练
-  resume: checkpoints/full.4/checkpoint_epoch_17.pth  # 🔴 注释掉：从头训练，不 resume
+  # resume: checkpoints/full.4/checkpoint_epoch_17.pth  # 取消注释以恢复训练
 
 # ============================================================
 # 随机种子（确保可复现性）

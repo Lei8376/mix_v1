@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 import numpy as np
 
-path = "/home/featurize/data/precomputed_2d"
+path = "/home/sunl/work/mix/data/precomputed_2d"
 
 scene = "scene0000_00"
 
