@@ -1,182 +1,67 @@
-"""
-语义 mIoU 计算模块（与 experiment_distill 版完全相同，独立一份方便后续调整）
+"""Compatibility entry for semantic IoU evaluation.
 
-流程：
-  1. 用冻结的 CLIP ViT-L/14 对 20 个 ScanNet 类别编码成文本特征 T (20, 768)
-  2. 对每个 3D 点：pred_class = argmax(normalize(pred_3d[i]) @ T.T)
-  3. 和 GT label 对比，按类别计算 IoU，取平均
-
-注意：
-  - GT label 是 nyu40id（1-40），需要映射到 0-19 的 20 类索引
-  - ignore_label=0（unlabeled/unknown）的点不计入评估
+The implementation lives in evaluate.semantic_iou so training, validation, and
+standalone evaluation use the same Diff2Scene Eq.3 metric code.
 """
 
-import numpy as np
-import torch
-import torch.nn.functional as F
-from typing import Dict
-
-# ScanNet 20 类标签名（按 nyu40 类别顺序）
-SCANNET_LABELS_20 = (
-    'wall', 'floor', 'cabinet', 'bed', 'chair',
-    'sofa', 'table', 'door', 'window', 'bookshelf',
-    'picture', 'counter', 'desk', 'curtain', 'refrigerator',
-    'shower curtain', 'toilet', 'sink', 'bathtub', 'otherfurniture',
+from evaluate.semantic_iou import (
+    IGNORE_LABEL,
+    SCANNET_LABELS_20,
+    AverageMeter,
+    Diff2SceneSemanticEvaluator,
+    Diff2SceneSemanticMIoUTracker,
+    ODISEPCSemanticMIoUTracker,
+    SemanticMIoUTracker,
+    XMask3DSemanticEvaluator,
+    build_text_features,
+    canonical_prompt_label,
+    compute_iou,
+    diff2scene_class_probs_predict,
+    diff2scene_dual_mask_class_probs_predict,
+    mask_feature_class_probs,
+    diff2scene_mask_feature_predict,
+    odise_geometric_mask_feature_predict,
+    odise_geometric_dual_mask_predict,
+    diff2scene_point_class_scores,
+    intersectionAndUnion,
+    intersectionAndUnionGPU,
 )
 
-# nyu40id → 0-based 20类索引（其余 → -1 ignore）
-NYU40_VALID_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                   11, 12, 14, 16, 24, 28, 33, 34, 36, 39]
-_NYU40_TO_20 = {nid: i for i, nid in enumerate(NYU40_VALID_IDS)}
-
-
-def nyu40_to_20(labels: torch.Tensor) -> torch.Tensor:
-    out = torch.full_like(labels, -1)
-    for nid, idx in _NYU40_TO_20.items():
-        out[labels == nid] = idx
-    return out
-
-
-def build_text_features(device: str = "cuda", clip_model: str = "ViT-L/14") -> torch.Tensor:
-    """用 CLIP 编码 ScanNet 20 类文本，返回 (20, 768) 归一化 float32 tensor。"""
-    import clip
-    model, _ = clip.load(clip_model, device=device)
-    model.eval()
-    prompts = [f"a {label} in a room" for label in SCANNET_LABELS_20]
-    with torch.no_grad():
-        tokens     = clip.tokenize(prompts).to(device)
-        text_feats = model.encode_text(tokens).float()   # (20, 768)
-        text_feats = F.normalize(text_feats, dim=-1)
-    del model
-    torch.cuda.empty_cache()
-    return text_feats
-
-
-class SemanticMIoUTracker:
-    """
-    增量式语义 mIoU 统计。
-
-    用法：
-        tracker = SemanticMIoUTracker(text_features)
-        for batch in val_loader:
-            tracker.update(pred_3d, gt_labels)
-        result = tracker.compute()
-        print(result["semantic_miou"])
-    """
-
-    NUM_CLASSES = 20
-
-    def __init__(self, text_features: torch.Tensor):
-        self.text_features = text_features   # (20, 768)
-        self.reset()
-
-    def reset(self):
-        self.intersection       = np.zeros(self.NUM_CLASSES, dtype=np.float64)
-        self.union              = np.zeros(self.NUM_CLASSES, dtype=np.float64)
-        self.n_points_per_class = np.zeros(self.NUM_CLASSES, dtype=np.int64)
-
-    @torch.no_grad()
-    def update(self, pred_3d: torch.Tensor, gt_labels: torch.Tensor):
-        """
-        pred_3d:   (N, 768) — 模型输出（未归一化亦可）
-        gt_labels: (N,)     — nyu40 label（整数）
-        """
-        gt_20 = nyu40_to_20(gt_labels.cpu())
-        valid = gt_20 >= 0
-        if not valid.any():
-            return
-
-        pred_valid = pred_3d[valid].float()
-        gt_valid   = gt_20[valid]
-
-        pred_norm  = F.normalize(pred_valid, dim=-1)
-        tf         = self.text_features.to(pred_norm.device)
-        sim        = pred_norm @ tf.T                    # (N_valid, 20)
-        pred_class = sim.argmax(dim=-1).cpu()            # (N_valid,)
-
-        for c in range(self.NUM_CLASSES):
-            gt_c   = (gt_valid   == c)
-            pred_c = (pred_class == c)
-            inter  = (gt_c & pred_c).sum().item()
-            union  = (gt_c | pred_c).sum().item()
-            self.intersection[c] += inter
-            self.union[c]        += union
-            self.n_points_per_class[c] += gt_c.sum().item()
-
-    def compute(self) -> Dict:
-        ious = {}
-        for c in range(self.NUM_CLASSES):
-            if self.union[c] > 0:
-                ious[SCANNET_LABELS_20[c]] = float(
-                    self.intersection[c] / (self.union[c] + 1e-10)
-                )
-        miou = float(np.mean(list(ious.values()))) if ious else 0.0
-        return {
-            "semantic_miou":   miou,
-            "per_class_iou":   ious,
-            "n_valid_classes": len(ious),
-        }
-
-
-# ============================================================
-# mask-level mIoU（可选辅助评估）
-# 计算预测 3D mask 与 lifted GT 3D mask 的 IoU
-# ============================================================
 
 class MaskMIoUTracker:
-    """
-    Mask-level mIoU 统计。
-
-    对每个 (batch_item, mask_slot) pair：
-        pred_mask  = (B_k^{3d'} > threshold)  — 预测二值 mask
-        gt_mask    = (B_k^{3d}  > threshold)  — lifted GT 二值 mask
-
-        IoU_k = |pred_mask & gt_mask| / |pred_mask | gt_mask|
-
-    所有有效 pair 取平均 → mask_miou
-    """
+    """Mask-level IoU helper. This is not semantic IoU."""
 
     def __init__(self, threshold: float = 0.5):
         self.threshold = threshold
         self.reset()
 
     def reset(self):
-        self._iou_sum   = 0.0
+        self._iou_sum = 0.0
         self._iou_count = 0
 
-    @torch.no_grad()
-    def update(
-        self,
-        pred_mask_prob: torch.Tensor,   # (N_v, K) — sigmoid 后的概率
-        gt_mask_soft:   torch.Tensor,   # (N_v, K) — lifted soft mask
-        valid_k:        torch.Tensor,   # (K,)  bool — 哪些 slot 有效
-    ):
-        """
-        N_v: 本 batch item 的有效点数（已过 inbounds 过滤）
-        K:   最大 mask slot 数
-        """
+    def update(self, pred_mask_prob, gt_mask_soft, valid_k):
+        import torch
+
         if not valid_k.any():
             return
 
-        pred  = (pred_mask_prob[:, valid_k] > self.threshold).float()   # (N_v, K_v)
-        gt    = (gt_mask_soft[:, valid_k]   > self.threshold).float()   # (N_v, K_v)
+        with torch.no_grad():
+            pred = (pred_mask_prob[:, valid_k] > self.threshold).float()
+            gt = (gt_mask_soft[:, valid_k] > self.threshold).float()
+            inter = (pred * gt).sum(dim=0)
+            union = (pred + gt - pred * gt).sum(dim=0)
+            has_gt = gt.sum(dim=0) > 0
+            if not has_gt.any():
+                return
 
-        inter = (pred * gt).sum(dim=0)                     # (K_v,)
-        union = (pred + gt - pred * gt).sum(dim=0)         # (K_v,)
+            iou = inter[has_gt] / (union[has_gt] + 1e-6)
+            self._iou_sum += iou.sum().item()
+            self._iou_count += has_gt.sum().item()
 
-        # 只统计 GT 中有正样本的 mask
-        has_gt = gt.sum(dim=0) > 0                         # (K_v,)
-        if not has_gt.any():
-            return
-
-        iou = inter[has_gt] / (union[has_gt] + 1e-6)
-        self._iou_sum   += iou.sum().item()
-        self._iou_count += has_gt.sum().item()
-
-    def compute(self) -> Dict:
+    def compute(self):
         if self._iou_count == 0:
             return {"mask_miou": 0.0, "n_masks": 0}
         return {
             "mask_miou": self._iou_sum / self._iou_count,
-            "n_masks":   self._iou_count,
+            "n_masks": self._iou_count,
         }

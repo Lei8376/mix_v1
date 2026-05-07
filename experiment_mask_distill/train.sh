@@ -5,19 +5,6 @@
 set -e
 cd "$(dirname "$0")/.."   # 切到项目根目录
 
-echo "=========================================="
-echo "  Mask Distillation 训练 (experiment_mask_distill)"
-echo "=========================================="
-echo "  主 loss : mask-level cosine distillation"
-echo "            L = (1/K) * sum_k [1 - cos(B_k', B_k)]"
-echo "  辅助 loss: 无（纯 mask distillation）"
-echo "  评估指标 : 语义 mIoU (20类) + Mask-level mIoU"
-echo "  数据量   : 30% (快速验证)"
-echo "  checkpoint: checkpoints/mask_distill.1/"
-echo "  日志      : runs/mask_distill.1/"
-echo "=========================================="
-
-sleep 2
 
 # ---- 单卡启动 ----
 python train_open_vocab_v2_ddp.py \

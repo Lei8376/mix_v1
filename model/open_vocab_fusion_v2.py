@@ -219,23 +219,22 @@ class OpenVocab3DFusionModelV2(nn.Module):
         fused_embeddings = self.fuse_embed(
             pixel_embeddings, mask_embeddings, mask_tensors, mask_valid
         )
+        pixel_pooled_embeddings = self._pool_pixel_embeddings_for_eval(
+            pixel_embeddings, mask_tensors, mask_valid
+        )
 
         # Process 3D points（MinkowskiEngine 体素化后输出点数 M 可能 < 输入点数 N）
         # 🔥 关键修复：正确映射每个输入点到其对应的体素特征
         implicit_condition, pred_3d_voxel, _ = self.pc_processor(batch_input["sinput"])
         sinput = batch_input["sinput"]
         
-        # 输入坐标 (N_total, 4): [batch, x, y, z]
-        # 体素坐标 (M_voxels, 4): [batch, x_quantized, y_quantized, z_quantized]
         # 目标：为每个输入点找到其量化后对应的体素索引
         
         input_coords = batch_input["coords_3d"].int().to(sinput.device)  # (N_total, 4)
         voxel_coords = sinput.C  # (M_voxels, 4)
         
-        # 使用向量化哈希映射（比 for 循环 + cpu().tolist() 
-        # 将 4D 坐标编码为单个整数，然后用 searchsorted 查找
+        # 使用向量化哈希映射
         def _encode_coords(coords_4d):
-            """将 (N, 4) 坐标编码为 (N,) 整数，用于快速匹配"""
             c = coords_4d.long() + 20000  # 偏移确保非负
             BASE = 40001  # 大于最大坐标范围
             return c[:, 0] * (BASE ** 3) + c[:, 1] * (BASE ** 2) + c[:, 2] * BASE + c[:, 3]
@@ -255,7 +254,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
         matched = sorted_voxel_hash[pos] == input_hash
         point_to_voxel_idx = sort_idx[pos]
         
-        # 🔥 关键检查：验证 point→voxel 映射是否 100% 匹配
+        # 验证 point→voxel 映射是否匹配
         matched_ratio = matched.float().mean().item()
         if matched_ratio < 0.999:
             print(f'[FATAL] point→voxel matched_ratio={matched_ratio:.6f}')
@@ -300,12 +299,17 @@ class OpenVocab3DFusionModelV2(nn.Module):
                 print(f"Warning: Empty mask_tokens for batch {b}, skipping")
                 continue
 
-            # Normalize and compute similarity
-            point_features = F.normalize(pred_3d[point_mask], dim=-1)
-            mask_tokens = F.normalize(mask_tokens, dim=-1)
-            logits = logit_scale * (point_features @ mask_tokens.t())
+            #修改一下归一写法，怀疑梯度消失
+            
+            # # Normalize and compute similarity
+            # point_features = F.normalize(pred_3d[point_mask], dim=-1)
+            # mask_tokens = F.normalize(mask_tokens, dim=-1)
+            # logits = logit_scale * (point_features @ mask_tokens.t())
+            point_features = pred_3d[point_mask] 
+            mask_tokens_unnorm = mask_tokens 
+            logits = point_features @ mask_tokens_unnorm.t()
 
-            # Expand to full mask count（AMP 下 logits 可能为 float16，与 full_logits 一致再赋值）
+            # Expand to full mask count
             if mask_valid is not None:
                 num_masks = fused_embeddings.shape[1]
                 full_logits = pred_3d.new_full(
@@ -323,8 +327,40 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "mask_masks": mask_tensors,
             "batch_indices": batch_indices,
             "fused_embeddings": fused_embeddings,
+            "pixel_pooled_embeddings": batch_input.get("clip_pooled", pixel_pooled_embeddings).float(),
             "pred_3d": pred_3d,
         }
+
+    def _pool_pixel_embeddings_for_eval(
+        self,
+        pixel_embeddings: torch.Tensor,
+        mask_tensors: torch.Tensor,
+        mask_valid: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Return raw CLIP/LSeg mask-pooled features for ODISE Eq.10 evaluation."""
+        if pixel_embeddings.dim() == 3:
+            return pixel_embeddings.float()
+        if pixel_embeddings.dim() != 4:
+            raise RuntimeError(
+                f"pixel_embeddings must be (B,K,C) or (B,H,W,C), got {tuple(pixel_embeddings.shape)}"
+            )
+
+        B, H, W, C = pixel_embeddings.shape
+        Bm, K, Hm, Wm = mask_tensors.shape
+        if B != Bm:
+            raise RuntimeError(f"batch mismatch: pixel B={B}, mask B={Bm}")
+        masks = mask_tensors.float()
+        if H != Hm or W != Wm:
+            masks = F.interpolate(masks, size=(H, W), mode="bilinear", align_corners=False)
+        if mask_valid is None:
+            valid = torch.ones(B, K, dtype=torch.bool, device=masks.device)
+        else:
+            valid = mask_valid.to(masks.device)
+        weights = masks * valid.unsqueeze(-1).unsqueeze(-1).float()
+        denom = weights.sum(dim=(-1, -2)).clamp_min(1.0)
+        pooled = torch.matmul(weights.view(B, K, H * W), pixel_embeddings.view(B, H * W, C))
+        pooled = pooled / denom.unsqueeze(-1)
+        return pooled.float()
 
     def freeze_extractors(self):
         """Freeze 2D feature extractors for training."""
@@ -334,4 +370,3 @@ class OpenVocab3DFusionModelV2(nn.Module):
         if self._mask_extractor is not None:
             for param in self._mask_extractor.model.parameters():
                 param.requires_grad = False
-

@@ -8,7 +8,7 @@ echo "=========================================="
 echo ""
 
 # 设置环境变量
-export ODISE_MODEL_ZOO="/home/sunl/work/mix/ODISE/checkpoints"
+export ODISE_MODEL_ZOO="/home/featurize/work/mix2_v1/ODISE/checkpoints"
 export OMP_NUM_THREADS=1
 
 # 激活环境
@@ -16,7 +16,7 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate f_bak
 
 # 进入工作目录
-cd /home/sunl/work/mix/ODISE
+cd /home/featurize/work/mix2_v1/ODISE
 
 # 运行批处理
 python precompute_features.py --config ../config/odise_config_production.yaml
@@ -25,4 +25,4 @@ echo ""
 echo "=========================================="
 echo "处理完成！"
 echo "=========================================="
-echo "结果保存在: /home/sunl/work/odise_features"
+echo "结果保存在: /home/featurize/data/odise_features"

@@ -23,8 +23,15 @@ Usage:
 
 import argparse
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+REPO_ROOT = Path(__file__).resolve().parent
+MASK2FORMER_ROOT = REPO_ROOT / "ODISE" / "third_party" / "Mask2Former"
+if MASK2FORMER_ROOT.exists() and str(MASK2FORMER_ROOT) not in sys.path:
+    sys.path.insert(0, str(MASK2FORMER_ROOT))
 
 import numpy as np
 import torch
@@ -43,6 +50,16 @@ from trainer.open_vocab_trainer_v2 import (
     OpenVocabTrainerV2,
     OpenVocabTrainerV2Config,
 )
+try:
+    from experiment_mask_distill.trainer_mask_distill import (
+        MaskDistillTrainer,
+        MaskDistillTrainerConfig,
+    )
+    _MASK_DISTILL_AVAILABLE = True
+except ImportError:
+    MaskDistillTrainer = None
+    MaskDistillTrainerConfig = None
+    _MASK_DISTILL_AVAILABLE = False
 
 
 @dataclass
@@ -320,6 +337,10 @@ def main() -> None:
         lseg_ckpt_path=lseg_ckpt_path if lseg_ckpt_path and os.path.exists(lseg_ckpt_path) else None,
         odise_model_config_path=odise_config_path,
         pc_arch=_model.get("pc_arch", "MinkUNet34C"),
+        pixel_embedding_dim=_model.get("pixel_embedding_dim", 512),
+        mask_embedding_dim=_model.get("mask_embedding_dim", 256),
+        fused_embedding_dim=_model.get("fused_embedding_dim", 768),
+        pc_last_dim=_model.get("pc_last_dim", 256),
     )
 
     # Trainer config
@@ -351,7 +372,42 @@ def main() -> None:
         resume_checkpoint=resume_checkpoint,
         use_model_half=_trainer.get("use_model_half", args.model_half),
         gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),  # 🔥 梯度累积
+        semantic_clip_model=_trainer.get("semantic_clip_model", "ViT-L/14"),
+        semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
+        semantic_prompt_template=_trainer.get("semantic_prompt_template", "a {} in a scene"),
+        semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
     )
+    use_mask_distill = _trainer.get("use_mask_distill", False)
+    if use_mask_distill:
+        if not _MASK_DISTILL_AVAILABLE:
+            raise ImportError("experiment_mask_distill not found; cannot use use_mask_distill")
+        trainer_config = MaskDistillTrainerConfig(
+            num_epochs=_trainer.get("num_epochs", args.num_epochs),
+            base_lr=_trainer.get("base_lr", args.base_lr),
+            weight_decay=_trainer.get("weight_decay", args.weight_decay),
+            grad_clip_norm=_trainer.get("grad_clip_norm", args.grad_clip_norm),
+            warmup_epochs=_trainer.get("warmup_epochs", args.warmup_epochs),
+            scheduler_type=_trainer.get("scheduler_type", args.scheduler_type),
+            mask_distill_weight=_trainer.get("mask_distill_weight", 1.0),
+            bce_weight=_trainer.get("bce_weight", 0.0),
+            dice_weight=_trainer.get("dice_weight", 0.0),
+            min_points_per_mask=_trainer.get("min_points_per_mask", 10),
+            log_dir=_trainer.get("log_dir", args.log_dir),
+            checkpoint_dir=_trainer.get("checkpoint_dir", args.checkpoint_dir),
+            save_every_epochs=_trainer.get("save_every_epochs", args.save_every_epochs),
+            val_every_epochs=_trainer.get("val_every_epochs", args.val_every_epochs),
+            use_amp=not args.no_amp,
+            early_stopping_patience=_trainer.get(
+                "early_stopping_patience", args.early_stopping_patience
+            ),
+            resume_checkpoint=resume_checkpoint,
+            use_model_half=_trainer.get("use_model_half", args.model_half),
+            gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),
+            semantic_clip_model=_trainer.get("semantic_clip_model", "ViT-L/14"),
+            semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
+            semantic_prompt_template=_trainer.get("semantic_prompt_template", "a {} in a scene"),
+            semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
+        )
 
     # Validate configuration
     if not os.path.exists(dataset_config.data_config_path):
@@ -405,13 +461,23 @@ def main() -> None:
     model = OpenVocab3DFusionModelV2(model_config)
 
     # Create trainer and run
-    trainer = OpenVocabTrainerV2(
-        model=model,
-        train_loader=train_loader,
-        config=trainer_config,
-        device=device,
-        val_loader=val_loader,
-    )
+    if use_mask_distill:
+        trainer = MaskDistillTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=trainer_config,
+            device=device,
+            rank=0,
+        )
+    else:
+        trainer = OpenVocabTrainerV2(
+            model=model,
+            train_loader=train_loader,
+            config=trainer_config,
+            device=device,
+            val_loader=val_loader,
+        )
 
     results = trainer.train()
     print(f"Training finished: {results}")
@@ -419,4 +485,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

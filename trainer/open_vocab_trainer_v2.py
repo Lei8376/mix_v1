@@ -23,6 +23,9 @@ from MinkowskiEngine import SparseTensor
 
 from model.criterion import Criteria, dice_loss
 from utils.util import AverageMeter
+from experiment_mask_distill.semantic_miou import (
+    Diff2SceneSemanticMIoUTracker, build_text_features,
+)
 
 
 @dataclass
@@ -67,6 +70,9 @@ class OpenVocabTrainerV2Config:
     # 🔥 梯度累积：用于降低显存峰值，同时保持有效 batch size
     # 例：batch_size=16, gradient_accumulation_steps=2 → 有效 batch=32
     gradient_accumulation_steps: int = 1
+    # Open-vocabulary semantic evaluation.
+    semantic_clip_model: str = "ViT-L/14@336px"
+    semantic_prompt_template: str = "a {} in a scene"
 
 
 class MetricsTracker:
@@ -206,6 +212,7 @@ class OpenVocabTrainerV2:
         self.train_sampler = train_sampler
         self.is_distributed = is_distributed
         self.is_main_process = is_main_process
+        self._text_features = None   # 懒加载 CLIP 文本特征（语义 mIoU 用）
 
         # Optimizer
         trainable_params = filter(lambda p: p.requires_grad, self.model.parameters())
@@ -419,6 +426,12 @@ class OpenVocabTrainerV2:
                     self.writer.add_scalar(
                         "LR", self.optimizer.param_groups[0]["lr"], self.global_step
                     )
+
+                    # Log fusion alpha (ODISE-residual fusion mixing weight)
+                    fuse = self.model.fuse_embed if hasattr(self.model, "fuse_embed") \
+                        else getattr(self.model, "module", None) and self.model.module.fuse_embed
+                    if fuse is not None and hasattr(fuse, "alpha"):
+                        self.writer.add_scalar("Fusion/alpha", fuse.alpha.item(), self.global_step)
                 self.global_step += 1
 
             # Apply warmup（基于 global_step，即优化步数）
@@ -458,6 +471,49 @@ class OpenVocabTrainerV2:
 
         return epoch_loss.avg
 
+    def _select_item_rows(
+        self,
+        pred_mask_values: torch.Tensor,
+        pt_mask: torch.Tensor,
+        context: str,
+    ) -> torch.Tensor:
+        """Return rows for one batch item, accepting item-local or batch-global tensors."""
+        n_rows = pred_mask_values.shape[0]
+        n_total = pt_mask.numel()
+        n_item = int(pt_mask.sum().item())
+
+        if n_rows == n_item:
+            return pred_mask_values
+        if n_rows == n_total:
+            return pred_mask_values[pt_mask]
+
+        raise RuntimeError(
+            f"{context}: pred_mask rows do not match item or batch points "
+            f"(rows={n_rows}, item_points={n_item}, total_points={n_total})."
+        )
+
+    def _select_valid_mask_columns(
+        self,
+        pred_mask_values: torch.Tensor,
+        valid_k: torch.Tensor,
+        context: str,
+    ) -> torch.Tensor:
+        """Return valid mask columns, accepting full K_max or already-filtered K_valid tensors."""
+        valid_k = valid_k.to(device=pred_mask_values.device, dtype=torch.bool)
+        n_cols = pred_mask_values.shape[1]
+        n_full = valid_k.numel()
+        n_valid = int(valid_k.sum().item())
+
+        if n_cols == n_full:
+            return pred_mask_values[:, valid_k]
+        if n_cols == n_valid:
+            return pred_mask_values
+
+        raise RuntimeError(
+            f"{context}: pred_mask columns do not match full or valid mask slots "
+            f"(cols={n_cols}, full_masks={n_full}, valid_masks={n_valid})."
+        )
+
     @torch.no_grad()
     def _validate(self, epoch: int) -> Dict[str, float]:
         """Run validation."""
@@ -467,6 +523,24 @@ class OpenVocabTrainerV2:
         self.model.eval()
         val_loss = AverageMeter()
         metrics = MetricsTracker()
+
+        # 语义 mIoU：懒加载 CLIP 文本特征（只加载一次）
+        if self._text_features is None:
+            try:
+                self._text_features = build_text_features(
+                    device=self.device,
+                    clip_model=self.config.semantic_clip_model,
+                    prompt_template=self.config.semantic_prompt_template,
+                )
+            except Exception as e:
+                if self.is_main_process:
+                    print(f"[SemanticMIoU] Failed to build text features: {e}")
+                self._text_features = None
+
+        text_feats = self._text_features
+        # Diff2Scene Eq.3：mask label probabilities are assigned to points
+        # through predicted 3D mask probabilities.
+        sem_tracker = Diff2SceneSemanticMIoUTracker() if text_feats is not None else None
 
         for batch_idx, batch in enumerate(self.val_loader):
             batch = self._move_batch_to_device(batch)
@@ -492,10 +566,15 @@ class OpenVocabTrainerV2:
                     continue
                 pred_logits = results["outputs"][b][0]["pred_mask_logits"]
                 valid = results["mask_valid_from_masks"][b]
+                point_mask = results["batch_indices"] == b
+                pred_logits = self._select_item_rows(
+                    pred_logits,
+                    point_mask,
+                    context=f"val mask metric batch={batch_idx} item={b}",
+                )
 
                 # Get GT masks
                 mask_2d = results["mask_masks"][b][valid]
-                point_mask = results["batch_indices"] == b
                 x_idx = batch["x_label"][point_mask].float()  # 先转 float 以便缩放
                 y_idx = batch["y_label"][point_mask].float()
 
@@ -550,13 +629,60 @@ class OpenVocabTrainerV2:
                     gt_3d = gt_3d[:, keep_gt]
                     # MetricsTracker 期望概率；pred_logits 为 logits，需先 sigmoid
                     metrics.update(torch.sigmoid(pred_valid).float(), gt_3d)
-            
+
+            # ---- 语义 mIoU：Diff2Scene Eq.3，fused_embed × pred_mask ----
+            if sem_tracker is not None:
+                fused_all   = results["fused_embeddings"]   # (B, K_max, 768)
+                mask_valid  = results["mask_valid_from_masks"]  # (B, K_max)
+                for b in range(len(results["outputs"])):
+                    if len(results["outputs"][b]) == 0:
+                        continue
+                    valid_k = mask_valid[b]
+                    if not valid_k.any():
+                        continue
+                    pred_logits_b = results["outputs"][b][0]["pred_mask_logits"]
+                    pt_mask = results["batch_indices"] == b
+                    fused_b = fused_all[b][valid_k]                       # (K_valid, 768)
+                    pred_logits_b = self._select_item_rows(
+                        pred_logits_b,
+                        pt_mask,
+                        context=f"D2S semantic mIoU batch={batch_idx} item={b}",
+                    )
+                    logits_b = self._select_valid_mask_columns(
+                        pred_logits_b,
+                        valid_k,
+                        context=f"D2S semantic mIoU batch={batch_idx} item={b}",
+                    ).float()                                             # (N_b, K_valid)
+                    gt_b = batch["binary_label_3d"][pt_mask]              # (N_b,)
+                    if logits_b.shape[0] != gt_b.numel():
+                        raise RuntimeError(
+                            f"D2S semantic mIoU batch={batch_idx} item={b}: "
+                            f"logits rows ({logits_b.shape[0]}) != gt labels ({gt_b.numel()})."
+                        )
+                    if logits_b.shape[1] != fused_b.shape[0]:
+                        raise RuntimeError(
+                            f"D2S semantic mIoU batch={batch_idx} item={b}: "
+                            f"logits masks ({logits_b.shape[1]}) != fused masks ({fused_b.shape[0]})."
+                        )
+                    sem_tracker.update(gt_b, fused_b, logits_b, text_feats)
+
             # 🔥 OOM 修复：每 50 个 batch 清理一次 CUDA 缓存（不影响计算结果）
             if (batch_idx + 1) % 50 == 0:
                 torch.cuda.empty_cache()
 
         val_metrics = metrics.compute()
         val_metrics["loss"] = val_loss.avg
+
+        # 语义 mIoU：Diff2Scene Eq.3
+        val_metrics["semantic_miou"]   = 0.0
+        val_metrics["semantic_miou_diff2scene"] = 0.0
+        val_metrics["n_valid_classes"] = 0
+        if sem_tracker is not None:
+            sem_res = sem_tracker.compute()
+            val_metrics["semantic_miou"] = sem_res["semantic_miou_diff2scene"]
+            val_metrics["semantic_miou_diff2scene"] = sem_res["semantic_miou_diff2scene"]
+            val_metrics["n_valid_classes"] = sem_res["n_valid_classes"]
+            val_metrics["per_class_iou_diff2scene"] = sem_res.get("per_class_iou_diff2scene", {})
 
         return val_metrics
 
@@ -643,7 +769,13 @@ class OpenVocabTrainerV2:
             print("Removing 'module.' prefix from checkpoint keys")
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
-        self.model.load_state_dict(state_dict)
+        # strict=False so newly added params (e.g. fuse_embed.alpha for ODISE-residual fusion)
+        # default to their init values when resuming from older checkpoints
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[resume] missing keys (will use init values): {missing}")
+        if unexpected:
+            print(f"[resume] unexpected keys (ignored): {unexpected}")
 
         # Optimizer state (will override lr/weight_decay in param_groups)
         if "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"] is not None:
@@ -729,18 +861,29 @@ class OpenVocabTrainerV2:
                 val_metrics = self._validate(epoch)
                 if val_metrics and self.is_main_process:
                     if self.writer is not None:
-                        self.writer.add_scalar("Loss/Val", val_metrics["loss"], epoch)
-                        self.writer.add_scalar("Metrics/IoU", val_metrics["iou"], epoch)
-                        self.writer.add_scalar("Metrics/mIoU", val_metrics.get("miou", 0), epoch)
-                        self.writer.add_scalar("Metrics/Accuracy", val_metrics["accuracy"], epoch)
-                        self.writer.add_scalar("Metrics/mAcc", val_metrics.get("macc", 0), epoch)
+                        self.writer.add_scalar("Loss/Val",                          val_metrics["loss"],                            epoch)
+                        self.writer.add_scalar("Metrics/IoU",                       val_metrics["iou"],                             epoch)
+                        self.writer.add_scalar("Metrics/mIoU",                      val_metrics.get("miou", 0),                     epoch)
+                        self.writer.add_scalar("Metrics/Accuracy",                  val_metrics["accuracy"],                        epoch)
+                        self.writer.add_scalar("Metrics/mAcc",                      val_metrics.get("macc", 0),                     epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_Diff2Scene",  val_metrics.get("semantic_miou_diff2scene", 0), epoch)
+                        if "per_class_iou_diff2scene" in val_metrics:
+                            for cls_name, iou_val in val_metrics["per_class_iou_diff2scene"].items():
+                                self.writer.add_scalar(f"PerClass_IoU_D2S/{cls_name}", iou_val, epoch)
                     print(
                         f"  Val Loss: {val_metrics['loss']:.4f} "
-                        f"IoU: {val_metrics['iou']:.4f} "
-                        f"mIoU: {val_metrics.get('miou', 0):.4f} "
-                        f"Acc: {val_metrics['accuracy']:.4f} "
-                        f"mAcc: {val_metrics.get('macc', 0):.4f}"
+                        f"[MaskIoU] {val_metrics.get('miou', 0):.4f}  "
+                        f"[语义mIoU-D2S] {val_metrics.get('semantic_miou_diff2scene', 0):.4f} "
+                        f"({val_metrics.get('n_valid_classes', 0)} classes)  "
+                        f"Acc: {val_metrics['accuracy']:.4f}"
                     )
+                    if "per_class_iou_diff2scene" in val_metrics and val_metrics["per_class_iou_diff2scene"]:
+                        per_cls = val_metrics["per_class_iou_diff2scene"]
+                        top10 = "  ".join(
+                            f"{k}:{v:.3f}" for k, v in
+                            sorted(per_cls.items(), key=lambda x: -x[1])[:10]
+                        )
+                        print(f"  Top-10 (D2S): {top10}")
                     
                     # Update best IoU
                     current_iou = val_metrics.get('miou', val_metrics['iou'])
@@ -824,4 +967,3 @@ class OpenVocabTrainerV2:
             "best_iou": self.best_iou,
             "final_epoch": final_epoch,
         }
-

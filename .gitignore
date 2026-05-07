@@ -3,9 +3,13 @@
 
 # data / outputs
 data/
-dataset/
+datasets/
+scannet/
+scannetv2/
+ScanNet/
 runs/
 targets_debug/
+diagnostic_logs/
 
 # python
 __pycache__/
@@ -28,6 +32,8 @@ output/
 outputs/
 log/
 logs/
+*.log
+*.jsonl
 tb/
 tensorboard/
 wandb/

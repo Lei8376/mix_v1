@@ -16,12 +16,12 @@ gpu_ids: [0]  # 单卡模式使用的 GPU 编号（0=第一张卡）
 # 数据加载配置
 # ============================================================
 dataloader:
-  batch_size: 8   # 🔥 单卡训练建议值（显存足够可用 16）
+  batch_size: 16   # 🔥 单卡训练建议值（显存足够可用 16）
                   # - 多卡时: 每个 GPU 的批大小
                   # - 单卡时: 总批大小
                   # - 显存不足时可减小到 4 或 2
   
-  num_workers: 8  # 数据加载线程数
+  num_workers: 12  # 数据加载线程数
                   # - 单卡建议: 4-8
                   # - 多卡建议: 8-16
                   # - 过大会占用过多内存
@@ -32,17 +32,20 @@ dataloader:
 dataset:
   data_config_path: config/data_scannet_3d.yaml  # 3D 数据集路径配置文件
   
-  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled  # 预计算的 2D 特征目录
+  precomputed_dir: /home/featurize/data/pixel_pooled  # 预计算的 2D 特征目录
                                                            # 包含 ODISE 生成的 .npz 文件
   
-  projection_dir: /home/sunl/work/mix/data/scannet_projections  # 预计算的投影坐标目录
+  projection_dir: /home/featurize/data/scannet_projections  # 预计算的投影坐标目录
                                                                  # 包含 3D→2D 投影对应关系
   
   split: train  # 数据集划分: train (训练集) / val (验证集) / test (测试集)
-  
+
+  aug: true     # 3D 数据增强（Z轴随机旋转 + 缩放[0.9,1.1] + 平移[-0.5,0.5]m，仅 train split）
+                # 防止 MinkowskiEngine 死记硬背绝对坐标导致过拟合
+
   # ===== 数据量控制 =====
   # 取消下面一行的注释来限制数据量（用于测试或调试）
-  # max_samples_ratio: 0.2  # 使用数据的比例
+  max_samples_ratio: 1 # 使用数据的比例
                             # - 0.1 = 10% 数据 (9,522 samples)
                             # - 0.2 = 20% 数据 (19,044 samples)
                             # - 0.5 = 50% 数据 (47,610 samples)
@@ -90,24 +93,24 @@ trainer:
                    # - 100% 数据: 100-200 epochs
   
   # ----- 验证和保存 -----
-  val_every_epochs: 2  # 每 N 个 epoch 进行一次验证
+  val_every_epochs: 1  # 每 N 个 epoch 进行一次验证
                        # - 频繁验证: 及时发现问题，但耗时
                        # - 建议: 1-5
   
-  save_every_epochs: 2 # 每 N 个 epoch 保存一次检查点
+  save_every_epochs: 1 # 每 N 个 epoch 保存一次检查点
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  # checkpoint_dir: checkpoints/full.1  # 🔴 旧目录
-  checkpoint_dir: checkpoints/full.4    # 🔥 新目录：避免覆盖之前的训练
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha
   
-  # log_dir: runs/full.1  # 🔴 旧日志目录
-  log_dir: runs/full.4  # 🔥 新日志目录
+  log_dir: runs/diff2scene_hybrid_lseg_pc_adaptive_alpha
   
-  # ----- Loss 参数 -----
-  bce_weight: 1.0            # BCE loss 权重（推荐 1.0）
-  dice_weight: 1.0           # Dice loss 权重（推荐 1.0）
-  min_points_per_mask: 10    # GT 正样本数 < 此值的 mask 不参与训练
+  # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
+  use_mask_distill: true
+  mask_distill_weight: 1.0
+  bce_weight: 0.0            # 论文主 loss 不使用 BCE 辅助项
+  dice_weight: 0.0           # 论文主 loss 不使用 Dice 辅助项
+  min_points_per_mask: 10    # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss
                              # - 过滤 GT 中正样本过少的 mask（可能是噪声）
                              # - 推荐值: 5-10
                              # - 太高: 过滤太严，有效样本少
@@ -127,9 +130,18 @@ trainer:
                                   # - batch_size=16 × accum=2 = 有效 batch 32
                                   # - 显存减半，训练效果与 batch_size=32 等价
                                   # - DDP 下使用 no_sync() 优化，速度只慢 5-15%
+
+  # ----- Open-vocabulary semantic mIoU -----
+  # 混合模型 token 为 768 维，使用 ViT-L/14@336px 文本空间评估。
+  semantic_clip_model: "ViT-L/14@336px"
+  # 现有 LSeg pixel_pooled 为 512 维，使用匹配的 ViT-B/32 文本空间评估。
+  semantic_pixel_clip_model: "ViT-B/32"
+  # p_final ∝ p_hybrid^lambda * p_lseg^(1-lambda)
+  semantic_pc_lambda: 0.5
+  semantic_prompt_template: "a {} in a scene"
   
   # 【可选】恢复训练
-  # resume: checkpoints/full.4/checkpoint_epoch_17.pth  # 取消注释以恢复训练
+  resume: ""  # 如需恢复训练，填入 checkpoint 路径
 
 # ============================================================
 # 随机种子（确保可复现性）
@@ -137,4 +149,3 @@ trainer:
 seed: 1342  # 随机种子
             # - 固定种子确保每次运行结果一致
             # - 用于调试和对比实验
-

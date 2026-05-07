@@ -292,6 +292,10 @@ class ODISEPixelMaskFusionNet(nn.Module):
         )
         nn.init.constant_(self.gate.bias, -2.0)  # bias toward mask-dominant fusion
 
+        # ODISE-residual fusion: final = mask_tokens + alpha * refine(mask_tokens + gate * pixel_tokens).
+        # Keep alpha learnable/adaptive, matching the original mix2_v1 backup.
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+
     def forward(self, pixel_embed, mask_embed, masks, valid_mask):
         """
         pixel_embed: either (B, H, W, Cp) pixel-level features, or (B, K, Cp) pre-pooled per-mask features.
@@ -327,8 +331,8 @@ class ODISEPixelMaskFusionNet(nn.Module):
         pixel_tokens = self.pixel_proj(pixel_pooled)  # (B,K,C_out)
 
         gate = torch.sigmoid(self.gate(torch.cat([mask_tokens, pixel_tokens], dim=-1)))
-        fused = mask_tokens + gate * pixel_tokens
-        fused = self.refine(fused)
+        delta = self.refine(mask_tokens + gate * pixel_tokens)
+        fused = mask_tokens + self.alpha * delta
 
         fused = fused * valid_mask.unsqueeze(-1).float()
         return fused
@@ -381,4 +385,3 @@ def pad_mask_tensors(mask_list):
     mask_masks = torch.stack(padded_masks).float()  # [B, max_masks, H, W]
     mask_valid = torch.stack(mask_valid)  # [B, max_masks]
     return mask_masks, mask_valid
-

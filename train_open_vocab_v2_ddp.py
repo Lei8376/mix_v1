@@ -14,8 +14,15 @@ Usage:
 
 import argparse
 import os
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+REPO_ROOT = Path(__file__).resolve().parent
+MASK2FORMER_ROOT = REPO_ROOT / "ODISE" / "third_party" / "Mask2Former"
+if MASK2FORMER_ROOT.exists() and str(MASK2FORMER_ROOT) not in sys.path:
+    sys.path.insert(0, str(MASK2FORMER_ROOT))
 
 import numpy as np
 import torch
@@ -388,6 +395,10 @@ def main() -> None:
         lseg_ckpt_path=lseg_ckpt_path if lseg_ckpt_path and os.path.exists(lseg_ckpt_path) else None,
         odise_model_config_path=odise_config_path,
         pc_arch=_model.get("pc_arch", "MinkUNet34C"),
+        pixel_embedding_dim=_model.get("pixel_embedding_dim", 512),
+        mask_embedding_dim=_model.get("mask_embedding_dim", 256),
+        fused_embedding_dim=_model.get("fused_embedding_dim", 768),
+        pc_last_dim=_model.get("pc_last_dim", 256),
     )
 
     # Trainer config
@@ -422,6 +433,10 @@ def main() -> None:
         resume_checkpoint=resume_checkpoint,
         use_model_half=_trainer.get("use_model_half", args.model_half),
         gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),
+        semantic_clip_model=_trainer.get("semantic_clip_model", "ViT-L/14"),
+        semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
+        semantic_prompt_template=_trainer.get("semantic_prompt_template", "a {} in a scene"),
+        semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
     )
 
     use_distill      = args.use_distill      or _trainer.get("use_distill",      False)

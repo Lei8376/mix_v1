@@ -81,6 +81,8 @@ class DistillTrainerConfig:
     max_batches_per_epoch:      Optional[int] = None
     use_model_half:             bool  = False
     gradient_accumulation_steps: int  = 1
+    semantic_clip_model:         str   = "ViT-L/14@336px"
+    semantic_prompt_template:    str   = "a {} in a scene"
 
 
 # ============================================================
@@ -301,6 +303,12 @@ class DistillTrainer:
                     self.writer.add_scalar("Loss/Train_Mask_Step",  loss_dict["loss_mask"],       self.global_step)
                     self.writer.add_scalar("LR", self.optimizer.param_groups[0]["lr"], self.global_step)
 
+                    # Log fusion alpha (ODISE-residual fusion mixing weight)
+                    fuse = self.model.fuse_embed if hasattr(self.model, "fuse_embed") \
+                        else getattr(self.model, "module", None) and self.model.module.fuse_embed
+                    if fuse is not None and hasattr(fuse, "alpha"):
+                        self.writer.add_scalar("Fusion/alpha", fuse.alpha.item(), self.global_step)
+
                 self.global_step += 1
 
             self._adjust_learning_rate_warmup(self.global_step)
@@ -349,7 +357,11 @@ class DistillTrainer:
             if self.is_main_process:
                 print("[DistillTrainer] Building CLIP text features for semantic mIoU ...")
             try:
-                self._text_features = build_text_features(device=self.device)
+                self._text_features = build_text_features(
+                    device=self.device,
+                    clip_model=self.config.semantic_clip_model,
+                    prompt_template=self.config.semantic_prompt_template,
+                )
                 if self.is_main_process:
                     print(f"  text_features shape: {self._text_features.shape}")
             except Exception as e:
@@ -499,7 +511,12 @@ class DistillTrainer:
             state_dict = {"module." + k: v for k, v in state_dict.items()}
         elif not is_model_ddp and is_ckpt_ddp:
             state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        self.model.load_state_dict(state_dict)
+        # strict=False tolerates newly added params (e.g. fuse_embed.alpha)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[resume] missing keys (will use init values): {missing}")
+        if unexpected:
+            print(f"[resume] unexpected keys (ignored): {unexpected}")
 
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

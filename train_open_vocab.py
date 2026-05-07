@@ -64,10 +64,10 @@ def _resolve_odise_config_path(config_path: str, repo_root: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Open-Vocabulary 3D Fusion")
-    parser.add_argument("--config", type=str, default="/home/sunl/work/mix/config/data_scannet_3d.yaml")
-    parser.add_argument("--data-config-path", type=str, default="/home/sunl/work/mix/config/data_scannet_3d.yaml")
-    parser.add_argument("--label-path", type=str, default="/home/sunl/work/mix/lang_seg/label_files/ade20k_objectInfo150.txt")
-    parser.add_argument("--lseg-ckpt-path", type=str, default="/home/sunl/work/mix/lang_seg/checkpoints/demo_e200.ckpt")
+    parser.add_argument("--config", type=str, default="config/data_scannet_3d.yaml")
+    parser.add_argument("--data-config-path", type=str, default="config/data_scannet_3d.yaml")
+    parser.add_argument("--label-path", type=str, default="lang_seg/label_files/ade20k_objectInfo150.txt")
+    parser.add_argument("--lseg-ckpt-path", type=str, default="lang_seg/checkpoints/demo_e200.ckpt")
     parser.add_argument("--odise-model-config-path", type=str, default="Panoptic/odise_caption_coco_50e.py")
     parser.add_argument("--num-epochs", type=int, default=10)
     parser.add_argument("--base-lr", type=float, default=1e-4)
@@ -183,4 +183,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

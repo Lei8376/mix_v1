@@ -1,14 +1,3 @@
-"""
-Open Vocabulary Dataset V2: 支持「仅 npz（含 pixel_pooled）」的预计算格式。
-
-预计算目录下每张图只有一个 *_odise.npz，内含:
-  - masks (K, H, W) bool
-  - mask_embeddings (K, 256)
-  - pixel_pooled (K, 512)   # LSeg 按 mask 池化后的向量
-  - num_masks, info
-
-无需单独的 *_lseg.npy。npz 用 np.load(npz_path, allow_pickle=True) 即可读取。
-"""
 
 import os
 from dataclasses import dataclass
@@ -96,7 +85,7 @@ def _list_samples_from_precomputed(precomputed_dir: Path, data_root: Optional[Pa
 
 
 def _load_npz_pooled(npz_path: Path) -> Dict[str, torch.Tensor]:
-    """从 npz 读取 pixel_pooled、masks、mask_embeddings、mask_valid。"""
+    """从 npz 读取 pixel_pooled、可选 clip_pooled、masks、mask_embeddings、mask_valid。"""
     with np.load(npz_path, allow_pickle=True) as f:
         keys = list(f.files)
         if "pixel_pooled" not in keys:
@@ -107,16 +96,24 @@ def _load_npz_pooled(npz_path: Path) -> Dict[str, torch.Tensor]:
             masks = np.stack(masks, axis=0)
         mask_embeddings = np.asarray(f["mask_embeddings"], dtype=np.float32)
         pixel_pooled = np.asarray(f["pixel_pooled"], dtype=np.float32)
+        clip_pooled = (
+            np.asarray(f["clip_pooled"], dtype=np.float32)
+            if "clip_pooled" in keys
+            else None
+        )
 
         K = masks.shape[0]
         mask_valid = np.ones(K, dtype=bool)
 
-    return {
+    out = {
         "pixel_pooled": torch.from_numpy(pixel_pooled),
         "masks": torch.from_numpy(masks),
         "mask_embeddings": torch.from_numpy(mask_embeddings),
         "mask_valid": torch.from_numpy(mask_valid),
     }
+    if clip_pooled is not None:
+        out["clip_pooled"] = torch.from_numpy(clip_pooled)
+    return out
 
 
 def _load_3d_with_precomputed_projection(
@@ -127,6 +124,7 @@ def _load_3d_with_precomputed_projection(
     frame_stem: str,
     pth_cache: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
     voxel_size: float = 0.05,
+    aug: bool = False,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """
     方案 B: 从预计算的投影文件加载 3D 数据和投影坐标。
@@ -166,6 +164,25 @@ def _load_3d_with_precomputed_projection(
     locs_filtered = locs[visible_mask]
     feats_filtered = feats[visible_mask]
     labels_filtered = labels[visible_mask]
+
+    # 5. 3D 数据增强（仅训练时）
+    # 注意：x_label / y_label 是预计算好的 2D 投影坐标，aug 只扰动 3D 坐标，不影响 2D 对应关系
+    if aug:
+        # 绕 Z 轴随机旋转 [0, 2π)
+        theta = np.random.uniform(0, 2 * np.pi)
+        c, s = float(np.cos(theta)), float(np.sin(theta))
+        rot = torch.tensor([[c, -s, 0],
+                             [s,  c, 0],
+                             [0,  0, 1]], dtype=locs_filtered.dtype)
+        locs_filtered = locs_filtered @ rot.T   # (N,3) @ (3,3)
+
+        # 随机缩放 [0.9, 1.1]
+        scale = np.random.uniform(0.9, 1.1)
+        locs_filtered = locs_filtered * scale
+
+        # 随机平移 [-0.5, 0.5] 米
+        trans = (torch.rand(3, dtype=locs_filtered.dtype) - 0.5)
+        locs_filtered = locs_filtered + trans
 
     N = locs_filtered.shape[0]
     batch_idx = torch.zeros(N, 1, dtype=torch.long)
@@ -493,6 +510,7 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
                 frame_stem=frame_stem,
                 pth_cache=self._pth_cache,
                 voxel_size=self.config.voxel_size,
+                aug=(self.config.aug and self.split == "train"),
             )
 
         # 如果没有预计算投影或加载失败，回退到运行时投影
@@ -538,14 +556,21 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
 
 
 def open_vocab_collate_v2(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Collate：pad pixel_pooled / masks / mask_embeddings 到 K_max，stack 3D。"""
+    """Collate：pad pixel_pooled / optional clip_pooled / masks / mask_embeddings 到 K_max，stack 3D。"""
     B = len(batch)
     max_k = max(b["pixel_pooled"].shape[0] for b in batch)
     _, H, W = batch[0]["masks"].shape
     Cp = batch[0]["pixel_pooled"].shape[1]
     Cm = batch[0]["mask_embeddings"].shape[1]
+    has_clip_pooled = all("clip_pooled" in b for b in batch)
+    Cclip = batch[0]["clip_pooled"].shape[1] if has_clip_pooled else None
 
     pixel_pooled = torch.zeros(B, max_k, Cp, dtype=torch.float32)
+    clip_pooled = (
+        torch.zeros(B, max_k, Cclip, dtype=torch.float32)
+        if has_clip_pooled
+        else None
+    )
     masks = torch.zeros(B, max_k, H, W, dtype=torch.float32)
     mask_embeddings = torch.zeros(B, max_k, Cm, dtype=torch.float32)
     mask_valid = torch.zeros(B, max_k, dtype=torch.bool)
@@ -564,6 +589,8 @@ def open_vocab_collate_v2(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     for b, item in enumerate(batch):
         k = item["pixel_pooled"].shape[0]
         pixel_pooled[b, :k] = item["pixel_pooled"]
+        if has_clip_pooled:
+            clip_pooled[b, :k] = item["clip_pooled"]
         masks[b, :k] = item["masks"]
         mask_embeddings[b, :k] = item["mask_embeddings"]
         mask_valid[b, :k] = item["mask_valid"]
@@ -590,7 +617,7 @@ def open_vocab_collate_v2(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         coords_3d_list2.append(c)
         ori_list2.append(o)
 
-    return {
+    out = {
         "pixel_pooled": pixel_pooled,
         "masks": masks,
         "mask_embeddings": mask_embeddings,
@@ -605,3 +632,6 @@ def open_vocab_collate_v2(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "binary_label_2d": torch.cat(binary_label_2d_list, dim=0),
         "label_2d": torch.cat(label_2d_list, dim=0),
     }
+    if has_clip_pooled:
+        out["clip_pooled"] = clip_pooled
+    return out

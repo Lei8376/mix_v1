@@ -1,537 +1,0 @@
-[06:19:38] 
-============================================================
-[06:19:38] Mix 开放词汇3D模型评估
-[06:19:38] ============================================================
-[06:19:38] 权重: checkpoints/full.4/checkpoint_epoch_36.pth
-[06:19:38] 配置: config/train_scannet_v2_full_multi_gpu.yaml
-[06:19:38] ============================================================
-
-[06:19:38] 提取CLIP文本特征...
-[06:19:47] ✓ 文本特征: torch.Size([20, 768])
-[06:19:47] 
-创建数据集...
-[06:19:47] ✓ 数据集: 26687 个样本
-[06:19:47] 
-创建模型...
-[06:19:48]   从权重推断: MinkUNet34C (较大模型)
-[06:19:49] ✓ 加载权重成功 (epoch 35)
-[06:19:49]   训练时最佳 IoU: 0.3034
-[06:19:49]   训练时最佳 Loss: 1.2650
-[06:19:49] 
-============================================================
-[06:19:49] 开始评估...
-[06:19:49] 类别: 20 个
-[06:19:49] 重复: 1 次
-[06:19:49] ============================================================
-
-[06:19:49] 轮次 1/1
-当前目录: /home/featurize/work/mix
-Python路径前3项: ['/home/featurize/work/openscene', '/home/featurize/work/mix', '/home/featurize/work/mix']
-✓ 所有模块导入成功
-✅ 使用预计算投影: /home/featurize/data/scannet_projections
-Found 26687/27130 samples with precomputed projections
-评估:   0%|          | 0/26687 [00:00<?, ?it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 2/26687 [00:00<25:25, 17.49it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 5/26687 [00:00<18:17, 24.31it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 8/26687 [00:00<17:07, 25.98it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 11/26687 [00:00<16:26, 27.05it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 14/26687 [00:00<16:02, 27.70it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 18/26687 [00:00<15:27, 28.74it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 22/26687 [00:00<14:57, 29.72it/s][06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:49] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 26/26687 [00:00<14:37, 30.37it/s][06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 30/26687 [00:01<14:34, 30.47it/s][06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 34/26687 [00:01<14:27, 30.71it/s][06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 38/26687 [00:01<14:41, 30.24it/s][06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 42/26687 [00:01<14:44, 30.11it/s][06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 46/26687 [00:01<14:39, 30.29it/s][06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 50/26687 [00:01<14:36, 30.40it/s][06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-[06:19:50] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 54/26687 [00:01<14:46, 30.06it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 58/26687 [00:01<15:07, 29.34it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 61/26687 [00:02<15:12, 29.18it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 65/26687 [00:02<14:59, 29.61it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 69/26687 [00:02<14:46, 30.03it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 73/26687 [00:02<14:41, 30.19it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 77/26687 [00:02<14:46, 30.02it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 81/26687 [00:02<14:38, 30.29it/s][06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:51] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 85/26687 [00:02<14:31, 30.52it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 89/26687 [00:03<14:47, 29.97it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 92/26687 [00:03<14:53, 29.78it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 96/26687 [00:03<14:46, 29.99it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 100/26687 [00:03<14:44, 30.06it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 104/26687 [00:03<15:24, 28.75it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 107/26687 [00:03<15:20, 28.88it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 110/26687 [00:03<15:13, 29.09it/s][06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-[06:19:52] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 113/26687 [00:03<15:17, 28.96it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 117/26687 [00:03<15:04, 29.37it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 120/26687 [00:04<15:08, 29.25it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 123/26687 [00:04<15:21, 28.83it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 126/26687 [00:04<15:18, 28.91it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 129/26687 [00:04<15:21, 28.81it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   0%|          | 132/26687 [00:04<15:29, 28.57it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 135/26687 [00:04<15:30, 28.54it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 138/26687 [00:04<15:24, 28.71it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:53] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 141/26687 [00:04<15:17, 28.94it/s][06:19:53] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 144/26687 [00:04<15:14, 29.02it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 148/26687 [00:05<15:02, 29.41it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 152/26687 [00:05<14:57, 29.57it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 155/26687 [00:05<15:05, 29.30it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 158/26687 [00:05<15:04, 29.32it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 161/26687 [00:05<15:06, 29.27it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 165/26687 [00:05<14:57, 29.54it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 168/26687 [00:05<14:57, 29.54it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:54] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 171/26687 [00:05<14:55, 29.62it/s][06:19:54] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 175/26687 [00:05<14:45, 29.93it/s][06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 179/26687 [00:06<14:37, 30.22it/s][06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 183/26687 [00:06<14:57, 29.52it/s][06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 187/26687 [00:06<14:42, 30.03it/s][06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 191/26687 [00:06<14:38, 30.15it/s][06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 195/26687 [00:06<14:40, 30.09it/s][06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 199/26687 [00:06<14:41, 30.05it/s][06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:55] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 203/26687 [00:06<14:56, 29.54it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 206/26687 [00:06<15:01, 29.38it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 209/26687 [00:07<14:58, 29.48it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 212/26687 [00:07<14:59, 29.43it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 215/26687 [00:07<15:15, 28.92it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 218/26687 [00:07<15:09, 29.09it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 221/26687 [00:07<15:21, 28.71it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 224/26687 [00:07<15:20, 28.74it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 227/26687 [00:07<15:09, 29.08it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:56] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 230/26687 [00:07<15:03, 29.27it/s][06:19:56] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 233/26687 [00:07<15:00, 29.37it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 237/26687 [00:08<14:51, 29.66it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 240/26687 [00:08<14:58, 29.44it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 243/26687 [00:08<15:22, 28.66it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 246/26687 [00:08<15:28, 28.48it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 249/26687 [00:08<15:28, 28.47it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 252/26687 [00:08<15:24, 28.59it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 255/26687 [00:08<15:14, 28.91it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:57] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 259/26687 [00:08<15:04, 29.23it/s][06:19:57] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 262/26687 [00:08<15:10, 29.01it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 265/26687 [00:09<15:14, 28.90it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 268/26687 [00:09<15:05, 29.16it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 271/26687 [00:09<15:15, 28.87it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 274/26687 [00:09<15:08, 29.07it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 278/26687 [00:09<14:35, 30.17it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 282/26687 [00:09<14:11, 31.01it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 286/26687 [00:09<14:19, 30.72it/s][06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-[06:19:58] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 290/26687 [00:09<14:29, 30.35it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 294/26687 [00:09<14:27, 30.44it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 298/26687 [00:10<14:15, 30.85it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 302/26687 [00:10<14:10, 31.03it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 306/26687 [00:10<14:09, 31.06it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 310/26687 [00:10<13:57, 31.48it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 314/26687 [00:10<14:00, 31.38it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 318/26687 [00:10<14:18, 30.71it/s][06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:19:59] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 322/26687 [00:10<14:14, 30.86it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 326/26687 [00:11<13:53, 31.62it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|          | 330/26687 [00:11<13:39, 32.15it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 334/26687 [00:11<13:31, 32.47it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 338/26687 [00:11<13:27, 32.62it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 342/26687 [00:11<13:28, 32.59it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 346/26687 [00:11<13:33, 32.39it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 350/26687 [00:11<13:52, 31.65it/s][06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:00] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 354/26687 [00:11<14:22, 30.52it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 358/26687 [00:12<13:55, 31.52it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 363/26687 [00:12<12:30, 35.09it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 368/26687 [00:12<11:30, 38.09it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 373/26687 [00:12<11:06, 39.48it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 378/26687 [00:12<10:53, 40.23it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 383/26687 [00:12<10:31, 41.63it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 388/26687 [00:12<10:28, 41.86it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:01] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 393/26687 [00:12<10:38, 41.17it/s][06:20:01] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   1%|▏         | 398/26687 [00:12<10:43, 40.86it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 403/26687 [00:13<10:52, 40.28it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 408/26687 [00:13<10:48, 40.51it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 413/26687 [00:13<10:56, 40.04it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 418/26687 [00:13<11:10, 39.18it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 422/26687 [00:13<11:49, 37.00it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 426/26687 [00:13<11:54, 36.75it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:02] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 430/26687 [00:13<12:04, 36.22it/s][06:20:02] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 434/26687 [00:13<12:21, 35.39it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 438/26687 [00:14<12:12, 35.85it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 442/26687 [00:14<12:07, 36.05it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 446/26687 [00:14<12:06, 36.10it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 450/26687 [00:14<12:09, 35.97it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 454/26687 [00:14<12:40, 34.51it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 458/26687 [00:14<12:13, 35.76it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 462/26687 [00:14<12:13, 35.75it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:03] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 466/26687 [00:14<12:03, 36.24it/s][06:20:03] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 470/26687 [00:14<12:02, 36.26it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 474/26687 [00:15<12:03, 36.21it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 479/26687 [00:15<11:38, 37.52it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 484/26687 [00:15<11:31, 37.92it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 488/26687 [00:15<11:31, 37.91it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 492/26687 [00:15<11:44, 37.18it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 496/26687 [00:15<12:13, 35.69it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 500/26687 [00:15<11:58, 36.44it/s][06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-[06:20:04] 处理batch出错: unhashable type: 'slice'
-评估:   2%|▏         | 504/26687 [00:15<11:44, 37.14it/s]

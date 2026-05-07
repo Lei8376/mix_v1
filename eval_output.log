@@ -1,6 +1,0 @@
-当前目录: /home/featurize/work/mix
-Python路径: ['/home/featurize/work/openscene', '/home/featurize/work/mix']
-Traceback (most recent call last):
-  File "eval_model_simple.py", line 54, in <module>
-    from dataset.open_vocab_dataset_v2 import OpenVocabDatasetV2Config, OpenVocabScannetDatasetV2, open_vocab_collate_v2
-ModuleNotFoundError: No module named 'dataset.open_vocab_dataset_v2'

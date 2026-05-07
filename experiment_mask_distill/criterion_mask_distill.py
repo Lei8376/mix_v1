@@ -337,6 +337,7 @@ class MaskDistillCriteria(nn.Module):
         if not losses:
             return torch.tensor(0.0, device=self.pred_3d.device, requires_grad=True)
         return torch.stack(losses).mean()
+        # return torch.stack(losses).sum()
 
     # ----------------------------------------------------------
     # 对外接口
