@@ -38,6 +38,11 @@ tb/
 tensorboard/
 wandb/
 
+# keep exported TensorBoard scalar CSVs as lightweight experiment records
+!record/
+!record/tensorboard_csv/
+!record/tensorboard_csv/**/*.csv
+
 # checkpoints / weights
 checkpoints/
 **/checkpoints/
