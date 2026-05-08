@@ -24,7 +24,7 @@ class OpenVocabFusionModelConfig:
     threshold: float = 0.5
     mask_embedding_dim: int = 256
     pixel_embedding_dim: int = 512
-    fused_embedding_dim: int = 256
+    fused_embedding_dim: int = 512
 
 
 class OpenVocab3DFusionModel(nn.Module):

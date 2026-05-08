@@ -129,8 +129,8 @@ def class_label(label_list, vocab):
     return demo_metadata, demo_classes
 
 
-#img_file = "/home/featurize/work/data/Replica_RGBD/Replica/room0/results/frame000001.jpg"
-img_file = "/home/featurize/data/scannet/scannet_2d/scene0000_00/color/1120.jpg"
+#img_file = "/home/sunl/work/data/Replica_RGBD/Replica/room0/results/frame000001.jpg"
+img_file = "/home/sunl/work/mix/data/scannet_2d/scene0000_00/color/1120.jpg"
 input_image = Image.open(img_file)
 label_list = ["SCANNET_20", "COCO", "ADE", "LVIS"]
 #label_list = ["COCO", "ADE", "LVIS", "SCANNET_20"]
@@ -145,7 +145,7 @@ demo_metadata, demo_classes = class_label(label_list, vocab)
 #print(demo_metadata.thing_colors)
 #print(demo_metadata.thing_dataset_id_to_contiguous_id)
 
-pred = torch.load("/home/featurize/work/data/scannet/mask/scene0000_00/predictions_0.pt")
+pred = torch.load("/home/sunl/work/data/scannet/mask/scene0000_00/predictions_0.pt")
 
 #print(pred[0]['panoptic_seg'][1])
 
@@ -198,6 +198,5 @@ print(mask_0["object"])
 
 embed_pred = torch.load("/home/featurize/work/data/scannet/mask/scene0000_00/mask_embed_1540.pt")
 print(embed_pred.shape)
-
 
 

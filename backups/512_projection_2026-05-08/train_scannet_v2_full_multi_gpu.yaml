@@ -58,14 +58,12 @@ dataset:
 # ============================================================
 # 模型配置
 # ============================================================
-model:
-  # 使用预计算 2D 特征训练；这里只显式固定融合维度。
-  # LSeg pixel_pooled 输入仍是 512D，进入模型后投影到 ODISE 原生 256D 空间。
-  pc_arch: MinkUNet34C
-  pixel_embedding_dim: 512
-  mask_embedding_dim: 256
-  fused_embedding_dim: 256
-  pc_last_dim: 256
+model: null  # 使用预计算特征时设为 null
+             # 如需在线提取 2D 特征，需要配置:
+             #   pc_arch: MinkUNet34C  # 3D backbone 架构
+             #   label_path: ...       # LSeg 标签文件
+             #   lseg_ckpt_path: ...   # LSeg 检查点
+             #   odise_model_config_path: ...  # ODISE 配置
 
 # ============================================================
 # 训练超参数配置
@@ -103,9 +101,9 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_fusion
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha
   
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_fusion
+  log_dir: runs/diff2scene_hybrid_lseg_pc_adaptive_alpha
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
@@ -134,16 +132,16 @@ trainer:
                                   # - DDP 下使用 no_sync() 优化，速度只慢 5-15%
 
   # ----- Open-vocabulary semantic mIoU -----
-  # 混合模型 token 为 ODISE 原生 256 维，使用 ODISE word_head.text_proj 文本器评估。
-  semantic_clip_model: "ODISE-256"
+  # 混合模型 token 为 512 维，使用匹配的 ViT-B/32 文本空间评估。
+  semantic_clip_model: "ViT-B/32"
   # 现有 LSeg pixel_pooled 为 512 维，使用匹配的 ViT-B/32 文本空间评估。
   semantic_pixel_clip_model: "ViT-B/32"
   # p_final ∝ p_hybrid^lambda * p_lseg^(1-lambda)
   semantic_pc_lambda: 0.5
-  semantic_prompt_template: "a photo of a {}"
+  semantic_prompt_template: "a {} in a scene"
   
   # 【可选】恢复训练
-  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_4.pth  # 续训使用最新 256D epoch checkpoint
+  resume: checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha/checkpoint_epoch_1.pth  # 如需恢复训练，填入 checkpoint 路径
 
 # ============================================================
 # 随机种子（确保可复现性）

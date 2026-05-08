@@ -12,8 +12,8 @@ dataloader:
   num_workers: 8
 dataset:
   data_config_path: config/data_scannet_3d.yaml
-  precomputed_dir: /home/featurize/data/pixel_pooled
-  projection_dir: /home/featurize/data/scannet_projections
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
+  projection_dir: /home/sunl/work/mix/data/scannet_projections
   split: train
   # 快速验证先用 10% 数据（约 9000 样本），确认能跑通再放开
   max_samples_ratio: 0.3

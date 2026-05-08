@@ -339,7 +339,7 @@ def main() -> None:
         pc_arch=_model.get("pc_arch", "MinkUNet34C"),
         pixel_embedding_dim=_model.get("pixel_embedding_dim", 512),
         mask_embedding_dim=_model.get("mask_embedding_dim", 256),
-        fused_embedding_dim=_model.get("fused_embedding_dim", 256),
+        fused_embedding_dim=_model.get("fused_embedding_dim", 512),
         pc_last_dim=_model.get("pc_last_dim", 256),
     )
 
@@ -372,9 +372,9 @@ def main() -> None:
         resume_checkpoint=resume_checkpoint,
         use_model_half=_trainer.get("use_model_half", args.model_half),
         gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),  # 🔥 梯度累积
-        semantic_clip_model=_trainer.get("semantic_clip_model", "ODISE-256"),
+        semantic_clip_model=_trainer.get("semantic_clip_model", "ViT-B/32"),
         semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
-        semantic_prompt_template=_trainer.get("semantic_prompt_template", "a photo of a {}"),
+        semantic_prompt_template=_trainer.get("semantic_prompt_template", "a {} in a scene"),
         semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
     )
     use_mask_distill = _trainer.get("use_mask_distill", False)
@@ -403,9 +403,9 @@ def main() -> None:
             resume_checkpoint=resume_checkpoint,
             use_model_half=_trainer.get("use_model_half", args.model_half),
             gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),
-            semantic_clip_model=_trainer.get("semantic_clip_model", "ODISE-256"),
+            semantic_clip_model=_trainer.get("semantic_clip_model", "ViT-B/32"),
             semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
-            semantic_prompt_template=_trainer.get("semantic_prompt_template", "a photo of a {}"),
+            semantic_prompt_template=_trainer.get("semantic_prompt_template", "a {} in a scene"),
             semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
         )
 

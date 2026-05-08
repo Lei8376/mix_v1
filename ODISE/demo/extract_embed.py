@@ -476,12 +476,12 @@ extractor = ODISEMaskEmbeddingExtractor(
     device = "cuda"
 )
 
-results = extractor.extract("/home/featurize/data/scannet_2d/scene0000_00/color/100.jpg")
+results = extractor.extract("/home/sunl/work/mix/data/scannet_2d/scene0000_00/color/100.jpg")
 print(results["num_masks"])
 print(len(results["masks"]))
 print(results["mask_embeddings"].shape)
 
-image = np.array(Image.open("/home/featurize/data/scannet_2d/scene0000_00/color/100.jpg"))
+image = np.array(Image.open("/home/sunl/work/mix/data/scannet_2d/scene0000_00/color/100.jpg"))
 image = extractor.visualize(image, results)
 Image.fromarray(image).save("visualization.jpg")
 

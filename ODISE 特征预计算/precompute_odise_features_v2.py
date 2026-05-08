@@ -8,7 +8,7 @@ This script processes images and saves:
 
 Usage:
     # Method 1: Using config file (recommended)
-    conda activate f_bak
+    conda activate mix
     python scripts/precompute_odise_features_v2.py --config config/odise_config.yaml
     
     # Method 2: Override config with command line arguments

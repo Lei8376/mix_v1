@@ -2,16 +2,16 @@
 # 运行 ODISE 特征提取测试脚本
 
 # 设置环境变量
-export ODISE_MODEL_ZOO="/home/featurize/work/mix2_v1/ODISE/checkpoints"
+export ODISE_MODEL_ZOO="/home/sunl/work/mix_v1/ODISE/checkpoints"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
 # 激活环境
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate f_bak
+conda activate mix
 
 # 进入目录
-cd /home/featurize/work/mix2_v1/ODISE
+cd /home/sunl/work/mix_v1/ODISE
 
 # 运行配置1: COCO+ADE+LVIS+SCANNET_20
 echo "运行配置1: COCO+ADE+LVIS+SCANNET_20"

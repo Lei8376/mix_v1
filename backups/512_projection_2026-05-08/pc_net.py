@@ -6,8 +6,8 @@ from .mink_unet import mink_unet as model3D
 class PC_Processor(nn.Module):
     def __init__(
         self,
-        adapter_proj_out_dim=256,
-        decoder_proj_out_dim=256,
+        adapter_proj_out_dim=512,
+        decoder_proj_out_dim=512,
         last_dim=256,
         arch_3d="MinkUNet34C",
     ):

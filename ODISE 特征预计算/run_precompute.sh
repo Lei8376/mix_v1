@@ -6,10 +6,10 @@
 # ==================== 需要配置的路径 ====================
 
 # 1. 数据配置文件路径（需要创建，见下方说明）
-DATA_CONFIG_PATH="config/scannet/data_config.yaml"
+DATA_CONFIG_PATH="config/data_scannet_3d.yaml"
 
 # 2. 输出目录
-OUTPUT_DIR="/path/to/output/precomputed_2d"
+OUTPUT_DIR="/home/sunl/work/mix/data/precomputed_2d"
 
 # 3. LSeg 检查点路径（需要下载，见下方说明）
 LSEG_CKPT_PATH="lang_seg/checkpoints/demo_e200.ckpt"
@@ -34,7 +34,7 @@ MAX_IMAGES_PER_SCENE=5
 
 # ==================== 运行命令 ====================
 
-cd /home/featurize/work/mix2_v1
+cd /home/sunl/work/mix_v1
 
 python scripts/precompute_2d_features.py \
     --data-config-path "$DATA_CONFIG_PATH" \

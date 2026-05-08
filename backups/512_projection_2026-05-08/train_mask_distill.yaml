@@ -29,12 +29,7 @@ dataset:
   max_samples_ratio: 1
   aug: true   # 3D 数据增强：Z轴随机旋转 + 缩放[0.9,1.1] + 平移[-0.5,0.5]m（仅 train split）
 
-model:
-  pc_arch: MinkUNet34C
-  pixel_embedding_dim: 512
-  mask_embedding_dim: 256
-  fused_embedding_dim: 256
-  pc_last_dim: 256
+model: null
 
 trainer:
   # ----- 学习率 -----
@@ -49,8 +44,8 @@ trainer:
   # ----- 验证和保存 -----
   val_every_epochs: 1
   save_every_epochs: 5
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_fusion.mask_distill
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_fusion.mask_distill
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha.1
+  log_dir: runs/diff2scene_hybrid_lseg_pc_adaptive_alpha.1
 
   # ----- Mask Distillation Loss 权重（Diff2Scene 方案）-----
   mask_distill_weight: 1.0   # L_mask_distill 主损失权重
@@ -67,13 +62,13 @@ trainer:
   use_mask_distill: true
 
   # ----- Open-vocabulary semantic evaluation -----
-  # hybrid/text: fused hybrid model token vs ODISE word_head.text_proj 256D text
-  semantic_clip_model: "ODISE-256"
+  # hybrid/text: fused hybrid model token vs 512-dim CLIP ViT-B/32 text
+  semantic_clip_model: "ViT-B/32"
   # lseg/text: existing 512-dim pixel_pooled feature vs matching CLIP-B text encoder.
   semantic_pixel_clip_model: "ViT-B/32"
   # Geometric mean: p_final ∝ p_hybrid^lambda * p_lseg^(1-lambda)
   semantic_pc_lambda: 0.5
-  semantic_prompt_template: "a photo of a {}"
+  semantic_prompt_template: "a {} in a scene"
 
   # # ----- 恢复训练（可选）-----
   resume: ""

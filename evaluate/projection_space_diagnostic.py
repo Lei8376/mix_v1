@@ -176,32 +176,32 @@ def main():
             pc_arch=model_cfg.get("pc_arch", "MinkUNet34C"),
             pixel_embedding_dim=model_cfg.get("pixel_embedding_dim", 512),
             mask_embedding_dim=model_cfg.get("mask_embedding_dim", 256),
-            fused_embedding_dim=model_cfg.get("fused_embedding_dim", 768),
+            fused_embedding_dim=model_cfg.get("fused_embedding_dim", 256),
             pc_last_dim=model_cfg.get("pc_last_dim", 256),
         )
     ).to(device)
     checkpoint, missing, unexpected = _load_model_state(model, args.checkpoint, str(device))
     model.eval()
 
-    text_l = build_text_features(
+    text_hybrid = build_text_features(
         SCANNET_LABELS_20,
-        trainer_cfg.get("semantic_prompt_template", "a {} in a scene"),
-        trainer_cfg.get("semantic_clip_model", "ViT-L/14@336px"),
+        trainer_cfg.get("semantic_prompt_template", "a photo of a {}"),
+        trainer_cfg.get("semantic_clip_model", "ODISE-256"),
         device=device,
     )
     text_b = build_text_features(
         SCANNET_LABELS_20,
-        trainer_cfg.get("semantic_prompt_template", "a {} in a scene"),
+        trainer_cfg.get("semantic_prompt_template", "a photo of a {}"),
         trainer_cfg.get("semantic_pixel_clip_model", "ViT-B/32"),
         device=device,
     )
 
     accs = {
         "odise_raw_label": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-        "odise_proj_768_text": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+        "odise_proj_256_text": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
         "lseg_raw_512_text": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-        "lseg_proj_768_text": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-        "fused_768_text": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+        "lseg_proj_256_text": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+        "fused_256_text": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
     }
     matched_masks = 0
     total_masks = 0
@@ -242,17 +242,17 @@ def main():
 
                 preds = {
                     "odise_raw_label": diff2scene_class_probs_predict(pred_logits, raw_probs),
-                    "odise_proj_768_text": diff2scene_mask_feature_predict(
-                        pred_logits, mask_proj_all[b][valid_k], text_l
+                    "odise_proj_256_text": diff2scene_mask_feature_predict(
+                        pred_logits, mask_proj_all[b][valid_k], text_hybrid
                     ),
                     "lseg_raw_512_text": diff2scene_mask_feature_predict(
                         pred_logits, batch["pixel_pooled"][b][valid_k].float(), text_b
                     ),
-                    "lseg_proj_768_text": diff2scene_mask_feature_predict(
-                        pred_logits, pixel_proj_all[b][valid_k], text_l
+                    "lseg_proj_256_text": diff2scene_mask_feature_predict(
+                        pred_logits, pixel_proj_all[b][valid_k], text_hybrid
                     ),
-                    "fused_768_text": diff2scene_mask_feature_predict(
-                        pred_logits, results["fused_embeddings"][b][valid_k], text_l
+                    "fused_256_text": diff2scene_mask_feature_predict(
+                        pred_logits, results["fused_embeddings"][b][valid_k], text_hybrid
                     ),
                 }
                 for name, pred in preds.items():

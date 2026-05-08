@@ -20,7 +20,7 @@ if project_root not in sys.path:
 # data_loader 仅下方 __main__ 使用，延迟导入避免 train_open_vocab_v2 时拉取 SharedArray
 from lang_seg.modules.models.lseg_net import LSegNet
 
-# for LSeg module：使用用户可写路径，避免 /home/featurize 权限错误
+# for LSeg module：使用用户可写路径，避免写入无权限目录
 _torch_home = os.environ.get("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
 os.environ.setdefault("TORCH_HOME", _torch_home)
 os.makedirs(os.path.join(_torch_home, "checkpoints"), exist_ok=True)
@@ -130,7 +130,7 @@ if __name__ == "__main__":
     label_path = "label_files/ade20k_objectInfo150.txt"
     ckpt_path = "checkpoints/demo_e200.ckpt"
 
-    file = "/home/featurize/work/mix2_v1/config/data_scannet_3d.yaml"
+    file = "/home/sunl/work/mix_v1/config/data_scannet_3d.yaml"
     res = dl.read_yaml(file)
     data_loader = dl.ScannetLoader(
         datapath_prefix=res['DATA']['data_root'],

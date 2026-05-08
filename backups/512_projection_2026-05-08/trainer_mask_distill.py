@@ -15,7 +15,7 @@ from MinkowskiEngine import SparseTensor
 
 from experiment_mask_distill.criterion_mask_distill import MaskDistillCriteria
 from experiment_mask_distill.semantic_miou import (
-    MaskMIoUTracker, ODISEPCSemanticMIoUTracker,
+    MaskMIoUTracker, Diff2SceneSemanticMIoUTracker, ODISEPCSemanticMIoUTracker,
     build_text_features,
 )
 from utils.util import AverageMeter
@@ -63,9 +63,9 @@ class MaskDistillTrainerConfig:
     max_batches_per_epoch:      Optional[int] = None
     use_model_half:             bool  = False
     gradient_accumulation_steps: int  = 2
-    semantic_clip_model:         str   = "ODISE-256"
+    semantic_clip_model:         str   = "ViT-B/32"
     semantic_pixel_clip_model:   str   = "ViT-B/32"
-    semantic_prompt_template:    str   = "a photo of a {}"
+    semantic_prompt_template:    str   = "a {} in a scene"
     semantic_pc_lambda:          float = 0.5
 
 
@@ -397,12 +397,10 @@ class MaskDistillTrainer:
         val_distill   = AverageMeter()
         val_aux       = AverageMeter()
 
-        # 语义 mIoU：只保留三项：
-        # 1) Hybrid/Text: fused 256D vs ODISE text256
-        # 2) CLIP/Text: raw LSeg/CLIP 512D vs CLIP-B text512
-        # 3) Final-PC: geometric fused final result
+        # 语义 mIoU：Diff2Scene Eq.3；可选 ODISE Eq.10 几何平均 PC。
         text_feats = self._get_text_features()
         pixel_text_feats = self._get_pixel_text_features()
+        sem_tracker = Diff2SceneSemanticMIoUTracker() if text_feats is not None else None
         pc_tracker = (
             ODISEPCSemanticMIoUTracker(pc_lambda=self.config.semantic_pc_lambda)
             if text_feats is not None and pixel_text_feats is not None
@@ -438,8 +436,8 @@ class MaskDistillTrainer:
             )
             # lifted: (N_total, K_max)
 
-            # ---- 语义 mIoU：Hybrid / CLIP / Final-PC ----
-            if pc_tracker is not None:
+            # ---- 语义 mIoU：Diff2Scene Eq.3 / ODISE Eq.10 PC ----
+            if sem_tracker is not None:
                 fused_all = results["fused_embeddings"]
                 pixel_all = results.get("pixel_pooled_embeddings", None)
                 mask_valid_for_sem = results["mask_valid_from_masks"]
@@ -456,15 +454,16 @@ class MaskDistillTrainer:
                     fused_b = fused_all[b][valid_k]
                     if pred_logits.shape[0] != gt_b.numel():
                         raise RuntimeError(
-                            f"Semantic eval batch={batch_idx} item={b}: "
+                            f"Diff2Scene semantic eval batch={batch_idx} item={b}: "
                             f"logit rows {pred_logits.shape[0]} != gt labels {gt_b.numel()}"
                         )
-                    if pixel_all is not None:
+                    sem_tracker.update(gt_b, fused_b, pred_logits, text_feats)
+                    if pc_tracker is not None and pixel_all is not None:
                         pixel_b = pixel_all[b][valid_k]
                         if pixel_b.shape[-1] != pixel_text_feats.shape[-1]:
                             if self.is_main and not self._warned_pixel_text_dim_mismatch:
                                 print(
-                                    "[WARNING] Skip semantic Hybrid/CLIP/Final-PC mIoU: "
+                                    "[WARNING] Skip ODISE PC / CLIP-text mIoU: "
                                     f"pixel feature dim={pixel_b.shape[-1]} but "
                                     f"text dim={pixel_text_feats.shape[-1]}. "
                                     "Regenerate mask-pooled CLIP features with the same CLIP model "
@@ -485,7 +484,7 @@ class MaskDistillTrainer:
             # ---- Mask-level mIoU ----
             B      = mask_valid.shape[0]
             K_max  = mask_valid.shape[1]
-            fused_embeddings_all = results["fused_embeddings"]   # (B, K_max, 256)
+            fused_embeddings_all = results["fused_embeddings"]   # (B, K_max, 512)
 
             for b in range(B):
                 if len(results["outputs"][b]) == 0:
@@ -531,29 +530,33 @@ class MaskDistillTrainer:
             "loss":                      val_loss.avg,
             "loss_mask_distill":         val_distill.avg,
             "loss_aux":                  val_aux.avg,
-            "semantic_miou":             0.0,  # final semantic metric used for best_model
+            "semantic_miou":             0.0,
+            "semantic_miou_diff2scene":  0.0,
             "semantic_miou_hybrid_text": 0.0,
             "semantic_miou_clip_text":   0.0,
-            "semantic_miou_final":       0.0,
-            "n_valid_classes_hybrid":    0,
-            "n_valid_classes_clip":      0,
-            "n_valid_classes_final":     0,
+            "semantic_miou_pc":          0.0,
+            "n_valid_classes":           0,
+            "n_valid_classes_pc":        0,
             "mask_miou":                 0.0,
             "n_masks":                   0,
         }
+
+        if sem_tracker is not None:
+            sem_res = sem_tracker.compute()
+            val_metrics["semantic_miou"] = sem_res["semantic_miou_diff2scene"]
+            val_metrics["semantic_miou_diff2scene"] = sem_res["semantic_miou_diff2scene"]
+            val_metrics["n_valid_classes"] = sem_res["n_valid_classes"]
+            val_metrics["per_class_iou_diff2scene"] = sem_res.get("per_class_iou_diff2scene", {})
 
         if pc_tracker is not None:
             pc_res = pc_tracker.compute()
             val_metrics["semantic_miou_hybrid_text"] = pc_res["semantic_miou_hybrid_text"]
             val_metrics["semantic_miou_clip_text"] = pc_res["semantic_miou_clip_text"]
-            val_metrics["semantic_miou_final"] = pc_res["semantic_miou_pc"]
-            val_metrics["semantic_miou"] = pc_res["semantic_miou_pc"]
-            val_metrics["n_valid_classes_hybrid"] = pc_res["n_valid_classes_hybrid_text"]
-            val_metrics["n_valid_classes_clip"] = pc_res["n_valid_classes_clip_text"]
-            val_metrics["n_valid_classes_final"] = pc_res["n_valid_classes_pc"]
+            val_metrics["semantic_miou_pc"] = pc_res["semantic_miou_pc"]
+            val_metrics["n_valid_classes_pc"] = pc_res["n_valid_classes_pc"]
             val_metrics["per_class_iou_hybrid_text"] = pc_res.get("per_class_iou_hybrid_text", {})
             val_metrics["per_class_iou_clip_text"] = pc_res.get("per_class_iou_clip_text", {})
-            val_metrics["per_class_iou_final"] = pc_res.get("per_class_iou_pc", {})
+            val_metrics["per_class_iou_pc"] = pc_res.get("per_class_iou_pc", {})
 
         mask_res = mask_tracker.compute()
         val_metrics["mask_miou"] = mask_res["mask_miou"]
@@ -575,7 +578,6 @@ class MaskDistillTrainer:
             "scaler_state_dict":    self.scaler.state_dict(),
             "best_loss":            self.best_loss,
             "best_iou":             self.best_iou,
-            "best_monitor":         "semantic_miou_final",
             "config":               self.config,
         }
         if suffix:
@@ -619,14 +621,7 @@ class MaskDistillTrainer:
         self.current_epoch = ckpt["epoch"] + 1
         self.global_step   = ckpt["global_step"]
         self.best_loss     = ckpt.get("best_loss", float("inf"))
-        if ckpt.get("best_monitor") == "semantic_miou_final":
-            self.best_iou = ckpt.get("best_iou", 0.0)
-        else:
-            # Older checkpoints stored mask_mIoU in best_iou. The current best
-            # model criterion is Final-PC semantic mIoU, so reset the baseline.
-            self.best_iou = 0.0
-            if self.is_main:
-                print("[resume] reset best_iou: checkpoint used old monitor, now using semantic_miou_final")
+        self.best_iou      = ckpt.get("best_iou",  0.0)
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
 
     # ----------------------------------------------------------
@@ -663,19 +658,20 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("Loss/Val",                   val_metrics["loss"],                       epoch)
                         self.writer.add_scalar("Loss/Val_MaskDistill",       val_metrics["loss_mask_distill"],          epoch)
                         self.writer.add_scalar("Loss/Val_Aux",               val_metrics["loss_aux"],                   epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_Diff2Scene", val_metrics["semantic_miou_diff2scene"], epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_HybridText", val_metrics["semantic_miou_hybrid_text"], epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_CLIPText",   val_metrics["semantic_miou_clip_text"],   epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_FinalPC",    val_metrics["semantic_miou_final"],       epoch)
-                        self.writer.add_scalar("Metrics/N_Valid_Classes_Hybrid",   val_metrics["n_valid_classes_hybrid"],   epoch)
-                        self.writer.add_scalar("Metrics/N_Valid_Classes_CLIP",     val_metrics["n_valid_classes_clip"],     epoch)
-                        self.writer.add_scalar("Metrics/N_Valid_Classes_Final",    val_metrics["n_valid_classes_final"],    epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_LSegText",   val_metrics["semantic_miou_clip_text"],   epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_PC",         val_metrics["semantic_miou_pc"],          epoch)
+                        self.writer.add_scalar("Metrics/N_Valid_Classes",          val_metrics["n_valid_classes"],          epoch)
+                        self.writer.add_scalar("Metrics/N_Valid_Classes_PC",       val_metrics["n_valid_classes_pc"],       epoch)
                         self.writer.add_scalar("Metrics/Mask_mIoU",               val_metrics["mask_miou"],                epoch)
                         self.writer.add_scalar("Metrics/N_Masks",                  val_metrics["n_masks"],                  epoch)
                         # 每类 IoU 写入 TensorBoard
                         per_class_groups = {
+                            "PerClass_IoU_D2S": val_metrics.get("per_class_iou_diff2scene", {}),
                             "PerClass_IoU_HybridText": val_metrics.get("per_class_iou_hybrid_text", {}),
-                            "PerClass_IoU_CLIPText": val_metrics.get("per_class_iou_clip_text", {}),
-                            "PerClass_IoU_FinalPC": val_metrics.get("per_class_iou_final", {}),
+                            "PerClass_IoU_LSegText": val_metrics.get("per_class_iou_clip_text", {}),
+                            "PerClass_IoU_PC": val_metrics.get("per_class_iou_pc", {}),
                         }
                         for tag_prefix, per_class in per_class_groups.items():
                             for cls_name, iou_val in per_class.items():
@@ -683,24 +679,27 @@ class MaskDistillTrainer:
                                     f"{tag_prefix}/{cls_name}", iou_val, epoch
                                 )
 
+                    sem_miou_b = val_metrics["semantic_miou_diff2scene"]
                     sem_miou_h = val_metrics["semantic_miou_hybrid_text"]
                     sem_miou_c = val_metrics["semantic_miou_clip_text"]
-                    sem_miou_final = val_metrics["semantic_miou_final"]
+                    sem_miou_pc = val_metrics["semantic_miou_pc"]
                     mask_miou  = val_metrics["mask_miou"]
-                    n_cls      = val_metrics["n_valid_classes_final"]
+                    n_cls      = val_metrics["n_valid_classes"]
                     print(
                         f"  Val Loss: {val_metrics['loss']:.4f} "
                         f"(distill={val_metrics['loss_mask_distill']:.4f})  "
+                        f"[语义mIoU-D2S] {sem_miou_b:.4f} ({n_cls} classes)  "
                         f"[Hybrid/Text] {sem_miou_h:.4f}  "
-                        f"[CLIP/Text] {sem_miou_c:.4f}  "
-                        f"[Final-PC] {sem_miou_final:.4f} ({n_cls} classes)  "
+                        f"[LSeg/Text] {sem_miou_c:.4f}  "
+                        f"[PC-Geom] {sem_miou_pc:.4f}  "
                         f"[MaskIoU] {mask_miou:.4f} ({val_metrics['n_masks']} masks)"
                     )
-                    if self.is_main:
+                    if "per_class_iou_diff2scene" in val_metrics and self.is_main:
                         for name, key in (
+                            ("D2S", "per_class_iou_diff2scene"),
                             ("Hybrid/Text", "per_class_iou_hybrid_text"),
-                            ("CLIP/Text", "per_class_iou_clip_text"),
-                            ("Final-PC", "per_class_iou_final"),
+                            ("LSeg/Text", "per_class_iou_clip_text"),
+                            ("PC-Geom", "per_class_iou_pc"),
                         ):
                             per_cls = val_metrics.get(key, {})
                             if not per_cls:
@@ -713,14 +712,14 @@ class MaskDistillTrainer:
 
             is_best = False
             if val_metrics is not None:
-                monitored = val_metrics.get("semantic_miou_final", 0.0)
+                monitored = val_metrics.get("mask_miou", 0.0)
                 if monitored > self.best_iou + self.config.early_stopping_min_delta:
                     prev = self.best_iou
                     self.best_iou = monitored
                     self.epochs_without_improvement = 0
                     is_best = True
                     if self.is_main:
-                        print(f"  New best Final-PC semantic mIoU: {monitored:.4f} (prev: {prev:.4f})")
+                        print(f"  New best mIoU: {monitored:.4f} (prev: {prev:.4f})")
                 else:
                     self.epochs_without_improvement += 1
                 if val_metrics["loss"] < self.best_loss:

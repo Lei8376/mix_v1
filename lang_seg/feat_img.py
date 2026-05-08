@@ -1,10 +1,10 @@
-#python feat_img.py --img /home/featurize/data/scannet_2d/scene0000_00/color/0.jpg --out out/feat.npy
+#python feat_img.py --img /home/sunl/work/mix/data/scannet_2d/scene0000_00/color/0.jpg --out out/feat.npy
 ## choose a writable cache root
 #export TORCH_HOME=/home/sunl/.cache/torch
 #mkdir -p "$TORCH_HOME/hub/checkpoints"
 
 # copy your existing file into the cache
-#cp /home/featurize/work/mix2_v1/lang_seg/checkpoints/L_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.1-sd_0.1--imagenet2012-steps_20k-lr_0.01-res_384.npz \
+#cp /home/sunl/work/mix_v1/lang_seg/checkpoints/L_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.1-sd_0.1--imagenet2012-steps_20k-lr_0.01-res_384.npz \
 #   "$TORCH_HOME/hub/checkpoints/"
 
 import os

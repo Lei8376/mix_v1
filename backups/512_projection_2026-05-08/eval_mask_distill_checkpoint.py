@@ -124,7 +124,7 @@ def main():
         pc_arch=model_cfg.get("pc_arch", "MinkUNet34C"),
         pixel_embedding_dim=model_cfg.get("pixel_embedding_dim", 512),
         mask_embedding_dim=model_cfg.get("mask_embedding_dim", 256),
-        fused_embedding_dim=model_cfg.get("fused_embedding_dim", 256),
+        fused_embedding_dim=model_cfg.get("fused_embedding_dim", 512),
         pc_last_dim=model_cfg.get("pc_last_dim", 256),
     )
     model = OpenVocab3DFusionModelV2(model_config).to(device)
@@ -145,9 +145,9 @@ def main():
         bce_weight=trainer_cfg.get("bce_weight", 0.0),
         dice_weight=trainer_cfg.get("dice_weight", 0.0),
         min_points_per_mask=trainer_cfg.get("min_points_per_mask", 10),
-        semantic_clip_model=trainer_cfg.get("semantic_clip_model", "ODISE-256"),
+        semantic_clip_model=trainer_cfg.get("semantic_clip_model", "ViT-B/32"),
         semantic_pixel_clip_model=trainer_cfg.get("semantic_pixel_clip_model", "ViT-B/32"),
-        semantic_prompt_template=trainer_cfg.get("semantic_prompt_template", "a photo of a {}"),
+        semantic_prompt_template=trainer_cfg.get("semantic_prompt_template", "a {} in a scene"),
         semantic_pc_lambda=trainer_cfg.get("semantic_pc_lambda", 0.5),
     )
     trainer = MaskDistillTrainer(
@@ -164,7 +164,7 @@ def main():
         if key.startswith("per_class") or key == "target":
             continue
         print(f"  {key}: {value}")
-    for key in ("per_class_iou_hybrid_text", "per_class_iou_clip_text", "per_class_iou_final"):
+    for key in ("per_class_iou_diff2scene", "per_class_iou_hybrid_text", "per_class_iou_clip_text", "per_class_iou_pc"):
         if key in metrics:
             print(f"  {key}:")
             for cls, val in metrics[key].items():

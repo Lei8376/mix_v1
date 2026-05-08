@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
@@ -63,13 +62,6 @@ def build_text_features(
     device: str | torch.device = "cuda",
 ) -> torch.Tensor:
     """Extract normalized CLIP text features using OpenScene-style prompts."""
-    if clip_model in {"ODISE-256", "ODISE", "ODISE-ViT-L/14"}:
-        return build_odise_256_text_features(
-            class_names=class_names,
-            prompt_template=prompt_template,
-            device=device,
-        )
-
     prompts = [
         prompt_template.format(canonical_prompt_label(label))
         for label in class_names
@@ -118,74 +110,6 @@ def build_text_features(
             text_features = F.normalize(text_features, dim=-1)
         del model
         return text_features
-
-
-def _resolve_odise_checkpoint(config_name: str = "Panoptic/odise_caption_coco_50e") -> Path:
-    """Resolve the local ODISE checkpoint cache used for word_head.text_proj."""
-    config_name = config_name.replace(".py", "").replace(".yaml", "")
-    checkpoint_names = {
-        "Panoptic/odise_caption_coco_50e": "odise_caption_coco_50e-853cc971.pth",
-        "Panoptic/odise_label_coco_50e": "odise_label_coco_50e-b67d2efc.pth",
-    }
-    if config_name not in checkpoint_names:
-        raise RuntimeError(f"Unsupported ODISE text-head config: {config_name}")
-    return (
-        Path.home()
-        / ".torch"
-        / "iopath_cache"
-        / "NVlabs"
-        / "ODISE"
-        / "releases"
-        / "download"
-        / "v1.0.0"
-        / checkpoint_names[config_name]
-    )
-
-
-def build_odise_256_text_features(
-    class_names: Sequence[str] = SCANNET_LABELS_20,
-    prompt_template: str = "a photo of a {}",
-    device: str | torch.device = "cuda",
-    odise_model_config: str = "Panoptic/odise_caption_coco_50e",
-) -> torch.Tensor:
-    """Build normalized 256D text features with ODISE word_head.text_proj.
-
-    This is the matching text reader for ODISE raw 256D mask embeddings and the
-    new 256D fused space.
-    """
-    import open_clip
-
-    device = torch.device(device)
-    checkpoint_path = _resolve_odise_checkpoint(odise_model_config)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"ODISE checkpoint not found in local cache: {checkpoint_path}. "
-            "Run an ODISE script once or place the checkpoint there before validation."
-        )
-    ckpt = torch.load(str(checkpoint_path), map_location="cpu")
-    state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
-    weight = state_dict["word_head.text_proj.weight"].float().to(device)
-    bias = state_dict["word_head.text_proj.bias"].float().to(device)
-
-    model, _, _ = open_clip.create_model_and_transforms(
-        "ViT-L-14",
-        pretrained="openai",
-        device=device,
-    )
-    model = model.to(device)
-    model.eval()
-
-    prompts = [
-        prompt_template.format(canonical_prompt_label(label))
-        for label in class_names
-    ]
-    with torch.no_grad():
-        tokens = open_clip.tokenize(prompts).to(device)
-        text_features = model.encode_text(tokens).float()
-        text_features = text_features @ weight.t() + bias
-        text_features = F.normalize(text_features, dim=-1)
-    del model
-    return text_features
 
 
 class AverageMeter:

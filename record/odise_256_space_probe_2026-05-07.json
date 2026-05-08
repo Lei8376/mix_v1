@@ -1,0 +1,360 @@
+{
+  "setup": {
+    "repo": "/home/sunl/work/mix_v1",
+    "checkpoint": "checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha/checkpoint_epoch_20.pth",
+    "checkpoint_epoch": 19,
+    "config": "config/train_scannet_v2_full_multi_gpu.yaml",
+    "split": "val",
+    "max_samples": 20,
+    "records_used": 20,
+    "probe_train_records": 10,
+    "probe_test_records": 10,
+    "probe_fit": "ridge least squares on normalized source512 -> normalized ODISE raw256, bias included",
+    "ridge": 0.001,
+    "odise_text256": "Panoptic/odise_caption_coco_50e.py word_head.text_proj, prompt: a photo of a {}",
+    "missing_keys": [],
+    "unexpected_keys": []
+  },
+  "summary": [
+    {
+      "split": "all20",
+      "method": "odise_raw256_text256",
+      "miou": 0.2427011982272932,
+      "n_valid_classes": 13
+    },
+    {
+      "split": "all20",
+      "method": "lseg512_to_odise256_text256",
+      "miou": 0.2677581991028242,
+      "n_valid_classes": 13
+    },
+    {
+      "split": "all20",
+      "method": "fused512_to_odise256_text256",
+      "miou": 0.23482533258104304,
+      "n_valid_classes": 14
+    },
+    {
+      "split": "train10_probe_fit",
+      "method": "odise_raw256_text256",
+      "miou": 0.27393257743677135,
+      "n_valid_classes": 13
+    },
+    {
+      "split": "train10_probe_fit",
+      "method": "lseg512_to_odise256_text256",
+      "miou": 0.32089559622024993,
+      "n_valid_classes": 12
+    },
+    {
+      "split": "train10_probe_fit",
+      "method": "fused512_to_odise256_text256",
+      "miou": 0.27405765571309537,
+      "n_valid_classes": 13
+    },
+    {
+      "split": "test10_probe_eval",
+      "method": "odise_raw256_text256",
+      "miou": 0.21330919602812096,
+      "n_valid_classes": 12
+    },
+    {
+      "split": "test10_probe_eval",
+      "method": "lseg512_to_odise256_text256",
+      "miou": 0.18768201968500856,
+      "n_valid_classes": 13
+    },
+    {
+      "split": "test10_probe_eval",
+      "method": "fused512_to_odise256_text256",
+      "miou": 0.20661472051783672,
+      "n_valid_classes": 13
+    }
+  ],
+  "metrics": {
+    "all20": {
+      "odise_raw256_text256": {
+        "miou": 0.2427011982272932,
+        "per_class": {
+          "wall": 0.7164500573793193,
+          "floor": 0.7504279506649684,
+          "cabinet": 0.31676839178012817,
+          "chair": 0.6827380854997289,
+          "sofa": 0.0,
+          "table": 0.2324181591550216,
+          "door": 0.0,
+          "window": 0.2898228194812951,
+          "bookshelf": 0.0,
+          "counter": 0.16649011299434957,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 145080,
+          "floor": 59677,
+          "cabinet": 12892,
+          "chair": 50106,
+          "table": 54992,
+          "window": 4141,
+          "counter": 8368,
+          "refrigerator": 8426,
+          "sink": 1127,
+          "otherfurniture": 10314
+        },
+        "n_valid_classes": 13
+      },
+      "lseg512_to_odise256_text256": {
+        "miou": 0.2677581991028242,
+        "per_class": {
+          "wall": 0.7280870191363543,
+          "floor": 0.7419202642132567,
+          "cabinet": 0.4173538129884106,
+          "chair": 0.646155545735748,
+          "sofa": 0.0,
+          "table": 0.2664647878750985,
+          "door": 0.0,
+          "window": 0.5244135534317893,
+          "picture": 0.0,
+          "counter": 0.15646160495605746,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 145080,
+          "floor": 59677,
+          "cabinet": 12892,
+          "chair": 50106,
+          "table": 54992,
+          "window": 4141,
+          "counter": 8368,
+          "refrigerator": 8426,
+          "sink": 1127,
+          "otherfurniture": 10314
+        },
+        "n_valid_classes": 13
+      },
+      "fused512_to_odise256_text256": {
+        "miou": 0.23482533258104304,
+        "per_class": {
+          "wall": 0.7182821629601245,
+          "floor": 0.751729325526171,
+          "cabinet": 0.2945819757482104,
+          "chair": 0.6838335327574608,
+          "sofa": 0.0,
+          "table": 0.23437602573360428,
+          "door": 0.0,
+          "window": 0.4313453536754453,
+          "bookshelf": 0.0,
+          "picture": 0.0,
+          "counter": 0.17340627973358624,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 145080,
+          "floor": 59677,
+          "cabinet": 12892,
+          "chair": 50106,
+          "table": 54992,
+          "window": 4141,
+          "counter": 8368,
+          "refrigerator": 8426,
+          "sink": 1127,
+          "otherfurniture": 10314
+        },
+        "n_valid_classes": 14
+      }
+    },
+    "train10_probe_fit": {
+      "odise_raw256_text256": {
+        "miou": 0.27393257743677135,
+        "per_class": {
+          "wall": 0.7016184685095237,
+          "floor": 0.8477387741987291,
+          "cabinet": 0.4287885183621745,
+          "chair": 0.7180127536794105,
+          "sofa": 0.0,
+          "table": 0.194765840220385,
+          "door": 0.0,
+          "window": 0.509532647207685,
+          "bookshelf": 0.0,
+          "counter": 0.16066650450011968,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 56632,
+          "floor": 43890,
+          "cabinet": 8608,
+          "chair": 35585,
+          "table": 25284,
+          "window": 3571,
+          "counter": 5001,
+          "refrigerator": 5787,
+          "sink": 513,
+          "otherfurniture": 4031
+        },
+        "n_valid_classes": 13
+      },
+      "lseg512_to_odise256_text256": {
+        "miou": 0.32089559622024993,
+        "per_class": {
+          "wall": 0.6848692702928438,
+          "floor": 0.8677027583367622,
+          "cabinet": 0.4546356958507003,
+          "chair": 0.7127207963306316,
+          "sofa": 0.0,
+          "table": 0.25006585012511445,
+          "door": 0.0,
+          "window": 0.582063645130172,
+          "counter": 0.29868913857677504,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 56632,
+          "floor": 43890,
+          "cabinet": 8608,
+          "chair": 35585,
+          "table": 25284,
+          "window": 3571,
+          "counter": 5001,
+          "refrigerator": 5787,
+          "sink": 513,
+          "otherfurniture": 4031
+        },
+        "n_valid_classes": 12
+      },
+      "fused512_to_odise256_text256": {
+        "miou": 0.27405765571309537,
+        "per_class": {
+          "wall": 0.7016417774421593,
+          "floor": 0.8479771805070089,
+          "cabinet": 0.4288247213779092,
+          "chair": 0.7179785634608838,
+          "sofa": 0.0,
+          "table": 0.1951807228915656,
+          "door": 0.0,
+          "window": 0.5104800540905932,
+          "bookshelf": 0.0,
+          "counter": 0.16066650450011968,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 56632,
+          "floor": 43890,
+          "cabinet": 8608,
+          "chair": 35585,
+          "table": 25284,
+          "window": 3571,
+          "counter": 5001,
+          "refrigerator": 5787,
+          "sink": 513,
+          "otherfurniture": 4031
+        },
+        "n_valid_classes": 13
+      }
+    },
+    "test10_probe_eval": {
+      "odise_raw256_text256": {
+        "miou": 0.21330919602812096,
+        "per_class": {
+          "wall": 0.7278303960356465,
+          "floor": 0.4892470220449497,
+          "cabinet": 0.23302196415046558,
+          "chair": 0.6095573440643833,
+          "sofa": 0.0,
+          "table": 0.2666604033571331,
+          "door": 0.0,
+          "window": 0.0635858234885326,
+          "counter": 0.1698073991963408,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 88448,
+          "floor": 15787,
+          "cabinet": 4284,
+          "chair": 14521,
+          "table": 29708,
+          "window": 570,
+          "counter": 3367,
+          "refrigerator": 2639,
+          "sink": 614,
+          "otherfurniture": 6283
+        },
+        "n_valid_classes": 12
+      },
+      "lseg512_to_odise256_text256": {
+        "miou": 0.18768201968500856,
+        "per_class": {
+          "wall": 0.7608295461082659,
+          "floor": 0.4243920182914133,
+          "cabinet": 0.3730692135361352,
+          "chair": 0.5242223811226291,
+          "sofa": 0.0,
+          "table": 0.28055681303757274,
+          "door": 0.0,
+          "window": 0.0,
+          "picture": 0.0,
+          "counter": 0.0767962838090951,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 88448,
+          "floor": 15787,
+          "cabinet": 4284,
+          "chair": 14521,
+          "table": 29708,
+          "window": 570,
+          "counter": 3367,
+          "refrigerator": 2639,
+          "sink": 614,
+          "otherfurniture": 6283
+        },
+        "n_valid_classes": 13
+      },
+      "fused512_to_odise256_text256": {
+        "miou": 0.20661472051783672,
+        "per_class": {
+          "wall": 0.7309778289891918,
+          "floor": 0.4858205227815058,
+          "cabinet": 0.20589055614436214,
+          "chair": 0.6126144352839987,
+          "sofa": 0.0,
+          "table": 0.27008970579010017,
+          "door": 0.0,
+          "window": 0.19900744416872462,
+          "picture": 0.0,
+          "counter": 0.1815908735739945,
+          "refrigerator": 0.0,
+          "sink": 0.0,
+          "otherfurniture": 0.0
+        },
+        "target": {
+          "wall": 88448,
+          "floor": 15787,
+          "cabinet": 4284,
+          "chair": 14521,
+          "table": 29708,
+          "window": 570,
+          "counter": 3367,
+          "refrigerator": 2639,
+          "sink": 614,
+          "otherfurniture": 6283
+        },
+        "n_valid_classes": 13
+      }
+    }
+  }
+}

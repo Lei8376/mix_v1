@@ -8,7 +8,7 @@ This script processes images and saves:
 
 Usage:
     # Activate environment first
-    conda activate f_bak
+    conda activate mix
     
     # Run script
     python scripts/precompute_odise_features.py \

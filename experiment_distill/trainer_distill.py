@@ -81,7 +81,7 @@ class DistillTrainerConfig:
     max_batches_per_epoch:      Optional[int] = None
     use_model_half:             bool  = False
     gradient_accumulation_steps: int  = 1
-    semantic_clip_model:         str   = "ViT-L/14@336px"
+    semantic_clip_model:         str   = "ViT-B/32"
     semantic_prompt_template:    str   = "a {} in a scene"
 
 
@@ -401,7 +401,7 @@ class DistillTrainer:
 
             # ---- 语义 mIoU：直接用 pred_3d 和 GT 3D 标签 ----
             if sem_tracker is not None:
-                pred_3d    = results["pred_3d"]                  # (N_total, 768)
+                pred_3d    = results["pred_3d"]                  # (N_total, 512)
                 gt_labels  = batch["binary_label_3d"]            # (N_total,) nyu40 id
                 sem_tracker.update(pred_3d, gt_labels)
 

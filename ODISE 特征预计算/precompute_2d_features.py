@@ -120,13 +120,13 @@ def main():
     parser.add_argument(
         "--data-config-path",
         type=str,
-        default="/home/featurize/work/mix2_v1/config/data_scannet_3d.yaml",
+        default="/home/sunl/work/mix_v1/config/data_scannet_3d.yaml",
         help="Path to dataset config YAML",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/home/featurize/data/precomputed_2d",
+        default="/home/sunl/work/mix/data/precomputed_2d",
         help="Output directory for precomputed features",
     )
     parser.add_argument(

@@ -71,8 +71,10 @@ class OpenVocabTrainerV2Config:
     # 例：batch_size=16, gradient_accumulation_steps=2 → 有效 batch=32
     gradient_accumulation_steps: int = 1
     # Open-vocabulary semantic evaluation.
-    semantic_clip_model: str = "ViT-L/14@336px"
+    semantic_clip_model: str = "ODISE-256"
+    semantic_pixel_clip_model: str = "ViT-B/32"
     semantic_prompt_template: str = "a {} in a scene"
+    semantic_pc_lambda: float = 0.5
 
 
 class MetricsTracker:
@@ -632,7 +634,7 @@ class OpenVocabTrainerV2:
 
             # ---- 语义 mIoU：Diff2Scene Eq.3，fused_embed × pred_mask ----
             if sem_tracker is not None:
-                fused_all   = results["fused_embeddings"]   # (B, K_max, 768)
+                fused_all   = results["fused_embeddings"]   # (B, K_max, 512)
                 mask_valid  = results["mask_valid_from_masks"]  # (B, K_max)
                 for b in range(len(results["outputs"])):
                     if len(results["outputs"][b]) == 0:
@@ -642,7 +644,7 @@ class OpenVocabTrainerV2:
                         continue
                     pred_logits_b = results["outputs"][b][0]["pred_mask_logits"]
                     pt_mask = results["batch_indices"] == b
-                    fused_b = fused_all[b][valid_k]                       # (K_valid, 768)
+                    fused_b = fused_all[b][valid_k]                       # (K_valid, 512)
                     pred_logits_b = self._select_item_rows(
                         pred_logits_b,
                         pt_mask,

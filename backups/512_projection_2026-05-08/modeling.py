@@ -36,11 +36,11 @@ class MaskStablePixle(nn.Module):
         self.mask_extractor = of.ODISEMaskEmbeddingExtractor(odise_model_config_path)
         self.pix_extractor.eval()
         #self.pixel_reliability = PixelReliability(dim=512)
-        #self.mask_token_projector = MaskTokenProjector(in_dim=256, out_dim=256)
-        #self.pixel_mask_attention = PixelMaskAttention(dim=256)
+        #self.mask_token_projector = MaskTokenProjector(in_dim=256, out_dim=512)
+        #self.pixel_mask_attention = PixelMaskAttention(dim=512)
         #self.mask_spatial_aggregator = MaskSpatialAggregator()
-        #self.adaptive_fusion = AdaptiveFusion(dim=256)
-        self.fuse_embed = ODISEPixelMaskFusionNet(pixel_dim=512, mask_dim=256, out_dim=256)
+        #self.adaptive_fusion = AdaptiveFusion(dim=512)
+        self.fuse_embed = ODISEPixelMaskFusionNet(pixel_dim=512, mask_dim=256, out_dim=512)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         #print(self.logit_scale)
         self.device = device
@@ -279,11 +279,11 @@ class AdaptiveFusion(nn.Module):
 
 
 class ODISEPixelMaskFusionNet(nn.Module):
-    def __init__(self, pixel_dim, mask_dim=256, out_dim=256):
+    def __init__(self, pixel_dim, mask_dim=256, out_dim=512):
         super().__init__()
 
         self.pixel_proj = nn.Linear(pixel_dim, out_dim)
-        self.mask_proj = nn.Identity() if mask_dim == out_dim else MaskTokenProjector(mask_dim, out_dim)
+        self.mask_proj = MaskTokenProjector(mask_dim, out_dim)
         self.gate = nn.Linear(out_dim * 2, 1)
         self.refine = nn.Sequential(
             nn.Linear(out_dim, out_dim),
@@ -292,8 +292,7 @@ class ODISEPixelMaskFusionNet(nn.Module):
         )
         nn.init.constant_(self.gate.bias, -2.0)  # bias toward mask-dominant fusion
 
-        # ODISE-residual fusion in ODISE's native space:
-        # final = raw_odise_tokens + alpha * refine(raw_odise_tokens + gate * projected_lseg_tokens).
+        # ODISE-residual fusion: final = mask_tokens + alpha * refine(mask_tokens + gate * pixel_tokens).
         # Keep alpha learnable/adaptive, matching the original mix2_v1 backup.
         self.alpha = nn.Parameter(torch.tensor(1.0))
 

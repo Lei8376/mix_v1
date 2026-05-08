@@ -413,3 +413,173 @@ checkpoint：
    - ODISE raw 256 本身不能直接和 CLIP text 做点积，除非拿到 ODISE 自己的 open-vocab classifier/logits。
    - 只把 3D/fused 维度改回 256，不能自动解决 text alignment。
    - 真正需要的是保留/蒸馏 ODISE 或 LSeg 的语义概率，而不是只改维度。
+
+## 2026-05-07 mix_v1 ODISE 512/256 Text-Space Diagnostic
+
+目的：
+- 用户确认此前应有 “ODISE 投影到 512 维后与文本做相似度” 的测试。
+- 若 `mix_v1` 没有记录，则在当前 `mix_v1` 代码和 checkpoint 上补测：
+  1. 当前混合模型的 `mask_proj: ODISE 256 -> 512` 后，与 `ViT-B/32` 512D 文本做 Diff2Scene-style semantic eval。
+  2. 原始 `mask_embeddings` 256D 与 ODISE 自己 checkpoint 中的 `word_head.text_proj` 生成的 256D 文本特征做相似度。
+
+环境和权重：
+- Python: `/home/sunl/miniconda3/envs/mix/bin/python`
+- `torch=1.13.1`, CPU eval。
+- `clip` 包不可导入，但 `open_clip` 可用。
+- CLIP 权重已有本地缓存：`/home/sunl/.cache/clip/ViT-B-32.pt`, `ViT-L-14.pt`, `ViT-L-14-336px.pt`。
+- ODISE checkpoint 已有本地缓存：
+  `/home/sunl/.torch/iopath_cache/NVlabs/ODISE/releases/download/v1.0.0/odise_caption_coco_50e-853cc971.pth`
+- ODISE 256D 文本特征构造方式：
+  `open_clip ViT-L-14 text 768D -> ODISE checkpoint word_head.text_proj (256,768) + bias -> 256D`。
+
+checkpoint / data：
+- Repo: `/home/sunl/work/mix_v1`
+- Checkpoint: `checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha/checkpoint_epoch_20.pth`
+- Checkpoint internal epoch: `19`
+- Config: `config/train_scannet_v2_full_multi_gpu.yaml`
+- Split: `val`
+- Samples: `20`
+- Dataset paths resolved to `/home/sunl/work/mix/data/pixel_pooled` and `/home/sunl/work/mix/data/scannet_projections`
+- Model load: `missing_keys=[]`, `unexpected_keys=[]`
+
+命令 1：当前 512D projection diagnostic
+
+```bash
+PYTHONPATH=/home/sunl/work/mix_v1/ODISE:/home/sunl/work/mix_v1/ODISE/third_party/Mask2Former:$PYTHONPATH \
+CLIP_CACHE_DIR=/home/sunl/.cache/clip TORCH_HOME=/tmp/torch \
+/home/sunl/miniconda3/envs/mix/bin/python \
+  evaluate/projection_space_diagnostic.py \
+  --checkpoint checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha/checkpoint_epoch_20.pth \
+  --config config/train_scannet_v2_full_multi_gpu.yaml \
+  --split val --device cpu --batch-size 2 --num-workers 0 --max-samples 20
+```
+
+20-sample result:
+
+| semantic source | mIoU | n_valid | note |
+|---|---:|---:|---|
+| `odise_raw_label` | 0.188840 | 11 | npz `info.category_name` 映射到 ScanNet20；matched masks `93/191` |
+| `odise_proj_512_text` | 0.047350 | 13 | 当前模型 `mask_proj(mask_embeddings)` 后，与 `ViT-B/32` 512D text 相似度 |
+| `lseg_raw_512_text` | 0.287178 | 13 | 原始 `pixel_pooled` 512D，与 `ViT-B/32` 512D text 相似度 |
+| `lseg_proj_512_text` | 0.006403 | 16 | 当前模型 `pixel_proj(pixel_pooled)` 后，与 `ViT-B/32` 512D text 相似度 |
+| `fused_512_text` | 0.045476 | 15 | 当前 `fused_embeddings` 与 `ViT-B/32` 512D text 相似度 |
+
+命令 2：ODISE 原生 256D text projection diagnostic
+
+方法：
+- 使用同一个 checkpoint、同一批 20 个 val samples、同一组 `pred_mask_logits`。
+- `mask_features` 换成原始 `batch["mask_embeddings"]`，维度 256。
+- `text_features` 换成 ODISE checkpoint 的 `word_head.text_proj` 生成的 256D 文本特征。
+- 主结果使用 ODISE 风格 prompt：`a photo of a {label}`。
+- 另测项目常用 prompt：`a {label} in a scene`，仅作对照。
+
+20-sample result:
+
+| semantic source | mIoU | n_valid | note |
+|---|---:|---:|---|
+| `odise_raw256_odise_text_photo` | 0.256471 | 12 | raw 256D ODISE mask embedding vs ODISE `word_head.text_proj` 256D text, prompt `a photo of a {}` |
+| `odise_raw256_odise_text_scene` | 0.178057 | 14 | 同上，但 prompt `a {} in a scene` |
+
+关键 per-class 摘要：
+
+`odise_raw256_odise_text_photo`:
+- wall 0.715950
+- floor 0.755031
+- cabinet 0.371063
+- chair 0.614133
+- table 0.149308
+- window 0.295447
+- counter 0.165301
+- otherfurniture 0.011419
+
+`odise_proj_512_text`:
+- wall 0.436341
+- floor 0.000000
+- cabinet 0.169969
+- chair 0.000000
+- refrigerator 0.009236
+- 其余大部分为 0
+
+结论：
+- ODISE 原始 256D embedding 在 ODISE 自己的 256D text-projection 空间里是明显可读的：`0.256471`。
+- 当前 `mask_proj: 256 -> 512` 后再与 `ViT-B/32` 文本做相似度，语义明显下降到 `0.047350`。
+- 当前 `fused_512_text=0.045476` 与 `odise_proj_512_text=0.047350` 接近，说明 fused 低并不只是 fusion 后被破坏；当前 512D projection/text alignment 本身已经较弱。
+- 原始 LSeg 512D 仍然最好：`lseg_raw_512_text=0.287178`；但 `pixel_proj_512_text=0.006403`，说明 learned projection 同样会破坏 LSeg/text 可读性。
+- 因此下一步如果要做混合模型，不能只依赖当前 `mask_proj/pixel_proj/refine` 后的 token 直接读文本；需要保留 ODISE 256D text head 或 LSeg raw 512D semantic head，或者显式加入 text-space / distribution alignment loss。
+
+## 2026-05-07 mix_v1 Current Projector vs Trained 512 Probe
+
+目的：
+- 进一步区分两种完全不同的 “ODISE 投影到 512”：
+  1. 当前融合模型内部已有的 `mask_proj: 256 -> 512`。
+  2. 单独拟合的 semantic probe：用前 10 个 records 训练 `ODISE raw256 -> LSeg raw512`，后 10 个 records 测试。
+- 对比当前融合模型、当前 512 projector、训练得到的 512 probe、ODISE 原生 256D text readout、LSeg raw 512D text readout。
+
+Artifacts：
+- 详细 Markdown 数据文档：`record/2026-05-07_odise_512_probe_comparison.md`
+- 机器可读 JSON：`record/odise_512_probe_comparison_2026-05-07.json`
+
+统一设置：
+- Repo: `/home/sunl/work/mix_v1`
+- Checkpoint: `checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha/checkpoint_epoch_20.pth`
+- Checkpoint internal epoch: `19`
+- Split: `val`
+- Records: first 20 filtered val records
+- Probe train/test split: first 10 fit, last 10 eval
+- Probe fit: ridge least squares on normalized `ODISE raw256 -> LSeg raw512`, bias included, ridge `1e-3`
+- TextB: `open_clip ViT-B-32`, prompt `a {label} in a scene`
+- ODISE text256: `open_clip ViT-L-14 text768 + ODISE word_head.text_proj`
+
+Summary:
+
+| method | all20 mIoU | train10 mIoU | test10 mIoU |
+|---|---:|---:|---:|
+| `ODISE raw256 @ ODISE text256(photo)` | 0.256471 | 0.314247 | 0.211182 |
+| `ODISE raw256 @ ODISE text256(scene)` | 0.178057 | 0.209325 | 0.178572 |
+| `LSeg raw512 @ CLIP-B text512` | 0.282567 | 0.345964 | 0.204916 |
+| `Current mask_proj 256->512 @ CLIP-B` | 0.047320 | 0.046935 | 0.059554 |
+| `Current pixel_proj 512->512 @ CLIP-B` | 0.006065 | 0.000812 | 0.014346 |
+| `Current fused512 @ CLIP-B` | 0.044698 | 0.048427 | 0.043597 |
+| `Trained ODISE256->512 probe @ CLIP-B` | 0.293798 | 0.377496 | 0.205819 |
+
+Conclusion:
+- 当前模型内部的 `mask_proj 256->512` 和 “单独训练的 semantic probe 256->512” 不是同一个东西。
+- 当前 `mask_proj` 是在当前融合模型目标下训练/加载的 projector，主要服务 mask logits；它没有显式 text/LSeg semantic alignment，因此 test10 只有 `0.059554`。
+- 训练得到的 probe 用 LSeg raw512 作为语义目标，test10 达到 `0.205819`，接近 `LSeg raw512 @ textB = 0.204916`，也接近 `ODISE raw256 @ text256(photo) = 0.211182`。
+- 这说明 ODISE raw256 的语义可以迁移到 CLIP/LSeg 512D 空间；当前问题不是 “ODISE 不能适配 512”，而是当前融合模型的 projector/fusion loss 没有让它适配 512 text-readable semantic space。
+- 后续若最终模型必须是 512D，应引入显式 semantic adapter/head，例如 `ODISE256->512` 用 `LSeg512` 或 `ODISE text256 distribution -> CLIP-B text512 distribution` 监督，再与 geometry/mask head 解耦或加 semantic-preserving fusion。
+
+## 2026-05-07 ODISE 256D space probe: LSeg/fused -> ODISE text head
+
+目的：
+- 回答一个相反方向的问题：不是把 ODISE256 投到 CLIP-B 512D，而是把 `LSeg raw512` 和当前 `fused512` 投到 ODISE 的 256D 空间，再用 ODISE 自己的 `word_head.text_proj` 生成的 256D 文本特征做相似度。
+- 验证 `LSeg512 -> ODISE256 -> ODISE text256` 是否可作为语义路径或辅助监督。
+
+Artifacts：
+- 实验脚本：`evaluate/odise_256_space_probe.py`
+- 详细 Markdown 数据文档：`record/2026-05-07_odise_256_space_probe.md`
+- 机器可读 JSON：`record/odise_256_space_probe_2026-05-07.json`
+
+统一设置：
+- Repo: `/home/sunl/work/mix_v1`
+- Checkpoint: `checkpoints/diff2scene_hybrid_lseg_pc_adaptive_alpha/checkpoint_epoch_20.pth`
+- Checkpoint internal epoch: `19`
+- Split: `val`
+- Records: first 20 filtered val records
+- Probe train/test split: first 10 fit, last 10 eval
+- Probe fit: ridge least squares on normalized `source512 -> ODISE raw256`, bias included, ridge `1e-3`
+- ODISE text256: `Panoptic/odise_caption_coco_50e.py word_head.text_proj`, prompt `a photo of a {label}`
+- Runtime note: current `mix` env did not expose CUDA, so this diagnostic ran on CPU.
+
+Summary:
+
+| method | all20 mIoU | train10 mIoU | test10 mIoU |
+|---|---:|---:|---:|
+| `ODISE raw256 @ ODISE text256(photo)` | 0.242701 | 0.273933 | 0.213309 |
+| `LSeg512->ODISE256 probe @ ODISE text256(photo)` | 0.267758 | 0.320896 | 0.187682 |
+| `Current fused512->ODISE256 probe @ ODISE text256(photo)` | 0.234825 | 0.274058 | 0.206615 |
+
+Conclusion:
+- `LSeg512 -> ODISE256` 是可行的，但 held-out `test10=0.187682` 低于 raw ODISE256 的 `0.213309`，而 train10 偏高，说明这个线性转换有过拟合/空间不完全一致的问题。
+- 当前 `fused512 -> ODISE256` 的 test10 为 `0.206615`，接近 raw ODISE256，但这仍是一个单独拟合的 probe，不能说明当前 fused512 本身天然可被 ODISE text head 读取。
+- 作为最终开放词汇方案，不建议只保留 `LSeg512 -> ODISE256 -> ODISE text256` 这一条语义路；更稳妥的是同时保留 CLIP-B/LSeg 512D readout，并把 ODISE256 作为辅助 head/loss 或兼容性约束。

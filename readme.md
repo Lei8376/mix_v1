@@ -4,5 +4,6 @@ ssh -L 1455:localhost:1455 featurize@workspace.featurize.cn -p 51118
 npm i -g @openai/codex
 
 环境
-conda activate /home/featurize/work/envs/mix_backup
+conda activate mix
+或使用 /home/sunl/miniconda3/envs/mix/bin/python
   featurize port export 6006

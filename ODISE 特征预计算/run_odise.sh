@@ -11,11 +11,11 @@
 
 # 激活 conda 环境
 source ~/miniconda3/etc/profile.d/conda.sh  # 或 ~/anaconda3/etc/profile.d/conda.sh
-conda activate f_bak
+conda activate mix
 
 # 检查环境是否激活成功
-if [ "$CONDA_DEFAULT_ENV" != "f_bak" ]; then
-    echo "ERROR: Failed to activate conda environment 'f_bak'"
+if [ "$CONDA_DEFAULT_ENV" != "mix" ]; then
+    echo "ERROR: Failed to activate conda environment 'mix'"
     exit 1
 fi
 
@@ -24,10 +24,10 @@ echo "Environment activated: $CONDA_DEFAULT_ENV"
 # ==================== 路径配置 ====================
 
 # ScanNet 数据根目录（包含 scene0000_00, scene0000_01 等文件夹）
-DATA_ROOT="/path/to/your/scannet/scans"
+DATA_ROOT="/home/sunl/work/mix/data/scannet_2d"
 
 # 输出目录
-OUTPUT_DIR="/path/to/output/precomputed_odise"
+OUTPUT_DIR="/home/sunl/work/mix/data/odise_features"
 
 # ODISE 模型配置
 ODISE_MODEL_CONFIG="Panoptic/odise_caption_coco_50e.py"
@@ -48,7 +48,7 @@ DEVICE="cuda"
 
 # ==================== 运行脚本 ====================
 
-cd /home/featurize/work/mix2_v1
+cd /home/sunl/work/mix_v1
 
 python scripts/precompute_odise_features.py \
     --data-root "$DATA_ROOT" \

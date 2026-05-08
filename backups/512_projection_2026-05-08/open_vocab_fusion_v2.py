@@ -28,7 +28,7 @@ class OpenVocabFusionModelV2Config:
     threshold: float = 0.5
     mask_embedding_dim: int = 256
     pixel_embedding_dim: int = 512
-    fused_embedding_dim: int = 256
+    fused_embedding_dim: int = 512
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
     lseg_ckpt_path: Optional[str] = None
@@ -178,8 +178,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
             mask_embeddings = batch_input["mask_embeddings"].float()
             mask_valid = batch_input.get("mask_valid", None)
             mask_valid_from_masks = mask_valid  # Same for precomputed
-            # Pixel: (B,H,W,C) from *_lseg.npy, or (B,K,C) pre-pooled from npz pixel_pooled.
-            # LSeg remains 512D at input; fuse_embed projects it into ODISE's 256D space.
+            # Pixel: (B,H,W,C) from *_lseg.npy, or (B,K,C) pre-pooled from npz pixel_pooled
             if "pixel_pooled" in batch_input:
                 pixel_embeddings = batch_input["pixel_pooled"].float()  # (B,K,512)
             else:
