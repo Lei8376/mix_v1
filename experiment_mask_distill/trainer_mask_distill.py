@@ -67,6 +67,7 @@ class MaskDistillTrainerConfig:
     semantic_pixel_clip_model:   str   = "ViT-B/32"
     semantic_prompt_template:    str   = "a photo of a {}"
     semantic_pc_lambda:          float = 0.5
+    validation_log_every_batches: int   = 25
 
 
 # ============================================================
@@ -396,11 +397,15 @@ class MaskDistillTrainer:
         val_loss      = AverageMeter()
         val_distill   = AverageMeter()
         val_aux       = AverageMeter()
+        validate_start = time.time()
+        total_val_batches = len(self.val_loader)
+        if self.is_main:
+            print(f"  Validation: {total_val_batches} batches")
 
-        # 语义 mIoU：只保留三项：
+        # 语义 mIoU：保留三项，其中 best_model 只监控 Hybrid/Text：
         # 1) Hybrid/Text: fused 256D vs ODISE text256
         # 2) CLIP/Text: raw LSeg/CLIP 512D vs CLIP-B text512
-        # 3) Final-PC: geometric fused final result
+        # 3) Final-PC: geometric fused final result, only for reference
         text_feats = self._get_text_features()
         pixel_text_feats = self._get_pixel_text_features()
         pc_tracker = (
@@ -524,6 +529,17 @@ class MaskDistillTrainer:
                 gt_full[:, keep_idx]   = B3d_gt_k
                 mask_tracker.update(pred_full, gt_full, keep_idx)
 
+            if (
+                self.is_main
+                and self.config.validation_log_every_batches > 0
+                and (batch_idx + 1) % self.config.validation_log_every_batches == 0
+            ):
+                elapsed = time.time() - validate_start
+                print(
+                    f"  Validation progress: {batch_idx + 1}/{total_val_batches} "
+                    f"batches ({elapsed:.1f}s)"
+                )
+
             if (batch_idx + 1) % 50 == 0:
                 torch.cuda.empty_cache()
 
@@ -531,10 +547,17 @@ class MaskDistillTrainer:
             "loss":                      val_loss.avg,
             "loss_mask_distill":         val_distill.avg,
             "loss_aux":                  val_aux.avg,
-            "semantic_miou":             0.0,  # final semantic metric used for best_model
+            "semantic_miou":             0.0,  # main semantic metric used for best_model: Hybrid/Text
             "semantic_miou_hybrid_text": 0.0,
             "semantic_miou_clip_text":   0.0,
             "semantic_miou_final":       0.0,
+            "semantic_acc":              0.0,
+            "semantic_acc_hybrid_text":  0.0,
+            "semantic_acc_clip_text":    0.0,
+            "semantic_acc_final":        0.0,
+            "semantic_mean_acc_hybrid_text": 0.0,
+            "semantic_mean_acc_clip_text":   0.0,
+            "semantic_mean_acc_final":       0.0,
             "n_valid_classes_hybrid":    0,
             "n_valid_classes_clip":      0,
             "n_valid_classes_final":     0,
@@ -547,13 +570,23 @@ class MaskDistillTrainer:
             val_metrics["semantic_miou_hybrid_text"] = pc_res["semantic_miou_hybrid_text"]
             val_metrics["semantic_miou_clip_text"] = pc_res["semantic_miou_clip_text"]
             val_metrics["semantic_miou_final"] = pc_res["semantic_miou_pc"]
-            val_metrics["semantic_miou"] = pc_res["semantic_miou_pc"]
+            val_metrics["semantic_miou"] = pc_res["semantic_miou_hybrid_text"]
+            val_metrics["semantic_acc_hybrid_text"] = pc_res["semantic_acc_hybrid_text"]
+            val_metrics["semantic_acc_clip_text"] = pc_res["semantic_acc_clip_text"]
+            val_metrics["semantic_acc_final"] = pc_res["semantic_acc_pc"]
+            val_metrics["semantic_acc"] = pc_res["semantic_acc_hybrid_text"]
+            val_metrics["semantic_mean_acc_hybrid_text"] = pc_res["semantic_mean_acc_hybrid_text"]
+            val_metrics["semantic_mean_acc_clip_text"] = pc_res["semantic_mean_acc_clip_text"]
+            val_metrics["semantic_mean_acc_final"] = pc_res["semantic_mean_acc_pc"]
             val_metrics["n_valid_classes_hybrid"] = pc_res["n_valid_classes_hybrid_text"]
             val_metrics["n_valid_classes_clip"] = pc_res["n_valid_classes_clip_text"]
             val_metrics["n_valid_classes_final"] = pc_res["n_valid_classes_pc"]
             val_metrics["per_class_iou_hybrid_text"] = pc_res.get("per_class_iou_hybrid_text", {})
             val_metrics["per_class_iou_clip_text"] = pc_res.get("per_class_iou_clip_text", {})
             val_metrics["per_class_iou_final"] = pc_res.get("per_class_iou_pc", {})
+            val_metrics["per_class_acc_hybrid_text"] = pc_res.get("per_class_acc_hybrid_text", {})
+            val_metrics["per_class_acc_clip_text"] = pc_res.get("per_class_acc_clip_text", {})
+            val_metrics["per_class_acc_final"] = pc_res.get("per_class_acc_pc", {})
 
         mask_res = mask_tracker.compute()
         val_metrics["mask_miou"] = mask_res["mask_miou"]
@@ -575,7 +608,7 @@ class MaskDistillTrainer:
             "scaler_state_dict":    self.scaler.state_dict(),
             "best_loss":            self.best_loss,
             "best_iou":             self.best_iou,
-            "best_monitor":         "semantic_miou_final",
+            "best_monitor":         "semantic_miou_hybrid_text",
             "config":               self.config,
         }
         if suffix:
@@ -619,14 +652,15 @@ class MaskDistillTrainer:
         self.current_epoch = ckpt["epoch"] + 1
         self.global_step   = ckpt["global_step"]
         self.best_loss     = ckpt.get("best_loss", float("inf"))
-        if ckpt.get("best_monitor") == "semantic_miou_final":
+        if ckpt.get("best_monitor") == "semantic_miou_hybrid_text":
             self.best_iou = ckpt.get("best_iou", 0.0)
         else:
-            # Older checkpoints stored mask_mIoU in best_iou. The current best
-            # model criterion is Final-PC semantic mIoU, so reset the baseline.
+            # Older checkpoints stored mask_mIoU or Final-PC in best_iou. The
+            # current best criterion is pure Hybrid/Text semantic mIoU, so reset
+            # the baseline instead of comparing against a different metric.
             self.best_iou = 0.0
             if self.is_main:
-                print("[resume] reset best_iou: checkpoint used old monitor, now using semantic_miou_final")
+                print("[resume] reset best_iou: checkpoint used old monitor, now using semantic_miou_hybrid_text")
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
 
     # ----------------------------------------------------------
@@ -657,6 +691,13 @@ class MaskDistillTrainer:
 
             val_metrics = None
             if (epoch + 1) % self.config.val_every_epochs == 0:
+                if self.is_main:
+                    self._save_checkpoint(epoch, train_loss, is_best=False, suffix=f"epoch_{epoch+1}")
+                    self._save_checkpoint(epoch, train_loss, is_best=False, suffix="before_val")
+                    print(
+                        f"  Saved checkpoint_epoch_{epoch+1}.pth and "
+                        "checkpoint_before_val.pth before validation"
+                    )
                 val_metrics = self._validate(epoch)
                 if val_metrics and self.is_main:
                     if self.writer is not None:
@@ -666,6 +707,12 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("Metrics/Semantic_mIoU_HybridText", val_metrics["semantic_miou_hybrid_text"], epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_CLIPText",   val_metrics["semantic_miou_clip_text"],   epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_FinalPC",    val_metrics["semantic_miou_final"],       epoch)
+                        self.writer.add_scalar("Metrics/Semantic_Acc_HybridText",  val_metrics["semantic_acc_hybrid_text"],  epoch)
+                        self.writer.add_scalar("Metrics/Semantic_Acc_CLIPText",    val_metrics["semantic_acc_clip_text"],    epoch)
+                        self.writer.add_scalar("Metrics/Semantic_Acc_FinalPC",     val_metrics["semantic_acc_final"],        epoch)
+                        self.writer.add_scalar("Metrics/Semantic_MeanAcc_HybridText", val_metrics["semantic_mean_acc_hybrid_text"], epoch)
+                        self.writer.add_scalar("Metrics/Semantic_MeanAcc_CLIPText",   val_metrics["semantic_mean_acc_clip_text"],   epoch)
+                        self.writer.add_scalar("Metrics/Semantic_MeanAcc_FinalPC",    val_metrics["semantic_mean_acc_final"],       epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Hybrid",   val_metrics["n_valid_classes_hybrid"],   epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_CLIP",     val_metrics["n_valid_classes_clip"],     epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Final",    val_metrics["n_valid_classes_final"],    epoch)
@@ -676,6 +723,9 @@ class MaskDistillTrainer:
                             "PerClass_IoU_HybridText": val_metrics.get("per_class_iou_hybrid_text", {}),
                             "PerClass_IoU_CLIPText": val_metrics.get("per_class_iou_clip_text", {}),
                             "PerClass_IoU_FinalPC": val_metrics.get("per_class_iou_final", {}),
+                            "PerClass_Acc_HybridText": val_metrics.get("per_class_acc_hybrid_text", {}),
+                            "PerClass_Acc_CLIPText": val_metrics.get("per_class_acc_clip_text", {}),
+                            "PerClass_Acc_FinalPC": val_metrics.get("per_class_acc_final", {}),
                         }
                         for tag_prefix, per_class in per_class_groups.items():
                             for cls_name, iou_val in per_class.items():
@@ -686,6 +736,9 @@ class MaskDistillTrainer:
                     sem_miou_h = val_metrics["semantic_miou_hybrid_text"]
                     sem_miou_c = val_metrics["semantic_miou_clip_text"]
                     sem_miou_final = val_metrics["semantic_miou_final"]
+                    sem_acc_h = val_metrics["semantic_acc_hybrid_text"]
+                    sem_acc_c = val_metrics["semantic_acc_clip_text"]
+                    sem_acc_final = val_metrics["semantic_acc_final"]
                     mask_miou  = val_metrics["mask_miou"]
                     n_cls      = val_metrics["n_valid_classes_final"]
                     print(
@@ -694,6 +747,7 @@ class MaskDistillTrainer:
                         f"[Hybrid/Text] {sem_miou_h:.4f}  "
                         f"[CLIP/Text] {sem_miou_c:.4f}  "
                         f"[Final-PC] {sem_miou_final:.4f} ({n_cls} classes)  "
+                        f"[Acc H/C/F] {sem_acc_h:.4f}/{sem_acc_c:.4f}/{sem_acc_final:.4f}  "
                         f"[MaskIoU] {mask_miou:.4f} ({val_metrics['n_masks']} masks)"
                     )
                     if self.is_main:
@@ -713,14 +767,14 @@ class MaskDistillTrainer:
 
             is_best = False
             if val_metrics is not None:
-                monitored = val_metrics.get("semantic_miou_final", 0.0)
+                monitored = val_metrics.get("semantic_miou_hybrid_text", 0.0)
                 if monitored > self.best_iou + self.config.early_stopping_min_delta:
                     prev = self.best_iou
                     self.best_iou = monitored
                     self.epochs_without_improvement = 0
                     is_best = True
                     if self.is_main:
-                        print(f"  New best Final-PC semantic mIoU: {monitored:.4f} (prev: {prev:.4f})")
+                        print(f"  New best Hybrid/Text semantic mIoU: {monitored:.4f} (prev: {prev:.4f})")
                 else:
                     self.epochs_without_improvement += 1
                 if val_metrics["loss"] < self.best_loss:

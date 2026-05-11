@@ -20,7 +20,7 @@ class OpenVocabDatasetV2Config:
     scannet200: bool = False
     voxel_size: float = 0.05
     aug: bool = False
-    memcache_init: bool = False
+    memcache_init: bool = False  # Deprecated; 3D .pth files are loaded on demand.
     identifier: int = 7791
     loop: int = 1
     eval_all: bool = False
@@ -122,7 +122,6 @@ def _load_3d_with_precomputed_projection(
     scene_name: str,
     projection_dir: Path,
     frame_stem: str,
-    pth_cache: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
     voxel_size: float = 0.05,
     aug: bool = False,
 ) -> Optional[Dict[str, torch.Tensor]]:
@@ -137,16 +136,13 @@ def _load_3d_with_precomputed_projection(
     if not proj_path.exists():
         return None  # fallback 到运行时投影
 
-    # 2. 加载 3D 数据（优先从缓存读取）
-    if pth_cache is not None and scene_name in pth_cache:
-        locs, feats, labels = pth_cache[scene_name]
-    else:
-        pth_path = data_root / split / f"{scene_name}.pth"
-        if not pth_path.exists():
-            pth_path = data_root / split / f"{scene_name}_vh_clean_2.pth"
-        if not pth_path.exists():
-            return None
-        locs, feats, labels = _cached_load_pth(pth_path)
+    # 2. 按需加载 3D 数据，避免 Dataset 初始化时预导入所有 scene。
+    pth_path = data_root / split / f"{scene_name}.pth"
+    if not pth_path.exists():
+        pth_path = data_root / split / f"{scene_name}_vh_clean_2.pth"
+    if not pth_path.exists():
+        return None
+    locs, feats, labels = _cached_load_pth(pth_path)
 
     # 3. 加载预计算投影
     proj_data = np.load(proj_path)
@@ -459,36 +455,6 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
             self.samples = self.samples[:n]
             print(f"Using {n} samples after filtering")
 
-        # 预加载 3D 数据到内存，避免反复从磁盘读取 .pth 文件
-        # DDP 多进程情况下只在主进程预加载，避免重复占用内存
-        self._pth_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        self._enable_cache = getattr(config, 'memcache_init', True)  # 默认启用预加载
-        
-        # 检查是否在 DDP 环境中
-        try:
-            import torch.distributed as dist
-            is_distributed = dist.is_available() and dist.is_initialized()
-            is_main_process = not is_distributed or dist.get_rank() == 0
-        except:
-            is_distributed = False
-            is_main_process = True
-        
-        if self._enable_cache and self.data_root and self.data_root.exists():
-            # DDP 情况下只在主进程预加载，子进程从磁盘读取（避免重复占用内存）
-            if is_main_process:
-                unique_scenes = sorted(set(scene for scene, _ in self.samples))
-                print(f"Pre-loading {len(unique_scenes)} scenes into memory (main process only)...")
-                for scene_name in unique_scenes:
-                    pth_path = self.data_root / self.split / f"{scene_name}.pth"
-                    if not pth_path.exists():
-                        pth_path = self.data_root / self.split / f"{scene_name}_vh_clean_2.pth"
-                    if pth_path.exists():
-                        self._pth_cache[scene_name] = _cached_load_pth(pth_path)
-                print(f"Pre-loaded {len(self._pth_cache)} scenes ✅")
-            else:
-                # 子进程不预加载，从磁盘读取（会慢一些，但避免 OOM）
-                print(f"Worker process: will load scenes from disk on-demand")
-
     def __len__(self) -> int:
         return len(self.samples) * max(1, self.config.loop)
 
@@ -508,7 +474,6 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
                 scene_name=scene_name,
                 projection_dir=self.projection_dir,
                 frame_stem=frame_stem,
-                pth_cache=self._pth_cache,
                 voxel_size=self.config.voxel_size,
                 aug=(self.config.aug and self.split == "train"),
             )

@@ -109,6 +109,7 @@ def build_text_features(
             model_name,
             pretrained="openai",
             device=device,
+            cache_dir=os.environ.get("CLIP_CACHE_DIR"),
         )
         model = model.to(device)
         model.eval()
@@ -129,7 +130,18 @@ def _resolve_odise_checkpoint(config_name: str = "Panoptic/odise_caption_coco_50
     }
     if config_name not in checkpoint_names:
         raise RuntimeError(f"Unsupported ODISE text-head config: {config_name}")
-    return (
+    checkpoint_name = checkpoint_names[config_name]
+
+    explicit_path = os.environ.get("ODISE_CHECKPOINT_PATH")
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+
+    model_zoo = os.environ.get("ODISE_MODEL_ZOO")
+    candidates = []
+    if model_zoo:
+        candidates.append(Path(model_zoo).expanduser() / checkpoint_name)
+    candidates.append(Path(__file__).resolve().parents[1] / "checkpoints" / "pretrained" / checkpoint_name)
+    candidates.append(
         Path.home()
         / ".torch"
         / "iopath_cache"
@@ -138,8 +150,12 @@ def _resolve_odise_checkpoint(config_name: str = "Panoptic/odise_caption_coco_50
         / "releases"
         / "download"
         / "v1.0.0"
-        / checkpoint_names[config_name]
+        / checkpoint_name
     )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def build_odise_256_text_features(
@@ -171,6 +187,7 @@ def build_odise_256_text_features(
         "ViT-L-14",
         pretrained="openai",
         device=device,
+        cache_dir=os.environ.get("CLIP_CACHE_DIR"),
     )
     model = model.to(device)
     model.eval()
@@ -245,7 +262,7 @@ def intersectionAndUnionGPU(
     K: int,
     ignore_index: int | Iterable[int] = IGNORE_LABEL,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """OpenScene/XMask3D torch IoU histogram without forcing CUDA output."""
+    """OpenScene/XMask3D torch IoU histogram on the input tensor device."""
     assert output.dim() in [1, 2, 3, 4]
     assert output.shape == target.shape
     output = output.view(-1).clone()
@@ -254,10 +271,10 @@ def intersectionAndUnionGPU(
         output[target == ignore] = ignore
     intersection = output[output == target]
     area_intersection = torch.histc(
-        intersection.float().cpu(), bins=K, min=0, max=K - 1
+        intersection.float(), bins=K, min=0, max=K - 1
     )
-    area_output = torch.histc(output.float().cpu(), bins=K, min=0, max=K - 1)
-    area_target = torch.histc(target.float().cpu(), bins=K, min=0, max=K - 1)
+    area_output = torch.histc(output.float(), bins=K, min=0, max=K - 1)
+    area_target = torch.histc(target.float(), bins=K, min=0, max=K - 1)
     area_union = area_output + area_target - area_intersection
     return area_intersection, area_union, area_target
 
@@ -395,7 +412,7 @@ def diff2scene_class_probs_predict(
         chunk_size=chunk_size,
     )
     if point_scores.shape[0] == 0:
-        return torch.empty(0, dtype=torch.long)
+        return torch.empty(0, dtype=torch.long, device=point_mask_logits.device)
     pred = torch.max(point_scores, 1)[1].long()
     support = torch.zeros(point_mask_logits.shape[0], device=point_mask_logits.device)
     for start in range(0, point_mask_logits.shape[0], chunk_size):
@@ -406,7 +423,7 @@ def diff2scene_class_probs_predict(
         pred,
         torch.full_like(pred, unsupported_label),
     )
-    return pred.cpu()
+    return pred
 
 
 @torch.no_grad()
@@ -442,7 +459,7 @@ def diff2scene_dual_mask_class_probs_predict(
     if lam < 0.0 or lam > 1.0:
         raise RuntimeError(f"lambda_weight must be in [0,1], got {lambda_weight}")
     if salient_masks.shape[0] == 0:
-        return torch.empty(0, dtype=torch.long)
+        return torch.empty(0, dtype=torch.long, device=geometric_mask_logits.device)
 
     device = geometric_mask_logits.device
     probs = mask_class_probs.float().to(device)
@@ -463,7 +480,7 @@ def diff2scene_dual_mask_class_probs_predict(
         pred,
         torch.full_like(pred, unsupported_label),
     )
-    return pred.cpu()
+    return pred
 
 
 @torch.no_grad()
@@ -635,9 +652,13 @@ class _SemanticAccumulator:
             raise RuntimeError(
                 f"pred/gt shape mismatch: pred={tuple(pred_labels.shape)}, gt={tuple(gt_labels.shape)}"
             )
+        if self.intersection.device != pred_labels.device:
+            self.intersection = self.intersection.to(pred_labels.device)
+            self.union = self.union.to(pred_labels.device)
+            self.target = self.target.to(pred_labels.device)
         inter, union, target = intersectionAndUnionGPU(
             pred_labels.long(),
-            gt_labels.long(),
+            gt_labels.to(pred_labels.device).long(),
             self.K,
             self.ignore_index,
         )
@@ -647,11 +668,30 @@ class _SemanticAccumulator:
 
     def compute(self, prefix: str) -> Dict:
         result = compute_iou(self.intersection, self.union, self.target, self.class_names)
+        valid_target = self.target > 0
+        per_class_acc = {
+            self.class_names[i]: float(self.intersection[i] / self.target[i])
+            for i in range(min(len(self.class_names), len(self.target)))
+            if valid_target[i]
+        }
+        overall_acc = (
+            float(self.intersection.sum() / self.target.sum())
+            if self.target.sum() > 0
+            else 0.0
+        )
+        mean_acc = (
+            float(torch.mean((self.intersection[valid_target] / self.target[valid_target]).float()))
+            if valid_target.any()
+            else 0.0
+        )
         return {
             prefix: result["miou"],
             f"per_class_iou_{prefix}": result["per_class_iou"],
             f"n_valid_classes_{prefix}": result["n_valid_classes"],
             f"target_{prefix}": result["target"],
+            f"overall_acc_{prefix}": overall_acc,
+            f"mean_acc_{prefix}": mean_acc,
+            f"per_class_acc_{prefix}": per_class_acc,
         }
 
 
@@ -694,7 +734,7 @@ class Diff2SceneSemanticEvaluator:
             unsupported_label=self.unsupported_label,
             chunk_size=self.chunk_size,
         )
-        self.acc.update_labels(pred, gt_labels.detach().cpu().long())
+        self.acc.update_labels(pred, gt_labels.detach().long())
 
     def compute(self) -> Dict:
         result = self.acc.compute("semantic_miou_diff2scene")
@@ -758,7 +798,7 @@ class Diff2SceneSemanticMIoUTracker:
         text_features: torch.Tensor,
     ):
         pred = self.predict_labels(fused_embeddings, pred_mask_logits, text_features)
-        self.acc.update_labels(pred, gt_labels.detach().cpu().long())
+        self.acc.update_labels(pred, gt_labels.detach().long())
 
     def compute(self) -> Dict:
         result = self.acc.compute("semantic_miou_diff2scene")
@@ -811,7 +851,7 @@ class ODISEPCSemanticMIoUTracker:
         clip_text_features: torch.Tensor,
         salient_masks: Optional[torch.Tensor] = None,
     ):
-        gt_cpu = gt_labels.detach().cpu().long()
+        gt_labels = gt_labels.detach().long()
         pred_hybrid = diff2scene_mask_feature_predict(
             point_mask_logits=pred_mask_logits,
             mask_features=hybrid_features,
@@ -860,9 +900,9 @@ class ODISEPCSemanticMIoUTracker:
                 unsupported_label=self.unsupported_label,
                 chunk_size=self.chunk_size,
             )
-        self.hybrid_acc.update_labels(pred_hybrid, gt_cpu)
-        self.clip_acc.update_labels(pred_clip, gt_cpu)
-        self.pc_acc.update_labels(pred_pc, gt_cpu)
+        self.hybrid_acc.update_labels(pred_hybrid, gt_labels)
+        self.clip_acc.update_labels(pred_clip, gt_labels)
+        self.pc_acc.update_labels(pred_pc, gt_labels)
 
     def compute(self) -> Dict:
         hybrid = self.hybrid_acc.compute("semantic_miou_hybrid_text")
@@ -872,9 +912,18 @@ class ODISEPCSemanticMIoUTracker:
             "semantic_miou_hybrid_text": hybrid["semantic_miou_hybrid_text"],
             "semantic_miou_clip_text": clip["semantic_miou_clip_text"],
             "semantic_miou_pc": pc["semantic_miou_pc"],
+            "semantic_acc_hybrid_text": hybrid["overall_acc_semantic_miou_hybrid_text"],
+            "semantic_acc_clip_text": clip["overall_acc_semantic_miou_clip_text"],
+            "semantic_acc_pc": pc["overall_acc_semantic_miou_pc"],
+            "semantic_mean_acc_hybrid_text": hybrid["mean_acc_semantic_miou_hybrid_text"],
+            "semantic_mean_acc_clip_text": clip["mean_acc_semantic_miou_clip_text"],
+            "semantic_mean_acc_pc": pc["mean_acc_semantic_miou_pc"],
             "per_class_iou_hybrid_text": hybrid["per_class_iou_semantic_miou_hybrid_text"],
             "per_class_iou_clip_text": clip["per_class_iou_semantic_miou_clip_text"],
             "per_class_iou_pc": pc["per_class_iou_semantic_miou_pc"],
+            "per_class_acc_hybrid_text": hybrid["per_class_acc_semantic_miou_hybrid_text"],
+            "per_class_acc_clip_text": clip["per_class_acc_semantic_miou_clip_text"],
+            "per_class_acc_pc": pc["per_class_acc_semantic_miou_pc"],
             "n_valid_classes_hybrid_text": hybrid["n_valid_classes_semantic_miou_hybrid_text"],
             "n_valid_classes_clip_text": clip["n_valid_classes_semantic_miou_clip_text"],
             "n_valid_classes_pc": pc["n_valid_classes_semantic_miou_pc"],

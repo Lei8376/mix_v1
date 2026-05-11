@@ -122,7 +122,16 @@ def _build_odise_text_features(
     }
     if config_name not in checkpoint_names:
         raise RuntimeError(f"Unsupported ODISE model config for text head lookup: {odise_model_config}")
-    checkpoint_path = (
+    checkpoint_name = checkpoint_names[config_name]
+    explicit_path = os.environ.get("ODISE_CHECKPOINT_PATH")
+    model_zoo = os.environ.get("ODISE_MODEL_ZOO")
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+    if model_zoo:
+        candidates.append(Path(model_zoo).expanduser() / checkpoint_name)
+    candidates.append(REPO_ROOT / "checkpoints" / "pretrained" / checkpoint_name)
+    candidates.append(
         Path.home()
         / ".torch"
         / "iopath_cache"
@@ -131,8 +140,9 @@ def _build_odise_text_features(
         / "releases"
         / "download"
         / "v1.0.0"
-        / checkpoint_names[config_name]
+        / checkpoint_name
     )
+    checkpoint_path = next((p for p in candidates if p.exists()), candidates[0])
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"ODISE checkpoint not found in local cache: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -144,6 +154,7 @@ def _build_odise_text_features(
         "ViT-L-14",
         pretrained="openai",
         device=device,
+        cache_dir=os.environ.get("CLIP_CACHE_DIR"),
     )
     model.eval()
     prompts = [prompt_template.format("other" if label == "otherfurniture" else label) for label in class_names]

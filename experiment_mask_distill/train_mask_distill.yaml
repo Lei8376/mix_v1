@@ -19,12 +19,15 @@ gpu_ids: [0]
 
 dataloader:
   batch_size: 16
+  val_batch_size: 2
   num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
 
 dataset:
   data_config_path: config/data_scannet_3d.yaml
-  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
-  projection_dir: /home/sunl/work/mix/data/scannet_projections
+  precomputed_dir: /home/featurize/data/pixel_pooled
+  projection_dir: /home/featurize/data/scannet_projections
   split: train
   max_samples_ratio: 1
   aug: true   # 3D 数据增强：Z轴随机旋转 + 缩放[0.9,1.1] + 平移[-0.5,0.5]m（仅 train split）
@@ -76,5 +79,5 @@ trainer:
   semantic_prompt_template: "a photo of a {}"
 
   # # ----- 恢复训练（可选）-----
-  resume: ""
+  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_11.pth
 seed: 1342

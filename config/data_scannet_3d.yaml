@@ -3,21 +3,21 @@
 
 DATA:
   # 3D 数据根目录 - 包含 train/val/test 子目录,每个子目录下有 scene*.pth 文件
-  # 例如: /home/sunl/work/mix/data/scannet_3d/train/scene0000_00.pth
-  data_root: /home/sunl/work/mix/data/scannet_3d
+  # 例如: /home/featurize/data/scannet_3d/train/scene0000_00.pth
+  data_root: /home/featurize/data/scannet_3d
   
   # 2D 数据根目录 - 包含场景文件夹 (scene0000_00, scene0001_01, 等)
   # 每个场景文件夹下有 color/ 子目录存放图片
-  # 例如: /home/sunl/work/mix/data/scannet_2d/scene0000_00/color/0.jpg
-  data_root_2d: /home/sunl/work/mix/data/scannet_2d
+  # 例如: /home/featurize/data/scannet_2d/scene0000_00/color/0.jpg
+  data_root_2d: /home/featurize/data/scannet_2d
   
   # LSeg 特征根目录(可选) - 如果使用预计算的 LSeg 特征
-  # 例如: /home/sunl/work/mix/data/pixel_pooled
-  data_root_lseg_feat: /home/sunl/work/mix/data/pixel_pooled
+  # 例如: /home/featurize/data/pixel_pooled
+  data_root_lseg_feat: /home/featurize/data/pixel_pooled
   
   # ODISE 特征根目录(可选) - 如果使用预计算的 ODISE 特征
-  # 例如: /home/sunl/work/mix/data/odise_features
-  data_root_odise_feat: /home/sunl/work/mix/data/odise_features
+  # 例如: /home/featurize/data/odise_features
+  data_root_odise_feat: /home/featurize/data/odise_features
   
   # 类别标签文件路径(可选)
   label_2d: ""

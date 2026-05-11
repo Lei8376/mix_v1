@@ -29,6 +29,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent
+os.environ.setdefault("CLIP_CACHE_DIR", str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"))
+os.environ.setdefault("ODISE_MODEL_ZOO", str(REPO_ROOT / "checkpoints" / "pretrained"))
+os.environ.setdefault("TORCH_HOME", str(REPO_ROOT / "checkpoints" / "pretrained" / "torch"))
+os.environ.setdefault("XDG_CACHE_HOME", str(REPO_ROOT / "checkpoints" / "pretrained" / "xdg"))
 MASK2FORMER_ROOT = REPO_ROOT / "ODISE" / "third_party" / "Mask2Former"
 if MASK2FORMER_ROOT.exists() and str(MASK2FORMER_ROOT) not in sys.path:
     sys.path.insert(0, str(MASK2FORMER_ROOT))
@@ -65,9 +69,17 @@ except ImportError:
 @dataclass
 class DataLoaderConfig:
     batch_size: int = 2
+    val_batch_size: int = 0
     num_workers: int = 4
+    val_num_workers: Optional[int] = None
     pin_memory: bool = True
     drop_last: bool = True
+    persistent_workers: bool = True
+    val_persistent_workers: Optional[bool] = None
+    prefetch_factor: int = 4
+    val_prefetch_factor: Optional[int] = None
+    val_max_samples: Optional[int] = None
+    val_max_samples_ratio: Optional[float] = None
 
 
 def load_yaml_config(config_path: str) -> Dict[str, Any]:
@@ -107,6 +119,10 @@ def create_data_loaders(
 ) -> tuple:
     """Create train and validation data loaders."""
     train_dataset = OpenVocabScannetDatasetV2(dataset_config)
+    train_loader_kwargs = {}
+    if dataloader_config.num_workers > 0:
+        train_loader_kwargs["persistent_workers"] = dataloader_config.persistent_workers
+        train_loader_kwargs["prefetch_factor"] = dataloader_config.prefetch_factor
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=dataloader_config.batch_size,
@@ -115,6 +131,7 @@ def create_data_loaders(
         pin_memory=dataloader_config.pin_memory,
         drop_last=dataloader_config.drop_last,
         collate_fn=open_vocab_collate_v2,
+        **train_loader_kwargs,
     )
 
     # Create validation loader if validation split exists
@@ -128,25 +145,46 @@ def create_data_loaders(
             scannet200=dataset_config.scannet200,
             voxel_size=dataset_config.voxel_size,
             aug=False,  # No augmentation for validation
-            memcache_init=dataset_config.memcache_init,
             identifier=dataset_config.identifier + 1,  # Different identifier
             loop=1,
             eval_all=True,
             input_color=dataset_config.input_color,
-            max_samples=getattr(dataset_config, "max_samples", None),
-            max_samples_ratio=getattr(dataset_config, "max_samples_ratio", None),
+            max_samples=dataloader_config.val_max_samples,
+            max_samples_ratio=dataloader_config.val_max_samples_ratio,
         )
         val_dataset = OpenVocabScannetDatasetV2(val_config)
+        val_batch_size = dataloader_config.val_batch_size or dataloader_config.batch_size
+        val_num_workers = (
+            dataloader_config.num_workers
+            if dataloader_config.val_num_workers is None
+            else dataloader_config.val_num_workers
+        )
+        val_loader_kwargs = {}
+        if val_num_workers > 0:
+            val_loader_kwargs["persistent_workers"] = (
+                dataloader_config.persistent_workers
+                if dataloader_config.val_persistent_workers is None
+                else dataloader_config.val_persistent_workers
+            )
+            val_loader_kwargs["prefetch_factor"] = (
+                dataloader_config.prefetch_factor
+                if dataloader_config.val_prefetch_factor is None
+                else dataloader_config.val_prefetch_factor
+            )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
-            batch_size=dataloader_config.batch_size,
+            batch_size=val_batch_size,
             shuffle=False,
-            num_workers=dataloader_config.num_workers,
+            num_workers=val_num_workers,
             pin_memory=dataloader_config.pin_memory,
             drop_last=False,
             collate_fn=open_vocab_collate_v2,
+            **val_loader_kwargs,
         )
-        print(f"Created validation loader with {len(val_dataset)} samples")
+        print(
+            f"Created validation loader with {len(val_dataset)} samples "
+            f"(batch_size={val_batch_size}, num_workers={val_num_workers})"
+        )
     except Exception as e:
         print(f"Could not create validation loader: {e}")
 
@@ -312,7 +350,15 @@ def main() -> None:
         raw_batch_size = 2
     dataloader_config = DataLoaderConfig(
         batch_size=raw_batch_size,
+        val_batch_size=_dataloader.get("val_batch_size", 0),
         num_workers=_dataloader.get("num_workers", args.num_workers),
+        val_num_workers=_dataloader.get("val_num_workers"),
+        persistent_workers=_dataloader.get("persistent_workers", True),
+        val_persistent_workers=_dataloader.get("val_persistent_workers"),
+        prefetch_factor=_dataloader.get("prefetch_factor", 4),
+        val_prefetch_factor=_dataloader.get("val_prefetch_factor"),
+        val_max_samples=_dataloader.get("val_max_samples"),
+        val_max_samples_ratio=_dataloader.get("val_max_samples_ratio"),
     )
 
     # Model config
@@ -407,6 +453,7 @@ def main() -> None:
             semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
             semantic_prompt_template=_trainer.get("semantic_prompt_template", "a photo of a {}"),
             semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
+            validation_log_every_batches=_trainer.get("validation_log_every_batches", 25),
         )
 
     # Validate configuration
@@ -439,7 +486,15 @@ def main() -> None:
     print(f"  Precomputed features: {use_precomputed}")
     print(f"  Precomputed projections: {projection_dir if projection_dir and os.path.exists(projection_dir or '') else 'No (runtime)'}")
     print(f"  Online extraction: {can_extract_online}")
-    print(f"  Batch size: {dataloader_config.batch_size} (min 2 for MinkowskiEngine BatchNorm)")
+    print(f"  Train batch size: {dataloader_config.batch_size} (min 2 for MinkowskiEngine BatchNorm)")
+    print(f"  Train num_workers: {dataloader_config.num_workers}")
+    print(f"  Val batch size: {dataloader_config.val_batch_size or dataloader_config.batch_size}")
+    print(
+        "  Val num_workers: "
+        f"{dataloader_config.num_workers if dataloader_config.val_num_workers is None else dataloader_config.val_num_workers}"
+    )
+    print(f"  Checkpoint dir: {trainer_config.checkpoint_dir}")
+    print(f"  Log dir: {trainer_config.log_dir}")
     print(f"  3D backbone: {model_config.pc_arch}")
     print(f"  Epochs: {trainer_config.num_epochs}")
     print(f"  Learning rate: {trainer_config.base_lr}")

@@ -132,7 +132,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=20)
-    parser.add_argument("--clip-cache-dir", default="/tmp/clip")
+    parser.add_argument(
+        "--clip-cache-dir",
+        default=str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"),
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("CLIP_CACHE_DIR", args.clip_cache_dir)

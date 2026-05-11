@@ -16,15 +16,18 @@ gpu_ids: [0]  # 单卡模式使用的 GPU 编号（0=第一张卡）
 # 数据加载配置
 # ============================================================
 dataloader:
-  batch_size: 16   # 🔥 单卡训练建议值（显存足够可用 16）
+  batch_size: 32  # 🔥 单卡训练建议值（显存足够可用 16）
                   # - 多卡时: 每个 GPU 的批大小
                   # - 单卡时: 总批大小
                   # - 显存不足时可减小到 4 或 2
+  val_batch_size: 32  # 验证单独使用小 batch，避免语义评估阶段显存爆掉
   
-  num_workers: 12  # 数据加载线程数
+  num_workers: 16  # 数据加载线程数
                   # - 单卡建议: 4-8
                   # - 多卡建议: 8-16
                   # - 过大会占用过多内存
+  val_num_workers: 12 # 验证阶段单独调小 worker；低于训练的 16，避免卡住同时保留数据预取能力
+  # val_max_samples: 200  # 调试时才打开；正式训练/选 best 默认全量验证，避免抽样影响指标
 
 # ============================================================
 # 数据集配置
@@ -32,15 +35,15 @@ dataloader:
 dataset:
   data_config_path: config/data_scannet_3d.yaml  # 3D 数据集路径配置文件
   
-  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled  # 预计算的 2D 特征目录
+  precomputed_dir: /home/featurize/data/pixel_pooled  # 预计算的 2D 特征目录
                                                            # 包含 ODISE 生成的 .npz 文件
   
-  projection_dir: /home/sunl/work/mix/data/scannet_projections  # 预计算的投影坐标目录
+  projection_dir: /home/featurize/data/scannet_projections  # 预计算的投影坐标目录
                                                                  # 包含 3D→2D 投影对应关系
   
   split: train  # 数据集划分: train (训练集) / val (验证集) / test (测试集)
 
-  aug: true     # 3D 数据增强（Z轴随机旋转 + 缩放[0.9,1.1] + 平移[-0.5,0.5]m，仅 train split）
+  aug: false    # 3D 数据增强（Z轴随机旋转 + 缩放[0.9,1.1] + 平移[-0.5,0.5]m，仅 train split）
                 # 防止 MinkowskiEngine 死记硬背绝对坐标导致过拟合
 
   # ===== 数据量控制 =====
@@ -103,21 +106,20 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_fusion
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_fusion.2
   
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_fusion
+  log_dir: runs/diff2scene_hybrid_lseg_odise256_fusion.2
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
   mask_distill_weight: 1.0
   bce_weight: 0.0            # 论文主 loss 不使用 BCE 辅助项
   dice_weight: 0.0           # 论文主 loss 不使用 Dice 辅助项
-  min_points_per_mask: 10    # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss
+  min_points_per_mask: 8  # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss、
                              # - 过滤 GT 中正样本过少的 mask（可能是噪声）
                              # - 推荐值: 5-10
                              # - 太高: 过滤太严，有效样本少
                              # - 太低: 噪声增加，训练不稳定
-  
   # ----- 训练稳定性 -----
   grad_clip_norm: 1.0  # 梯度裁剪阈值
                        # - 防止梯度爆炸
@@ -141,9 +143,10 @@ trainer:
   # p_final ∝ p_hybrid^lambda * p_lseg^(1-lambda)
   semantic_pc_lambda: 0.5
   semantic_prompt_template: "a photo of a {}"
+  validation_log_every_batches: 25
   
-  # 【可选】恢复训练
-  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_4.pth  # 续训使用最新 256D epoch checkpoint
+  # # 【可选】恢复训练
+  # resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_16.pth  # 续训使用最新 256D epoch checkpoint
 
 # ============================================================
 # 随机种子（确保可复现性）

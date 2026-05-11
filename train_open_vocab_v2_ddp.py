@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent
+os.environ.setdefault("CLIP_CACHE_DIR", str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"))
+os.environ.setdefault("ODISE_MODEL_ZOO", str(REPO_ROOT / "checkpoints" / "pretrained"))
+os.environ.setdefault("TORCH_HOME", str(REPO_ROOT / "checkpoints" / "pretrained" / "torch"))
+os.environ.setdefault("XDG_CACHE_HOME", str(REPO_ROOT / "checkpoints" / "pretrained" / "xdg"))
 MASK2FORMER_ROOT = REPO_ROOT / "ODISE" / "third_party" / "Mask2Former"
 if MASK2FORMER_ROOT.exists() and str(MASK2FORMER_ROOT) not in sys.path:
     sys.path.insert(0, str(MASK2FORMER_ROOT))
@@ -124,9 +128,13 @@ def cleanup_distributed():
 @dataclass
 class DataLoaderConfig:
     batch_size: int = 2
+    val_batch_size: int = 0
     num_workers: int = 4
+    val_num_workers: Optional[int] = None
     pin_memory: bool = True
     drop_last: bool = True
+    val_max_samples: Optional[int] = None
+    val_max_samples_ratio: Optional[float] = None
 
 
 def load_yaml_config(config_path: str) -> Dict[str, Any]:
@@ -204,13 +212,12 @@ def create_data_loaders(
             scannet200=dataset_config.scannet200,
             voxel_size=dataset_config.voxel_size,
             aug=False,
-            memcache_init=dataset_config.memcache_init,
             identifier=dataset_config.identifier + 1,
             loop=1,
             eval_all=True,
             input_color=dataset_config.input_color,
-            max_samples=getattr(dataset_config, "max_samples", None),
-            max_samples_ratio=getattr(dataset_config, "max_samples_ratio", None),
+            max_samples=dataloader_config.val_max_samples,
+            max_samples_ratio=dataloader_config.val_max_samples_ratio,
         )
         val_dataset = OpenVocabScannetDatasetV2(val_config)
         
@@ -223,19 +230,28 @@ def create_data_loaders(
                 shuffle=False,
             )
         
+        val_batch_size = dataloader_config.val_batch_size or dataloader_config.batch_size
+        val_num_workers = (
+            dataloader_config.num_workers
+            if dataloader_config.val_num_workers is None
+            else dataloader_config.val_num_workers
+        )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
-            batch_size=dataloader_config.batch_size,
+            batch_size=val_batch_size,
             shuffle=False,
             sampler=val_sampler,
-            num_workers=dataloader_config.num_workers,
+            num_workers=val_num_workers,
             pin_memory=dataloader_config.pin_memory,
             drop_last=False,
             collate_fn=open_vocab_collate_v2,
-            persistent_workers=dataloader_config.num_workers > 0,
+            persistent_workers=val_num_workers > 0,
         )
         if is_main_process():
-            print(f"Created validation loader with {len(val_dataset)} samples")
+            print(
+                f"Created validation loader with {len(val_dataset)} samples "
+                f"(batch_size={val_batch_size}, num_workers={val_num_workers})"
+            )
     except Exception as e:
         if is_main_process():
             print(f"Could not create validation loader: {e}")
@@ -373,7 +389,11 @@ def main() -> None:
     
     dataloader_config = DataLoaderConfig(
         batch_size=per_gpu_batch_size,
+        val_batch_size=_dataloader.get("val_batch_size", 0),
         num_workers=_dataloader.get("num_workers", args.num_workers),
+        val_num_workers=_dataloader.get("val_num_workers"),
+        val_max_samples=_dataloader.get("val_max_samples"),
+        val_max_samples_ratio=_dataloader.get("val_max_samples_ratio"),
     )
 
     # Model config
@@ -453,6 +473,7 @@ def main() -> None:
             mask_distill_weight=_trainer.get("mask_distill_weight", 1.0),
             bce_weight=_trainer.get("bce_weight", 0.0),
             dice_weight=_trainer.get("dice_weight", 0.0),
+            validation_log_every_batches=_trainer.get("validation_log_every_batches", 25),
         )
         if is_main_process():
             print(f"[MaskDistill] mask_distill_weight={trainer_config.mask_distill_weight}  "
@@ -496,9 +517,17 @@ def main() -> None:
         print(f"  Distributed: {use_distributed}")
         print(f"  Per-GPU batch size: {per_gpu_batch_size}")
         print(f"  Effective batch size: {effective_batch_size}")
+        print(f"  Train num_workers: {dataloader_config.num_workers}")
+        print(f"  Val batch size per GPU: {dataloader_config.val_batch_size or dataloader_config.batch_size}")
+        print(
+            "  Val num_workers: "
+            f"{dataloader_config.num_workers if dataloader_config.val_num_workers is None else dataloader_config.val_num_workers}"
+        )
         print(f"  Base LR: {base_lr} -> Scaled LR: {scaled_lr}")
         print(f"  Precomputed features: {use_precomputed}")
         print(f"  Precomputed projections: {projection_dir if projection_dir else 'No'}")
+        print(f"  Checkpoint dir: {trainer_config.checkpoint_dir}")
+        print(f"  Log dir: {trainer_config.log_dir}")
         print(f"  3D backbone: {model_config.pc_arch}")
         print(f"  Epochs: {trainer_config.num_epochs}")
         print(f"  AMP enabled: {trainer_config.use_amp}")

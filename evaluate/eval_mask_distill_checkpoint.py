@@ -71,7 +71,10 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--clip-cache-dir", default="/tmp/clip")
+    parser.add_argument(
+        "--clip-cache-dir",
+        default=str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"),
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("CLIP_CACHE_DIR", args.clip_cache_dir)
@@ -103,12 +106,14 @@ def main():
         aug=False,
         loop=1,
         eval_all=True,
-        max_samples=args.max_samples,
-        max_samples_ratio=None,
+        max_samples=args.max_samples if args.max_samples is not None else dataloader_cfg.get("val_max_samples"),
+        max_samples_ratio=None if args.max_samples is not None else dataloader_cfg.get("val_max_samples_ratio"),
     )
     val_dataset = OpenVocabScannetDatasetV2(val_config)
-    batch_size = args.batch_size or dataloader_cfg.get("batch_size", 2)
+    batch_size = args.batch_size or dataloader_cfg.get("val_batch_size", dataloader_cfg.get("batch_size", 2))
     num_workers = args.num_workers if args.num_workers is not None else dataloader_cfg.get("num_workers", 4)
+    if args.num_workers is None:
+        num_workers = dataloader_cfg.get("val_num_workers", num_workers)
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=batch_size,
@@ -149,7 +154,16 @@ def main():
         semantic_pixel_clip_model=trainer_cfg.get("semantic_pixel_clip_model", "ViT-B/32"),
         semantic_prompt_template=trainer_cfg.get("semantic_prompt_template", "a photo of a {}"),
         semantic_pc_lambda=trainer_cfg.get("semantic_pc_lambda", 0.5),
+        validation_log_every_batches=trainer_cfg.get("validation_log_every_batches", 25),
     )
+    print("[eval] runtime config:")
+    print(f"  device: {device}")
+    print(f"  batch_size: {batch_size}")
+    print(f"  num_workers: {num_workers}")
+    print(f"  val_samples: {len(val_dataset)}")
+    print(f"  checkpoint_dir: {trainer_config.checkpoint_dir}")
+    print(f"  log_dir: {trainer_config.log_dir}")
+    print(f"  validation_log_every_batches: {trainer_config.validation_log_every_batches}")
     trainer = MaskDistillTrainer(
         model=model,
         train_loader=val_loader,

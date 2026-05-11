@@ -183,7 +183,9 @@ point_scores = sigmoid(pred_mask_logits) @ mask_class_probs
 - `CLIP/Text`: LSeg/CLIP `pixel_pooled(512)` vs CLIP-B `text512`
 - `Final-PC`: `Hybrid/Text` 和 `CLIP/Text` 的几何平均最终结果
 
-`best_model.pth` 现在按 `Final-PC` 语义 mIoU 保存，不再按 mask-level `mask_mIoU` 保存。
+`best_model.pth` 现在按 `Hybrid/Text` 语义 mIoU 保存，也就是只看混合模型
+`fused_embeddings(256)` 与 ODISE `text256` 的相似度结果；`Final-PC` 仍会记录，
+但不再参与 best checkpoint 选择。
 
 ## 运行命令
 

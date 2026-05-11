@@ -300,15 +300,10 @@ class OpenVocab3DFusionModelV2(nn.Module):
                 print(f"Warning: Empty mask_tokens for batch {b}, skipping")
                 continue
 
-            #修改一下归一写法，怀疑梯度消失
-            
-            # # Normalize and compute similarity
-            # point_features = F.normalize(pred_3d[point_mask], dim=-1)
-            # mask_tokens = F.normalize(mask_tokens, dim=-1)
-            # logits = logit_scale * (point_features @ mask_tokens.t())
-            point_features = pred_3d[point_mask] 
-            mask_tokens_unnorm = mask_tokens 
-            logits = point_features @ mask_tokens_unnorm.t()
+            # Match Diff2Scene/text evaluation: optimize angular similarity, not feature norms.
+            point_features = F.normalize(pred_3d[point_mask], dim=-1)
+            mask_tokens_norm = F.normalize(mask_tokens, dim=-1)
+            logits = logit_scale * (point_features @ mask_tokens_norm.t())
 
             # Expand to full mask count
             if mask_valid is not None:
