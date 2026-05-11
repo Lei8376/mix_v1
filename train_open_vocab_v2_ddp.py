@@ -457,6 +457,9 @@ def main() -> None:
         semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
         semantic_prompt_template=_trainer.get("semantic_prompt_template", "a photo of a {}"),
         semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
+        validation_subprocess=_trainer.get("validation_subprocess", False),
+        validation_config_path=args.config or "config/train_scannet_v2_full_multi_gpu.yaml",
+        validation_device=device,
     )
 
     use_distill      = args.use_distill      or _trainer.get("use_distill",      False)
@@ -474,6 +477,9 @@ def main() -> None:
             bce_weight=_trainer.get("bce_weight", 0.0),
             dice_weight=_trainer.get("dice_weight", 0.0),
             validation_log_every_batches=_trainer.get("validation_log_every_batches", 25),
+            validation_subprocess=_trainer.get("validation_subprocess", False),
+            validation_config_path=args.config or "config/train_scannet_v2_full_multi_gpu.yaml",
+            validation_device=device,
         )
         if is_main_process():
             print(f"[MaskDistill] mask_distill_weight={trainer_config.mask_distill_weight}  "

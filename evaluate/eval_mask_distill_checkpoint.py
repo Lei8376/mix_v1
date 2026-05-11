@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -71,6 +72,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--metrics-json", default=None)
     parser.add_argument(
         "--clip-cache-dir",
         default=str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"),
@@ -114,6 +116,13 @@ def main():
     num_workers = args.num_workers if args.num_workers is not None else dataloader_cfg.get("num_workers", 4)
     if args.num_workers is None:
         num_workers = dataloader_cfg.get("val_num_workers", num_workers)
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = dataloader_cfg.get("val_persistent_workers", False)
+        loader_kwargs["prefetch_factor"] = dataloader_cfg.get(
+            "val_prefetch_factor",
+            dataloader_cfg.get("prefetch_factor", 2),
+        )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=batch_size,
@@ -122,6 +131,7 @@ def main():
         pin_memory=(device != "cpu"),
         drop_last=False,
         collate_fn=open_vocab_collate_v2,
+        **loader_kwargs,
     )
 
     model_config = OpenVocabFusionModelV2Config(
@@ -160,6 +170,8 @@ def main():
     print(f"  device: {device}")
     print(f"  batch_size: {batch_size}")
     print(f"  num_workers: {num_workers}")
+    print(f"  persistent_workers: {loader_kwargs.get('persistent_workers', False)}")
+    print(f"  prefetch_factor: {loader_kwargs.get('prefetch_factor', None)}")
     print(f"  val_samples: {len(val_dataset)}")
     print(f"  checkpoint_dir: {trainer_config.checkpoint_dir}")
     print(f"  log_dir: {trainer_config.log_dir}")
@@ -173,6 +185,12 @@ def main():
         rank=0,
     )
     metrics = trainer._validate(checkpoint.get("epoch", 0))
+    if args.metrics_json:
+        metrics_path = Path(args.metrics_json)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, ensure_ascii=False)
+        print(f"[eval] wrote metrics_json={metrics_path}")
     print("[eval] metrics:")
     for key, value in metrics.items():
         if key.startswith("per_class") or key == "target":

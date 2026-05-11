@@ -1,10 +1,15 @@
 
 
 import contextlib
+import json
 import math
 import os
+import subprocess
+import sys
+import traceback
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
@@ -68,6 +73,9 @@ class MaskDistillTrainerConfig:
     semantic_prompt_template:    str   = "a photo of a {}"
     semantic_pc_lambda:          float = 0.5
     validation_log_every_batches: int   = 25
+    validation_subprocess:        bool  = False
+    validation_config_path:       str   = "config/train_scannet_v2_full_multi_gpu.yaml"
+    validation_device:            str   = "cuda"
 
 
 # ============================================================
@@ -400,7 +408,23 @@ class MaskDistillTrainer:
         validate_start = time.time()
         total_val_batches = len(self.val_loader)
         if self.is_main:
-            print(f"  Validation: {total_val_batches} batches")
+            val_batch_size = getattr(self.val_loader, "batch_size", "unknown")
+            val_num_workers = getattr(self.val_loader, "num_workers", "unknown")
+            val_persistent_workers = getattr(self.val_loader, "persistent_workers", "unknown")
+            val_prefetch_factor = getattr(self.val_loader, "prefetch_factor", None)
+            val_samples = (
+                len(self.val_loader.dataset)
+                if getattr(self.val_loader, "dataset", None) is not None
+                else "unknown"
+            )
+            print("  +---------------- Validation ----------------+", flush=True)
+            print(f"  | samples            : {val_samples}", flush=True)
+            print(f"  | batches            : {total_val_batches}", flush=True)
+            print(f"  | batch_size         : {val_batch_size}", flush=True)
+            print(f"  | num_workers        : {val_num_workers}", flush=True)
+            print(f"  | persistent_workers : {val_persistent_workers}", flush=True)
+            print(f"  | prefetch_factor    : {val_prefetch_factor}", flush=True)
+            print("  +--------------------------------------------+", flush=True)
 
         # 语义 mIoU：保留三项，其中 best_model 只监控 Hybrid/Text：
         # 1) Hybrid/Text: fused 256D vs ODISE text256
@@ -532,12 +556,25 @@ class MaskDistillTrainer:
             if (
                 self.is_main
                 and self.config.validation_log_every_batches > 0
-                and (batch_idx + 1) % self.config.validation_log_every_batches == 0
+                and (
+                    (batch_idx + 1) % self.config.validation_log_every_batches == 0
+                    or (batch_idx + 1) == total_val_batches
+                )
             ):
                 elapsed = time.time() - validate_start
+                done = batch_idx + 1
+                seconds_per_batch = elapsed / max(done, 1)
+                eta = seconds_per_batch * max(total_val_batches - done, 0)
+                pct = done / max(total_val_batches, 1)
+                bar_width = 28
+                filled = int(bar_width * pct)
+                bar = "#" * filled + "-" * (bar_width - filled)
                 print(
-                    f"  Validation progress: {batch_idx + 1}/{total_val_batches} "
-                    f"batches ({elapsed:.1f}s)"
+                    f"  Validation [{bar}] "
+                    f"{done}/{total_val_batches} ({pct * 100:5.1f}%) "
+                    f"elapsed={elapsed:.1f}s ETA={eta:.1f}s "
+                    f"loss={val_loss.avg:.4f}",
+                    flush=True,
                 )
 
             if (batch_idx + 1) % 50 == 0:
@@ -663,6 +700,58 @@ class MaskDistillTrainer:
                 print("[resume] reset best_iou: checkpoint used old monitor, now using semantic_miou_hybrid_text")
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
 
+    def _validate_subprocess(self, epoch: int, checkpoint_path: str) -> Optional[Dict]:
+        repo_root = Path(__file__).resolve().parents[1]
+        eval_script = repo_root / "evaluate" / "eval_mask_distill_checkpoint.py"
+        metrics_path = (
+            Path(self.config.checkpoint_dir)
+            / f"eval_metrics_epoch_{epoch + 1}.json"
+        )
+        cmd = [
+            sys.executable,
+            str(eval_script),
+            "--checkpoint",
+            checkpoint_path,
+            "--config",
+            self.config.validation_config_path,
+            "--split",
+            "val",
+            "--device",
+            self.config.validation_device,
+            "--metrics-json",
+            str(metrics_path),
+        ]
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        py_paths = [
+            str(repo_root),
+            str(repo_root / "ODISE"),
+            str(repo_root / "ODISE" / "third_party" / "Mask2Former"),
+        ]
+        env["PYTHONPATH"] = os.pathsep.join(py_paths + [env.get("PYTHONPATH", "")])
+        env.setdefault("CLIP_CACHE_DIR", str(repo_root / "checkpoints" / "pretrained" / "clip"))
+        env.setdefault("TORCH_HOME", str(repo_root / "checkpoints" / "pretrained" / "torch"))
+
+        if self.is_main:
+            print("  Running validation in a subprocess:", flush=True)
+            print(f"    checkpoint: {checkpoint_path}", flush=True)
+            print(f"    metrics_json: {metrics_path}", flush=True)
+
+        result = subprocess.run(cmd, cwd=str(repo_root), env=env)
+        if result.returncode != 0:
+            if self.is_main:
+                print(
+                    f"  [ERROR] Validation subprocess failed with code {result.returncode}",
+                    flush=True,
+                )
+            return None
+        if not metrics_path.exists():
+            if self.is_main:
+                print(f"  [ERROR] Validation subprocess did not write {metrics_path}", flush=True)
+            return None
+        with metrics_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+
     # ----------------------------------------------------------
     # 主训练入口
     # ----------------------------------------------------------
@@ -691,6 +780,9 @@ class MaskDistillTrainer:
 
             val_metrics = None
             if (epoch + 1) % self.config.val_every_epochs == 0:
+                epoch_checkpoint_path = (
+                    f"{self.config.checkpoint_dir}/checkpoint_epoch_{epoch+1}.pth"
+                )
                 if self.is_main:
                     self._save_checkpoint(epoch, train_loss, is_best=False, suffix=f"epoch_{epoch+1}")
                     self._save_checkpoint(epoch, train_loss, is_best=False, suffix="before_val")
@@ -698,7 +790,20 @@ class MaskDistillTrainer:
                         f"  Saved checkpoint_epoch_{epoch+1}.pth and "
                         "checkpoint_before_val.pth before validation"
                     )
-                val_metrics = self._validate(epoch)
+                try:
+                    if self.config.validation_subprocess:
+                        val_metrics = self._validate_subprocess(epoch, epoch_checkpoint_path)
+                    else:
+                        val_metrics = self._validate(epoch)
+                except Exception as exc:
+                    val_metrics = None
+                    if self.is_main:
+                        print(f"  [ERROR] Validation failed at epoch {epoch+1}: {exc}", flush=True)
+                        traceback.print_exc()
+                        print(
+                            "  Continue training from the checkpoint saved before validation.",
+                            flush=True,
+                        )
                 if val_metrics and self.is_main:
                     if self.writer is not None:
                         self.writer.add_scalar("Loss/Val",                   val_metrics["loss"],                       epoch)

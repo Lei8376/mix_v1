@@ -20,13 +20,15 @@ dataloader:
                   # - 多卡时: 每个 GPU 的批大小
                   # - 单卡时: 总批大小
                   # - 显存不足时可减小到 4 或 2
-  val_batch_size: 32  # 验证单独使用小 batch，避免语义评估阶段显存爆掉
+  val_batch_size: 8  # 验证单独使用小 batch，避免语义评估阶段显存/CPU 峰值过高
   
   num_workers: 16  # 数据加载线程数
                   # - 单卡建议: 4-8
                   # - 多卡建议: 8-16
                   # - 过大会占用过多内存
   val_num_workers: 12 # 验证阶段单独调小 worker；低于训练的 16，避免卡住同时保留数据预取能力
+  val_persistent_workers: false # 验证结束后释放 worker；避免训练进入下一轮时 worker 残留/崩溃
+  val_prefetch_factor: 2
   # val_max_samples: 200  # 调试时才打开；正式训练/选 best 默认全量验证，避免抽样影响指标
 
 # ============================================================
@@ -145,8 +147,8 @@ trainer:
   semantic_prompt_template: "a photo of a {}"
   validation_log_every_batches: 25
   
-  # # 【可选】恢复训练
-  # resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_16.pth  # 续训使用最新 256D epoch checkpoint
+  # 【可选】恢复训练
+  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion.2/checkpoint_epoch_3.pth
 
 # ============================================================
 # 随机种子（确保可复现性）

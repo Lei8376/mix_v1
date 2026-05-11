@@ -454,6 +454,9 @@ def main() -> None:
             semantic_prompt_template=_trainer.get("semantic_prompt_template", "a photo of a {}"),
             semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
             validation_log_every_batches=_trainer.get("validation_log_every_batches", 25),
+            validation_subprocess=_trainer.get("validation_subprocess", False),
+            validation_config_path=args.config or "config/train_scannet_v2_full_multi_gpu.yaml",
+            validation_device=device,
         )
 
     # Validate configuration
