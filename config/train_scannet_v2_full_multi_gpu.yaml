@@ -16,7 +16,7 @@ gpu_ids: [0]  # 单卡模式使用的 GPU 编号（0=第一张卡）
 # 数据加载配置
 # ============================================================
 dataloader:
-  batch_size: 16   # 🔥 单卡训练建议值（显存足够可用 16）
+  batch_size: 32  # 🔥 单卡训练建议值（显存足够可用 16）
                   # - 多卡时: 每个 GPU 的批大小
                   # - 单卡时: 总批大小
                   # - 显存不足时可减小到 4 或 2
@@ -143,7 +143,7 @@ trainer:
   semantic_prompt_template: "a photo of a {}"
   
   # 【可选】恢复训练
-  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_4.pth  # 续训使用最新 256D epoch checkpoint
+  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_8.pth  # 续训使用最新 256D epoch checkpoint
 
 # ============================================================
 # 随机种子（确保可复现性）
