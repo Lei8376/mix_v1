@@ -526,6 +526,13 @@ def main() -> None:
             "Either provide --precomputed-dir or provide extraction model paths"
         )
 
+    eval_split = (_trainer.get("eval_split") or "val").strip().lower()
+    if eval_split != "val":
+        raise ValueError(
+            f"Training-time evaluation must use val split, got eval_split={eval_split!r}. "
+            "Do not use test for training-time validation or model selection."
+        )
+
     if is_main_process():
         print("=" * 60)
         print("Configuration:")
@@ -545,6 +552,7 @@ def main() -> None:
         print(f"  Precomputed projections: {projection_dir if projection_dir else 'No'}")
         print(f"  Checkpoint dir: {trainer_config.checkpoint_dir}")
         print(f"  Log dir: {trainer_config.log_dir}")
+        print(f"  Eval split (val loader): {eval_split}")
         print(f"  3D backbone: {model_config.pc_arch}")
         print(f"  Epochs: {trainer_config.num_epochs}")
         print(f"  AMP enabled: {trainer_config.use_amp}")
@@ -553,9 +561,12 @@ def main() -> None:
     # Free GPU memory
     torch.cuda.empty_cache()
 
-    # Create data loaders
+    # Create data loaders (train uses dataset.split; periodic eval uses trainer.eval_split, default val).
     train_loader, val_loader, train_sampler = create_data_loaders(
-        dataset_config, dataloader_config, val_split="val", use_distributed=use_distributed
+        dataset_config,
+        dataloader_config,
+        val_split=eval_split,
+        use_distributed=use_distributed,
     )
     if is_main_process():
         print(f"Train loader: {len(train_loader)} batches")

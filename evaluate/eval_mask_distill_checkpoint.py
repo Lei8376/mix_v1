@@ -66,7 +66,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", default="config/train_scannet_v2_full_multi_gpu.yaml")
-    parser.add_argument("--split", default="val")
+    parser.add_argument("--split", default="val", choices=["val", "test"])
+    parser.add_argument(
+        "--allow-test",
+        action="store_true",
+        help="Allow evaluating test split. Default workflow uses val for validation/model selection.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -78,6 +83,19 @@ def main():
         default=str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"),
     )
     args = parser.parse_args()
+
+    if args.split != "val" and not args.allow_test:
+        raise ValueError(
+            "Default evaluation must use --split val. "
+            "Test split is only for final held-out evaluation and requires --allow-test."
+        )
+    if args.split == "val":
+        print("[eval] Split=val (recommended for tuning and reporting when test labels/data are unavailable).")
+    else:
+        print(
+            "[eval] Split=test with --allow-test. "
+            "Use only for final held-out evaluation; do not use for model selection."
+        )
 
     os.environ.setdefault("CLIP_CACHE_DIR", args.clip_cache_dir)
 

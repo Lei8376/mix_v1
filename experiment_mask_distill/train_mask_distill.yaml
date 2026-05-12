@@ -85,6 +85,7 @@ trainer:
   # Geometric mean: p_final ∝ p_hybrid^lambda * p_lseg^(1-lambda)
   semantic_pc_lambda: 0.5
   semantic_prompt_template: "a photo of a {}"
+  eval_split: val  # 训练阶段验证统一使用 val
 
   # # ----- 恢复训练（可选）-----
   resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_11.pth

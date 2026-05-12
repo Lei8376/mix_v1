@@ -32,6 +32,13 @@ dataset:
   split: train
 ```
 
+训练过程中的周期性验证数据 loader 使用 **`trainer.eval_split`**（默认 `val`，脚本强制必须为 `val`，不可用 `test` 做训练期验证或选 best）。
+
+```yaml
+trainer:
+  eval_split: val
+```
+
 完整示例（含 PYTHONPATH 与缓存目录）：
 
 ```bash
@@ -92,6 +99,8 @@ CUDA_VISIBLE_DEVICES=0 \
 
 ## 5. 仅当你确实有 test 数据时才用 `--split test`
 
+`evaluate/eval_mask_distill_checkpoint.py` 默认只允许 **`--split val`**；若要评估 test，必须额外传入 **`--allow-test`**，避免误跑 held-out。
+
 需同时存在类似：
 
 - `/home/featurize/data/scannet_3d/test/`（或与 `data_scannet_3d.yaml` 一致的路径）
@@ -111,6 +120,7 @@ CUDA_VISIBLE_DEVICES=0 \
   --checkpoint checkpoints/hfg/checkpoint_epoch_2.pth \
   --config config/train_scannet_v2_full_multi_gpu.yaml \
   --split test \
+  --allow-test \
   --device cuda
 ```
 
@@ -122,7 +132,7 @@ CUDA_VISIBLE_DEVICES=0 \
 
 | 阶段       | 做法 |
 |------------|------|
-| 训练       | `dataset.split: train`，trainer 内做 val |
+| 训练       | `dataset.split: train`，`trainer.eval_split: val`，trainer 内验证 |
 | 调参评估   | `--split val --max-samples 500`（或 1000） |
 | 最终对比   | `--split val` 全量 |
 | 不要做     | 用 train 做语义评估；无 test 数据/标签时强行 `--split test` |

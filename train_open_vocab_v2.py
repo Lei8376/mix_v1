@@ -506,6 +506,13 @@ def main() -> None:
     )
     print(f"  Checkpoint dir: {trainer_config.checkpoint_dir}")
     print(f"  Log dir: {trainer_config.log_dir}")
+    eval_split = (_trainer.get("eval_split") or "val").strip().lower()
+    if eval_split != "val":
+        raise ValueError(
+            f"Training-time evaluation must use val split, got eval_split={eval_split!r}. "
+            "Do not use test for training-time validation or model selection."
+        )
+    print(f"  Eval split (val loader): {eval_split}")
     print(f"  3D backbone: {model_config.pc_arch}")
     print(f"  Epochs: {trainer_config.num_epochs}")
     print(f"  Learning rate: {trainer_config.base_lr}")
@@ -517,9 +524,9 @@ def main() -> None:
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    # Create data loaders
+    # Create data loaders (train uses dataset.split; periodic eval uses trainer.eval_split, default val).
     train_loader, val_loader = create_data_loaders(
-        dataset_config, dataloader_config, val_split="val"
+        dataset_config, dataloader_config, val_split=eval_split
     )
     print(f"Train loader: {len(train_loader)} batches")
 
