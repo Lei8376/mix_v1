@@ -64,7 +64,7 @@ trainer:
   nce_type: "hard"           # hard or soft
   nce_tau: 0.1
   nce_tau_teacher: 0.2
-  vicreg_weight: 0.03
+  vicreg_weight: 0.01
   bce_weight: 0.0            # 辅助 BCE（先纯试 mask distillation，设为 0）
   dice_weight: 0.0           # 辅助 Dice（同上，设为 0）
   min_points_per_mask: 5    # GT mask 至少需要多少个正样本点才参与 loss

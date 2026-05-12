@@ -130,8 +130,11 @@ def vicreg_loss_batch(
         if valid.sum() < 4:
             continue
 
-        z = F.normalize(fused[b, valid], dim=-1)
-        y = F.normalize(base[b, valid], dim=-1)
+        # VICReg operates on raw token statistics.
+        # Do not L2-normalize here; otherwise gamma=1.0 is incompatible
+        # with 256D unit vectors and the variance term becomes abnormal.
+        z = fused[b, valid]
+        y = base[b, valid]
         losses.append(vicreg_loss_single(z, y))
 
     if not losses:
@@ -145,7 +148,7 @@ class HybridFusionRegularizationLoss(nn.Module):
     def __init__(
         self,
         nce_weight: float = 0.5,
-        vicreg_weight: float = 0.03,
+        vicreg_weight: float = 0.01,
         nce_type: str = "hard",
         tau: float = 0.1,
         tau_teacher: float = 0.2,

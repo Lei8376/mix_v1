@@ -63,7 +63,7 @@ class MaskDistillTrainerConfig:
     nce_type:                   str   = "hard"
     nce_tau:                    float = 0.1
     nce_tau_teacher:            float = 0.2
-    vicreg_weight:              float = 0.03
+    vicreg_weight:              float = 0.01
     bce_weight:                 float = 0.0   # 辅助 BCE（默认不用）
     dice_weight:                float = 0.0   # 辅助 Dice（默认不用）
     # GT 过滤阈值

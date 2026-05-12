@@ -164,7 +164,7 @@ def main():
         nce_type=trainer_cfg.get("nce_type", "hard"),
         nce_tau=trainer_cfg.get("nce_tau", 0.1),
         nce_tau_teacher=trainer_cfg.get("nce_tau_teacher", 0.2),
-        vicreg_weight=trainer_cfg.get("vicreg_weight", 0.03),
+        vicreg_weight=trainer_cfg.get("vicreg_weight", 0.01),
         bce_weight=trainer_cfg.get("bce_weight", 0.0),
         dice_weight=trainer_cfg.get("dice_weight", 0.0),
         min_points_per_mask=trainer_cfg.get("min_points_per_mask", 10),

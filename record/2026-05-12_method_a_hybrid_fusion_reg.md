@@ -9,6 +9,7 @@
 ## 当前代码状态
 
 - 本分支已实现方法 A 的训练代码，分支名：`method-a-hybrid-fusion-reg`。
+- **修订**：`vicreg_loss_batch` 对 fused/base **不做** L2 normalize（与 `gamma=1` 的 variance 项匹配）；第一轮配置将 `vicreg_weight` 降为 `0.01`。
 - 新增/修改的主要文件：
   - `model/modeling.py`
   - `model/open_vocab_fusion_v2.py`
@@ -36,6 +37,23 @@ fused        = mask_tokens + alpha * delta
   - `_mask_distill_loss(logits_key=...)` 可读取不同 logits。
   - `compute_loss()` 已组合 `loss_mask_student` 和 `loss_mask_joint`。
 
+## Alpha 结论（bounded adaptive）
+
+**不要**把 refine 残差系数固定为 `1`，也**不建议**固定为 `0.5`。当前实现里的 **bounded adaptive alpha** 更合理：
+
+```python
+self.alpha_raw = nn.Parameter(torch.tensor(-1.5))
+self.alpha_max = 0.2
+alpha = alpha_max * torch.sigmoid(alpha_raw)
+```
+
+初始近似：`alpha ≈ 0.2 * sigmoid(-1.5) ≈ 0.036`。第一轮实验偏保守是故意的：refine 是自由 MLP，若 `alpha` 固定为 `1` 或较大的常数，很容易把 ODISE-256 语义空间拉飞；在已有 NCE/VICReg 的前提下，仍不建议第一轮就把 residual 权重放得太大。
+
+建议：
+
+- **第一轮**：保留 bounded adaptive，`alpha_max=0.2`，`alpha_raw=-1.5`。暂时不要用 `alpha=0.5` 或 `1`。
+- **第二轮（仅在第一轮诊断满足时再改）**：若 `loss_nce` 在降、`loss_vicreg` 正常、Hybrid mIoU 不再掉，但 fused 相对 base 提升仍弱，可把 `alpha_raw` 初始改为 `0.0`，使初始 `alpha = 0.1 * sigmoid(0) = 0.1`（在 `alpha_max=0.2` 下）。**本轮不要提前改 alpha。**
+
 ## 问题判断
 
 当前 mask distillation 会同时更新 3D student 和 `fused_embeddings`。如果该 loss 对 fused 的梯度过强，fused 容易变成只服务 `pred_3d @ fused -> mask` 的 latent classifier，而不是保持开放词汇语义可读的 Hybrid token。
@@ -51,7 +69,7 @@ loss_total =
     1.0  * loss_mask_student
   + 0.05 * loss_mask_joint
   + 0.5  * loss_nce
-  + 0.03 * loss_vicreg
+  + 0.01 * loss_vicreg
 ```
 
 其中：
@@ -188,11 +206,12 @@ loss_vicreg = sim_w * invariance
             + cov_w * covariance
 ```
 
-外部权重保持小：
+### NCE 与 VICReg 是否做 L2 normalize（重要）
 
-```text
-vicreg_weight = 0.03
-```
+- **NCE**：继续对 `fused` / teacher tokens 做 `F.normalize`，与对比学习惯例一致。
+- **VICReg**：**不要**在 `vicreg_loss_batch` 里对 `fused`/`base` 再做 `F.normalize`。默认 `gamma=1.0` 针对的是各维标准差；若先 L2 归一化成近似单位向量，256 维下每维标准差量级约 `1/sqrt(256)≈0.0625`，variance 惩罚项会异常偏大、训练不稳定。
+
+第一轮 **VICReg 外部权重** 建议 `vicreg_weight = 0.01`，避免一开始就过强；若曲线仍被 VICReg 主导，可再降到 `0.005`。
 
 ## 新增 Fusion Regularization Loss
 
@@ -239,7 +258,7 @@ trainer:
   nce_type: "hard"
   nce_tau: 0.1
 
-  vicreg_weight: 0.03
+  vicreg_weight: 0.01
 ```
 
 如果先做最小实验、不拆 mask loss，可临时使用：
@@ -248,7 +267,7 @@ trainer:
 trainer:
   mask_distill_weight: 0.5
   nce_weight: 0.5
-  vicreg_weight: 0.03
+  vicreg_weight: 0.01
 ```
 
 ## 训练日志必须补充
@@ -285,9 +304,45 @@ Fused:      fused @ text256
 ## 推荐实验顺序
 
 1. 最小版：`0.5 * loss_mask_distill + 0.5 * loss_nce`，先确认 NCE 是否能阻止 Hybrid/Text mIoU 下降。
-2. 加 VICReg：`0.5 * loss_mask_distill + 0.5 * loss_nce + 0.03 * loss_vicreg`，观察曲线是否更平稳。
-3. 正式方法 A：`1.0 * loss_mask_student + 0.05 * loss_mask_joint + 0.5 * loss_nce + 0.03 * loss_vicreg`。
+2. 加 VICReg：`0.5 * loss_mask_distill + 0.5 * loss_nce + 0.01 * loss_vicreg`，观察曲线是否更平稳。
+3. 正式方法 A（第一轮推荐）：`1.0 * loss_mask_student + 0.05 * loss_mask_joint + 0.5 * loss_nce + 0.01 * loss_vicreg`，并保持 bounded adaptive alpha（见上文）。
 4. soft NCE：如果 hard NCE 不稳定或同类实例互相排斥明显，再把 `nce_type` 改为 `soft`。
+
+## 第一轮推荐 YAML 快照
+
+```yaml
+mask_student_weight: 1.0
+mask_joint_weight: 0.05
+nce_weight: 0.5
+nce_type: "hard"
+nce_tau: 0.1
+vicreg_weight: 0.01
+alpha_max: 0.2
+```
+
+## TensorBoard 与判断标准
+
+重点看：
+
+```text
+Loss/Train_NCE
+Loss/Train_VICReg
+Loss/Train_MaskStudent
+Loss/Train_MaskJoint
+Fusion/alpha
+Fusion/gate_mean
+Metrics/Semantic_mIoU_HybridText
+semantic_miou_base
+semantic_miou_odise_only
+semantic_miou_pixel256
+```
+
+经验规则：
+
+- 若 **fused < base**：refine 仍在拉坏语义，保持小 alpha；必要时把 `vicreg_weight` 提到 `0.02` 加强约束。
+- 若 **fused ≈ base 但不提升**：第二轮再把 `alpha_raw` 初始改为 `0.0`（初始 alpha=0.1），不要第一轮就做。
+- 若 **VICReg 数值仍然很大**：继续降低 `vicreg_weight` 到 `0.005`。
+- 若 **NCE 不降**：尝试 `nce_type: "soft"`。
 
 ## 一句话总结
 

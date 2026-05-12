@@ -122,7 +122,7 @@ trainer:
   nce_type: "hard"             # hard or soft
   nce_tau: 0.1
   nce_tau_teacher: 0.2
-  vicreg_weight: 0.03
+  vicreg_weight: 0.01
   bce_weight: 0.0            # 论文主 loss 不使用 BCE 辅助项
   dice_weight: 0.0           # 论文主 loss 不使用 Dice 辅助项
   min_points_per_mask: 8  # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss、

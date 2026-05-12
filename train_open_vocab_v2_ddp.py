@@ -481,7 +481,7 @@ def main() -> None:
             nce_type=_trainer.get("nce_type", "hard"),
             nce_tau=_trainer.get("nce_tau", 0.1),
             nce_tau_teacher=_trainer.get("nce_tau_teacher", 0.2),
-            vicreg_weight=_trainer.get("vicreg_weight", 0.03),
+            vicreg_weight=_trainer.get("vicreg_weight", 0.01),
             bce_weight=_trainer.get("bce_weight", 0.0),
             dice_weight=_trainer.get("dice_weight", 0.0),
             validation_log_every_batches=_trainer.get("validation_log_every_batches", 25),
