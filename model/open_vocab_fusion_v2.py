@@ -29,6 +29,7 @@ class OpenVocabFusionModelV2Config:
     mask_embedding_dim: int = 256
     pixel_embedding_dim: int = 512
     fused_embedding_dim: int = 256
+    alpha_max: float = 0.2
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
     lseg_ckpt_path: Optional[str] = None
@@ -64,6 +65,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
             pixel_dim=config.pixel_embedding_dim,
             mask_dim=config.mask_embedding_dim,
             out_dim=config.fused_embedding_dim,
+            alpha_max=config.alpha_max,
         )
 
         # Learnable temperature for similarity
@@ -217,9 +219,14 @@ class OpenVocab3DFusionModelV2(nn.Module):
             )
 
         # Fuse 2D features
-        fused_embeddings = self.fuse_embed(
-            pixel_embeddings, mask_embeddings, mask_tensors, mask_valid
+        fusion_out = self.fuse_embed(
+            pixel_embeddings,
+            mask_embeddings,
+            mask_tensors,
+            mask_valid,
+            return_aux=True,
         )
+        fused_embeddings = fusion_out["fused"]
         pixel_pooled_embeddings = self._pool_pixel_embeddings_for_eval(
             pixel_embeddings, mask_tensors, mask_valid
         )
@@ -304,6 +311,8 @@ class OpenVocab3DFusionModelV2(nn.Module):
             point_features = F.normalize(pred_3d[point_mask], dim=-1)
             mask_tokens_norm = F.normalize(mask_tokens, dim=-1)
             logits = logit_scale * (point_features @ mask_tokens_norm.t())
+            mask_tokens_detached_norm = F.normalize(mask_tokens.detach(), dim=-1)
+            logits_detached = logit_scale * (point_features @ mask_tokens_detached_norm.t())
 
             # Expand to full mask count
             if mask_valid is not None:
@@ -311,11 +320,19 @@ class OpenVocab3DFusionModelV2(nn.Module):
                 full_logits = pred_3d.new_full(
                     (logits.shape[0], num_masks), float("-inf")
                 )
+                full_logits_detached = pred_3d.new_full(
+                    (logits_detached.shape[0], num_masks), float("-inf")
+                )
                 full_logits[:, valid_mask] = logits.to(full_logits.dtype)
+                full_logits_detached[:, valid_mask] = logits_detached.to(full_logits_detached.dtype)
                 logits = full_logits
+                logits_detached = full_logits_detached
 
             # 传 logits 给 criterion，便于 AMP 下用 BCEWithLogitsLoss（autocast 安全）
-            outputs[b].append({"pred_mask_logits": logits})
+            outputs[b].append({
+                "pred_mask_logits": logits,
+                "pred_mask_logits_detached_teacher": logits_detached,
+            })
 
         return {
             "outputs": outputs,
@@ -325,6 +342,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "fused_embeddings": fused_embeddings,
             "pixel_pooled_embeddings": batch_input.get("clip_pooled", pixel_pooled_embeddings).float(),
             "pred_3d": pred_3d,
+            "fusion_aux": fusion_out,
         }
 
     def _pool_pixel_embeddings_for_eval(

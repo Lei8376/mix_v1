@@ -386,6 +386,7 @@ def main() -> None:
         pixel_embedding_dim=_model.get("pixel_embedding_dim", 512),
         mask_embedding_dim=_model.get("mask_embedding_dim", 256),
         fused_embedding_dim=_model.get("fused_embedding_dim", 256),
+        alpha_max=_model.get("alpha_max", 0.2),
         pc_last_dim=_model.get("pc_last_dim", 256),
     )
 
@@ -435,6 +436,13 @@ def main() -> None:
             warmup_epochs=_trainer.get("warmup_epochs", args.warmup_epochs),
             scheduler_type=_trainer.get("scheduler_type", args.scheduler_type),
             mask_distill_weight=_trainer.get("mask_distill_weight", 1.0),
+            mask_student_weight=_trainer.get("mask_student_weight", 1.0),
+            mask_joint_weight=_trainer.get("mask_joint_weight", 0.05),
+            nce_weight=_trainer.get("nce_weight", 0.5),
+            nce_type=_trainer.get("nce_type", "hard"),
+            nce_tau=_trainer.get("nce_tau", 0.1),
+            nce_tau_teacher=_trainer.get("nce_tau_teacher", 0.2),
+            vicreg_weight=_trainer.get("vicreg_weight", 0.03),
             bce_weight=_trainer.get("bce_weight", 0.0),
             dice_weight=_trainer.get("dice_weight", 0.0),
             min_points_per_mask=_trainer.get("min_points_per_mask", 10),

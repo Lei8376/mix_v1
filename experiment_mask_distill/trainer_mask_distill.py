@@ -19,8 +19,9 @@ from torch.utils.tensorboard import SummaryWriter
 from MinkowskiEngine import SparseTensor
 
 from experiment_mask_distill.criterion_mask_distill import MaskDistillCriteria
+from experiment_mask_distill.fusion_regularization import HybridFusionRegularizationLoss
 from experiment_mask_distill.semantic_miou import (
-    MaskMIoUTracker, ODISEPCSemanticMIoUTracker,
+    Diff2SceneSemanticMIoUTracker, MaskMIoUTracker, ODISEPCSemanticMIoUTracker,
     build_text_features,
 )
 from utils.util import AverageMeter
@@ -55,7 +56,14 @@ class MaskDistillTrainerConfig:
     early_stopping_patience:    int   = 15
     early_stopping_min_delta:   float = 1e-4
     # ---- Loss 权重（主损失 mask distillation）----
-    mask_distill_weight:        float = 1.0   # L_mask_distill 主损失
+    mask_distill_weight:        float = 1.0   # legacy: old single mask distill weight
+    mask_student_weight:        float = 1.0   # detached fused token, mainly trains 3D student
+    mask_joint_weight:          float = 0.05  # normal fused token, small gradient to fusion
+    nce_weight:                 float = 0.5
+    nce_type:                   str   = "hard"
+    nce_tau:                    float = 0.1
+    nce_tau_teacher:            float = 0.2
+    vicreg_weight:              float = 0.03
     bce_weight:                 float = 0.0   # 辅助 BCE（默认不用）
     dice_weight:                float = 0.0   # 辅助 Dice（默认不用）
     # GT 过滤阈值
@@ -121,6 +129,13 @@ class MaskDistillTrainer:
         self._build_scheduler()
 
         self.scaler = GradScaler(enabled=self.config.use_amp)
+        self.fusion_reg_criterion = HybridFusionRegularizationLoss(
+            nce_weight=self.config.nce_weight,
+            vicreg_weight=self.config.vicreg_weight,
+            nce_type=self.config.nce_type,
+            tau=self.config.nce_tau,
+            tau_teacher=self.config.nce_tau_teacher,
+        )
 
         self.global_step                = 0
         self.current_epoch              = 0
@@ -145,9 +160,14 @@ class MaskDistillTrainer:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             total     = sum(p.numel() for p in model.parameters())
             print(f"[MaskDistillTrainer] Parameters: {trainable:,} trainable / {total:,} total")
-            print(f"  mask_distill_weight={self.config.mask_distill_weight}  "
-                  f"bce_weight={self.config.bce_weight}  "
-                  f"dice_weight={self.config.dice_weight}")
+            print(
+                f"  mask_student_weight={self.config.mask_student_weight}  "
+                f"mask_joint_weight={self.config.mask_joint_weight}  "
+                f"nce_weight={self.config.nce_weight}  "
+                f"vicreg_weight={self.config.vicreg_weight}  "
+                f"bce_weight={self.config.bce_weight}  "
+                f"dice_weight={self.config.dice_weight}"
+            )
 
     # ----------------------------------------------------------
     # 内部工具
@@ -203,6 +223,8 @@ class MaskDistillTrainer:
             results=results,
             batch_input=batch,
             mask_distill_weight=self.config.mask_distill_weight,
+            mask_student_weight=self.config.mask_student_weight,
+            mask_joint_weight=self.config.mask_joint_weight,
             bce_weight=self.config.bce_weight,
             dice_weight=self.config.dice_weight,
             min_points_per_mask=self.config.min_points_per_mask,
@@ -216,7 +238,11 @@ class MaskDistillTrainer:
         self.model.train()
         epoch_loss        = AverageMeter()
         epoch_distill     = AverageMeter()
+        epoch_mask_joint  = AverageMeter()
         epoch_aux         = AverageMeter()
+        epoch_nce         = AverageMeter()
+        epoch_vicreg      = AverageMeter()
+        epoch_fusion_reg  = AverageMeter()
         batch_time        = AverageMeter()
 
         accum_steps    = self.accum_steps
@@ -247,7 +273,11 @@ class MaskDistillTrainer:
                     try:
                         results  = self.model(batch)
                         criteria = self._make_criteria(results, batch)
-                        loss, loss_dict = criteria.compute_loss()
+                        mask_loss, loss_dict = criteria.compute_loss()
+                        fusion_reg_loss, fusion_reg_dict = self.fusion_reg_criterion(results)
+                        loss = mask_loss + fusion_reg_loss
+                        loss_dict.update(fusion_reg_dict)
+                        loss_dict["loss_total"] = float(loss.detach().cpu())
                         if torch.isnan(loss) or torch.isinf(loss):
                             raise ValueError(f"Invalid loss: {loss}")
                     except Exception as e:
@@ -259,7 +289,11 @@ class MaskDistillTrainer:
 
             epoch_loss.update(loss.item())
             epoch_distill.update(loss_dict["loss_mask_distill"])
+            epoch_mask_joint.update(loss_dict["loss_mask_joint"])
             epoch_aux.update(loss_dict["loss_aux"])
+            epoch_nce.update(loss_dict["loss_nce"])
+            epoch_vicreg.update(loss_dict["loss_vicreg"])
+            epoch_fusion_reg.update(loss_dict["loss_fusion_reg"])
             batch_time.update(time.time() - end_time)
             end_time = time.time()
 
@@ -307,7 +341,11 @@ class MaskDistillTrainer:
 
                 if self.writer is not None:
                     self.writer.add_scalar("Loss/Train_Step",         loss.item(),                        self.global_step)
-                    self.writer.add_scalar("Loss/Train_MaskDistill",  loss_dict["loss_mask_distill"],     self.global_step)
+                    self.writer.add_scalar("Loss/Train_MaskStudent",  loss_dict["loss_mask_student"],     self.global_step)
+                    self.writer.add_scalar("Loss/Train_MaskJoint",    loss_dict["loss_mask_joint"],       self.global_step)
+                    self.writer.add_scalar("Loss/Train_NCE",          loss_dict["loss_nce"],              self.global_step)
+                    self.writer.add_scalar("Loss/Train_VICReg",       loss_dict["loss_vicreg"],           self.global_step)
+                    self.writer.add_scalar("Loss/Train_FusionReg",    loss_dict["loss_fusion_reg"],       self.global_step)
                     self.writer.add_scalar("Loss/Train_Aux",          loss_dict["loss_aux"],              self.global_step)
                     self.writer.add_scalar("LR", self.optimizer.param_groups[0]["lr"], self.global_step)
 
@@ -316,6 +354,12 @@ class MaskDistillTrainer:
                         else getattr(self.model, "module", None) and self.model.module.fuse_embed
                     if fuse is not None and hasattr(fuse, "alpha"):
                         self.writer.add_scalar("Fusion/alpha", fuse.alpha.item(), self.global_step)
+                    aux = results.get("fusion_aux")
+                    if aux is not None:
+                        gate = aux["gate"][results["mask_valid_from_masks"]]
+                        if gate.numel() > 0:
+                            self.writer.add_scalar("Fusion/gate_mean", gate.mean().item(), self.global_step)
+                            self.writer.add_scalar("Fusion/gate_std", gate.std(unbiased=False).item(), self.global_step)
 
                 self.global_step += 1
 
@@ -328,7 +372,11 @@ class MaskDistillTrainer:
                     f"Epoch [{epoch+1}/{self.config.num_epochs}] "
                     f"Step [{step}/{len(self.train_loader)}] "
                     f"Loss: {loss.item():.4f} "
-                    f"(distill={loss_dict['loss_mask_distill']:.4f} aux={loss_dict['loss_aux']:.4f}) "
+                    f"(student={loss_dict['loss_mask_student']:.4f} "
+                    f"joint={loss_dict['loss_mask_joint']:.4f} "
+                    f"nce={loss_dict['loss_nce']:.4f} "
+                    f"vic={loss_dict['loss_vicreg']:.4f} "
+                    f"aux={loss_dict['loss_aux']:.4f}) "
                     f"avg={epoch_loss.avg:.4f}  LR: {lr:.2e}  ETA: {eta:.0f}s"
                 )
 
@@ -349,7 +397,11 @@ class MaskDistillTrainer:
             self.global_step += 1
 
         if self.writer is not None:
-            self.writer.add_scalar("Loss/Train_MaskDistill_Epoch", epoch_distill.avg, epoch)
+            self.writer.add_scalar("Loss/Train_MaskStudent_Epoch", epoch_distill.avg, epoch)
+            self.writer.add_scalar("Loss/Train_MaskJoint_Epoch",   epoch_mask_joint.avg, epoch)
+            self.writer.add_scalar("Loss/Train_NCE_Epoch",         epoch_nce.avg, epoch)
+            self.writer.add_scalar("Loss/Train_VICReg_Epoch",      epoch_vicreg.avg, epoch)
+            self.writer.add_scalar("Loss/Train_FusionReg_Epoch",   epoch_fusion_reg.avg, epoch)
             self.writer.add_scalar("Loss/Train_Aux_Epoch",         epoch_aux.avg,     epoch)
 
         return epoch_loss.avg
@@ -404,7 +456,11 @@ class MaskDistillTrainer:
         self.model.eval()
         val_loss      = AverageMeter()
         val_distill   = AverageMeter()
+        val_mask_joint = AverageMeter()
         val_aux       = AverageMeter()
+        val_nce       = AverageMeter()
+        val_vicreg    = AverageMeter()
+        val_fusion_reg = AverageMeter()
         validate_start = time.time()
         total_val_batches = len(self.val_loader)
         if self.is_main:
@@ -437,6 +493,9 @@ class MaskDistillTrainer:
             if text_feats is not None and pixel_text_feats is not None
             else None
         )
+        odise_token_tracker = Diff2SceneSemanticMIoUTracker() if text_feats is not None else None
+        pixel256_tracker = Diff2SceneSemanticMIoUTracker() if text_feats is not None else None
+        base_tracker = Diff2SceneSemanticMIoUTracker() if text_feats is not None else None
 
         # Mask-level mIoU
         mask_tracker  = MaskMIoUTracker(threshold=0.5)
@@ -448,11 +507,19 @@ class MaskDistillTrainer:
             with autocast(enabled=self.config.use_amp):
                 results          = self.model(batch)
                 criteria         = self._make_criteria(results, batch)
-                loss, loss_dict  = criteria.compute_loss()
+                mask_loss, loss_dict = criteria.compute_loss()
+                fusion_reg_loss, fusion_reg_dict = self.fusion_reg_criterion(results)
+                loss = mask_loss + fusion_reg_loss
+                loss_dict.update(fusion_reg_dict)
+                loss_dict["loss_total"] = float(loss.detach().cpu())
 
             val_loss.update(loss.item())
             val_distill.update(loss_dict["loss_mask_distill"])
+            val_mask_joint.update(loss_dict["loss_mask_joint"])
             val_aux.update(loss_dict["loss_aux"])
+            val_nce.update(loss_dict["loss_nce"])
+            val_vicreg.update(loss_dict["loss_vicreg"])
+            val_fusion_reg.update(loss_dict["loss_fusion_reg"])
 
             from experiment_mask_distill.criterion_mask_distill import build_lifted_3d_masks
             mask_valid = results["mask_valid_from_masks"]    # (B, K_max)
@@ -487,6 +554,26 @@ class MaskDistillTrainer:
                         raise RuntimeError(
                             f"Semantic eval batch={batch_idx} item={b}: "
                             f"logit rows {pred_logits.shape[0]} != gt labels {gt_b.numel()}"
+                        )
+                    fusion_aux = results.get("fusion_aux")
+                    if fusion_aux is not None and text_feats is not None:
+                        odise_token_tracker.update(
+                            gt_labels=gt_b,
+                            fused_embeddings=fusion_aux["mask_tokens"][b][valid_k],
+                            pred_mask_logits=pred_logits,
+                            text_features=text_feats,
+                        )
+                        pixel256_tracker.update(
+                            gt_labels=gt_b,
+                            fused_embeddings=fusion_aux["pixel_tokens"][b][valid_k],
+                            pred_mask_logits=pred_logits,
+                            text_features=text_feats,
+                        )
+                        base_tracker.update(
+                            gt_labels=gt_b,
+                            fused_embeddings=fusion_aux["base"][b][valid_k],
+                            pred_mask_logits=pred_logits,
+                            text_features=text_feats,
                         )
                     if pixel_all is not None:
                         pixel_b = pixel_all[b][valid_k]
@@ -583,11 +670,19 @@ class MaskDistillTrainer:
         val_metrics = {
             "loss":                      val_loss.avg,
             "loss_mask_distill":         val_distill.avg,
+            "loss_mask_student":         val_distill.avg,
+            "loss_mask_joint":           val_mask_joint.avg,
             "loss_aux":                  val_aux.avg,
+            "loss_nce":                  val_nce.avg,
+            "loss_vicreg":               val_vicreg.avg,
+            "loss_fusion_reg":           val_fusion_reg.avg,
             "semantic_miou":             0.0,  # main semantic metric used for best_model: Hybrid/Text
             "semantic_miou_hybrid_text": 0.0,
             "semantic_miou_clip_text":   0.0,
             "semantic_miou_final":       0.0,
+            "semantic_miou_odise_only":  0.0,
+            "semantic_miou_pixel256":    0.0,
+            "semantic_miou_base":        0.0,
             "semantic_acc":              0.0,
             "semantic_acc_hybrid_text":  0.0,
             "semantic_acc_clip_text":    0.0,
@@ -624,6 +719,16 @@ class MaskDistillTrainer:
             val_metrics["per_class_acc_hybrid_text"] = pc_res.get("per_class_acc_hybrid_text", {})
             val_metrics["per_class_acc_clip_text"] = pc_res.get("per_class_acc_clip_text", {})
             val_metrics["per_class_acc_final"] = pc_res.get("per_class_acc_pc", {})
+
+        if odise_token_tracker is not None:
+            odise_res = odise_token_tracker.compute()
+            val_metrics["semantic_miou_odise_only"] = odise_res["semantic_miou_diff2scene"]
+        if pixel256_tracker is not None:
+            pixel256_res = pixel256_tracker.compute()
+            val_metrics["semantic_miou_pixel256"] = pixel256_res["semantic_miou_diff2scene"]
+        if base_tracker is not None:
+            base_res = base_tracker.compute()
+            val_metrics["semantic_miou_base"] = base_res["semantic_miou_diff2scene"]
 
         mask_res = mask_tracker.compute()
         val_metrics["mask_miou"] = mask_res["mask_miou"]
@@ -807,11 +912,18 @@ class MaskDistillTrainer:
                 if val_metrics and self.is_main:
                     if self.writer is not None:
                         self.writer.add_scalar("Loss/Val",                   val_metrics["loss"],                       epoch)
-                        self.writer.add_scalar("Loss/Val_MaskDistill",       val_metrics["loss_mask_distill"],          epoch)
+                        self.writer.add_scalar("Loss/Val_MaskStudent",       val_metrics["loss_mask_student"],          epoch)
+                        self.writer.add_scalar("Loss/Val_MaskJoint",         val_metrics["loss_mask_joint"],            epoch)
+                        self.writer.add_scalar("Loss/Val_NCE",               val_metrics["loss_nce"],                   epoch)
+                        self.writer.add_scalar("Loss/Val_VICReg",            val_metrics["loss_vicreg"],                epoch)
+                        self.writer.add_scalar("Loss/Val_FusionReg",         val_metrics["loss_fusion_reg"],            epoch)
                         self.writer.add_scalar("Loss/Val_Aux",               val_metrics["loss_aux"],                   epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_HybridText", val_metrics["semantic_miou_hybrid_text"], epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_CLIPText",   val_metrics["semantic_miou_clip_text"],   epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_FinalPC",    val_metrics["semantic_miou_final"],       epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_ODISEOnly",  val_metrics["semantic_miou_odise_only"],  epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_Pixel256",   val_metrics["semantic_miou_pixel256"],    epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_Base",       val_metrics["semantic_miou_base"],        epoch)
                         self.writer.add_scalar("Metrics/Semantic_Acc_HybridText",  val_metrics["semantic_acc_hybrid_text"],  epoch)
                         self.writer.add_scalar("Metrics/Semantic_Acc_CLIPText",    val_metrics["semantic_acc_clip_text"],    epoch)
                         self.writer.add_scalar("Metrics/Semantic_Acc_FinalPC",     val_metrics["semantic_acc_final"],        epoch)
@@ -848,8 +960,15 @@ class MaskDistillTrainer:
                     n_cls      = val_metrics["n_valid_classes_final"]
                     print(
                         f"  Val Loss: {val_metrics['loss']:.4f} "
-                        f"(distill={val_metrics['loss_mask_distill']:.4f})  "
+                        f"(student={val_metrics['loss_mask_student']:.4f} "
+                        f"joint={val_metrics['loss_mask_joint']:.4f} "
+                        f"nce={val_metrics['loss_nce']:.4f} "
+                        f"vic={val_metrics['loss_vicreg']:.4f})  "
                         f"[Hybrid/Text] {sem_miou_h:.4f}  "
+                        f"[ODISE/Base/Pixel256] "
+                        f"{val_metrics['semantic_miou_odise_only']:.4f}/"
+                        f"{val_metrics['semantic_miou_base']:.4f}/"
+                        f"{val_metrics['semantic_miou_pixel256']:.4f}  "
                         f"[CLIP/Text] {sem_miou_c:.4f}  "
                         f"[Final-PC] {sem_miou_final:.4f} ({n_cls} classes)  "
                         f"[Acc H/C/F] {sem_acc_h:.4f}/{sem_acc_c:.4f}/{sem_acc_final:.4f}  "

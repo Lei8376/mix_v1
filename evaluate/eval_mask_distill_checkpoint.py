@@ -140,6 +140,7 @@ def main():
         pixel_embedding_dim=model_cfg.get("pixel_embedding_dim", 512),
         mask_embedding_dim=model_cfg.get("mask_embedding_dim", 256),
         fused_embedding_dim=model_cfg.get("fused_embedding_dim", 256),
+        alpha_max=model_cfg.get("alpha_max", 0.2),
         pc_last_dim=model_cfg.get("pc_last_dim", 256),
     )
     model = OpenVocab3DFusionModelV2(model_config).to(device)
@@ -157,6 +158,13 @@ def main():
         checkpoint_dir=trainer_cfg.get("checkpoint_dir", "checkpoints/eval_only"),
         use_amp=(not args.no_amp and device != "cpu"),
         mask_distill_weight=trainer_cfg.get("mask_distill_weight", 1.0),
+        mask_student_weight=trainer_cfg.get("mask_student_weight", 1.0),
+        mask_joint_weight=trainer_cfg.get("mask_joint_weight", 0.05),
+        nce_weight=trainer_cfg.get("nce_weight", 0.5),
+        nce_type=trainer_cfg.get("nce_type", "hard"),
+        nce_tau=trainer_cfg.get("nce_tau", 0.1),
+        nce_tau_teacher=trainer_cfg.get("nce_tau_teacher", 0.2),
+        vicreg_weight=trainer_cfg.get("vicreg_weight", 0.03),
         bce_weight=trainer_cfg.get("bce_weight", 0.0),
         dice_weight=trainer_cfg.get("dice_weight", 0.0),
         min_points_per_mask=trainer_cfg.get("min_points_per_mask", 10),

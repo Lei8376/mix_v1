@@ -71,6 +71,7 @@ model:
   mask_embedding_dim: 256
   fused_embedding_dim: 256
   pc_last_dim: 256
+  alpha_max: 0.2
 
 # ============================================================
 # 训练超参数配置
@@ -114,7 +115,14 @@ trainer:
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
-  mask_distill_weight: 1.0
+  mask_distill_weight: 1.0     # legacy single-loss weight; Method A uses split weights below
+  mask_student_weight: 1.0     # L_mask(pred_3d, fused.detach())
+  mask_joint_weight: 0.05      # L_mask(pred_3d, fused)
+  nce_weight: 0.5
+  nce_type: "hard"             # hard or soft
+  nce_tau: 0.1
+  nce_tau_teacher: 0.2
+  vicreg_weight: 0.03
   bce_weight: 0.0            # 论文主 loss 不使用 BCE 辅助项
   dice_weight: 0.0           # 论文主 loss 不使用 Dice 辅助项
   min_points_per_mask: 8  # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss、

@@ -187,6 +187,14 @@ point_scores = sigmoid(pred_mask_logits) @ mask_class_probs
 `fused_embeddings(256)` 与 ODISE `text256` 的相似度结果；`Final-PC` 仍会记录，
 但不再参与 best checkpoint 选择。
 
+## 方案记录
+
+新分支 `method-a-hybrid-fusion-reg` 已实现下一阶段的 Hybrid 语义稳定训练方案：
+
+- `record/2026-05-12_method_a_hybrid_fusion_reg.md`
+
+核心是 mask loss 梯度分流、跨模态 NCE 主导 fused token 语义结构，以及 VICReg 稳定 refine 前后的表示空间。
+
 ## 运行命令
 
 单卡训练：

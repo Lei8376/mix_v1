@@ -279,7 +279,7 @@ class AdaptiveFusion(nn.Module):
 
 
 class ODISEPixelMaskFusionNet(nn.Module):
-    def __init__(self, pixel_dim, mask_dim=256, out_dim=256):
+    def __init__(self, pixel_dim, mask_dim=256, out_dim=256, alpha_max=0.2):
         super().__init__()
 
         self.pixel_proj = nn.Linear(pixel_dim, out_dim)
@@ -292,16 +292,20 @@ class ODISEPixelMaskFusionNet(nn.Module):
         )
         nn.init.constant_(self.gate.bias, -2.0)  # bias toward mask-dominant fusion
 
-        # ODISE-residual fusion in ODISE's native space:
-        # final = raw_odise_tokens + alpha * refine(raw_odise_tokens + gate * projected_lseg_tokens).
-        # Keep alpha learnable/adaptive, matching the original mix2_v1 backup.
-        self.alpha = nn.Parameter(torch.tensor(1.0))
+        # ODISE-residual fusion in ODISE's native space. Keep the residual
+        # bounded so refine cannot immediately dominate the text-readable token.
+        self.alpha_raw = nn.Parameter(torch.tensor(-1.5))
+        self.alpha_max = alpha_max
 
-    def forward(self, pixel_embed, mask_embed, masks, valid_mask):
+    @property
+    def alpha(self):
+        return self.alpha_max * torch.sigmoid(self.alpha_raw)
+
+    def forward(self, pixel_embed, mask_embed, masks, valid_mask, return_aux=False):
         """
         pixel_embed: either (B, H, W, Cp) pixel-level features, or (B, K, Cp) pre-pooled per-mask features.
         Returns:
-            fused_embed: (B, K, C_out)
+            fused_embed: (B, K, C_out), or an aux dict when return_aux=True.
         """
         assert mask_embed.dim() == 3, "mask_embed must be (B,K,C)"
         assert masks.dim() == 4, "masks must be (B,K,H,W)"
@@ -332,11 +336,31 @@ class ODISEPixelMaskFusionNet(nn.Module):
         pixel_tokens = self.pixel_proj(pixel_pooled)  # (B,K,C_out)
 
         gate = torch.sigmoid(self.gate(torch.cat([mask_tokens, pixel_tokens], dim=-1)))
-        delta = self.refine(mask_tokens + gate * pixel_tokens)
-        fused = mask_tokens + self.alpha * delta
+        base = mask_tokens + gate * pixel_tokens
+        delta = self.refine(base)
+        alpha = self.alpha
+        fused = mask_tokens + alpha * delta
 
-        fused = fused * valid_mask.unsqueeze(-1).float()
-        return fused
+        valid_float = valid_mask.unsqueeze(-1).float()
+        mask_tokens = mask_tokens * valid_float
+        pixel_tokens = pixel_tokens * valid_float
+        base = base * valid_float
+        delta = delta * valid_float
+        fused = fused * valid_float
+        gate = gate * valid_float
+
+        if not return_aux:
+            return fused
+
+        return {
+            "fused": fused,
+            "mask_tokens": mask_tokens,
+            "pixel_tokens": pixel_tokens,
+            "base": base,
+            "delta": delta,
+            "gate": gate,
+            "alpha": alpha,
+        }
 
 
 def pad_mask_embeddings(mask_embeds_list):

@@ -129,6 +129,8 @@ class MaskDistillCriteria(nn.Module):
         results:    dict,
         batch_input: dict,
         mask_distill_weight: float = 1.0,
+        mask_student_weight: float = 1.0,
+        mask_joint_weight:   float = 0.05,
         bce_weight:          float = 0.0,
         dice_weight:         float = 0.0,
         min_points_per_mask: int   = 10,
@@ -138,6 +140,8 @@ class MaskDistillCriteria(nn.Module):
         super().__init__()
 
         self.mask_distill_weight = mask_distill_weight
+        self.mask_student_weight = mask_student_weight
+        self.mask_joint_weight   = mask_joint_weight
         self.bce_weight          = bce_weight
         self.dice_weight         = dice_weight
         self.min_points_per_mask = min_points_per_mask
@@ -159,7 +163,7 @@ class MaskDistillCriteria(nn.Module):
     # ----------------------------------------------------------
     # 主损失：mask-level cosine distillation
     # ----------------------------------------------------------
-    def _mask_distill_loss(self):
+    def _mask_distill_loss(self, logits_key: str = "pred_mask_logits"):
         """
         逐 batch item 计算 mask distillation loss。
 
@@ -198,7 +202,7 @@ class MaskDistillCriteria(nn.Module):
 
             # 直接取模型前向算好的 logits（已含 normalize + logit_scale）
             # shape: (N_pts_b, K_max)，无效 slot 为 -inf
-            pred_logits_full = self.outputs[b][0]["pred_mask_logits"]   # (N_b, K_max)
+            pred_logits_full = self.outputs[b][0][logits_key]   # (N_b, K_max)
 
             # 只取有效 slot
             pred_logits = pred_logits_full[:, valid_k].float()  # (N_b, K_valid)
@@ -345,19 +349,27 @@ class MaskDistillCriteria(nn.Module):
     def compute_loss(self):
         """
         总损失：
-            L = mask_distill_weight * L_mask_distill
+            L = mask_student_weight * L_mask_student
+              + mask_joint_weight * L_mask_joint
               + bce_weight * L_bce  (默认 0)
               + dice_weight * L_dice (默认 0)
 
         返回 (total_loss, loss_dict)
         """
-        l_mask_distill = self._mask_distill_loss()
+        l_mask_student = self._mask_distill_loss("pred_mask_logits_detached_teacher")
+        l_mask_joint   = self._mask_distill_loss("pred_mask_logits")
         l_aux          = self._aux_loss()
 
-        total = self.mask_distill_weight * l_mask_distill + l_aux
+        total = (
+            self.mask_student_weight * l_mask_student
+            + self.mask_joint_weight * l_mask_joint
+            + l_aux
+        )
 
         loss_dict = {
-            "loss_mask_distill": l_mask_distill.item(),
+            "loss_mask_distill": l_mask_student.item(),
+            "loss_mask_student": l_mask_student.item(),
+            "loss_mask_joint":   l_mask_joint.item(),
             "loss_aux":          l_aux.item() if isinstance(l_aux, torch.Tensor) else float(l_aux),
             "loss_total":        total.item(),
         }
