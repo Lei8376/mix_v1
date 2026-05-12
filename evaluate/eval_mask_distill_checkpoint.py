@@ -158,7 +158,7 @@ def main():
         pixel_embedding_dim=model_cfg.get("pixel_embedding_dim", 512),
         mask_embedding_dim=model_cfg.get("mask_embedding_dim", 256),
         fused_embedding_dim=model_cfg.get("fused_embedding_dim", 256),
-        alpha_max=model_cfg.get("alpha_max", 0.2),
+        alpha_max=model_cfg.get("alpha_max", 0.5),
         pc_last_dim=model_cfg.get("pc_last_dim", 256),
     )
     model = OpenVocab3DFusionModelV2(model_config).to(device)

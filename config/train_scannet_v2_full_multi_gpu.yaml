@@ -71,7 +71,7 @@ model:
   mask_embedding_dim: 256
   fused_embedding_dim: 256
   pc_last_dim: 256
-  alpha_max: 0.2
+  alpha_max: 0.5
 
 # ============================================================
 # 训练超参数配置
@@ -109,23 +109,22 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/hfg
-  
-  log_dir: runs/hfg
+  checkpoint_dir: checkpoints/hfg.2
+  log_dir: runs/hfg.2
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
   mask_distill_weight: 1.0     # legacy single-loss weight; Method A uses split weights below
   mask_student_weight: 1.0     # L_mask(pred_3d, fused.detach())
-  mask_joint_weight: 0.05      # L_mask(pred_3d, fused)
+  mask_joint_weight: 0.02     # L_mask(pred_3d, fused)
   nce_weight: 0.5
   nce_type: "soft"             # hard or soft
   nce_tau: 0.1
   nce_tau_teacher: 0.5
-  vicreg_weight: 0.01
+  vicreg_weight: 0.0
   bce_weight: 0.0            # 论文主 loss 不使用 BCE 辅助项
   dice_weight: 0.0           # 论文主 loss 不使用 Dice 辅助项
-  min_points_per_mask: 5  # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss、
+  min_points_per_mask: 8  # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss、
                              # - 过滤 GT 中正样本过少的 mask（可能是噪声）
                              # - 推荐值: 5-10
                              # - 太高: 过滤太严，有效样本少
@@ -157,7 +156,7 @@ trainer:
   eval_split: val  # 训练阶段验证统一使用 val，不使用 test
 
   # 【可选】恢复训练
-  resume: "checkpoints/hfg/checkpoint_epoch_2.pth"
+  # resume: "checkpoints/hfg/checkpoint_epoch_2.pth"
 
 # ============================================================
 # 随机种子（确保可复现性）

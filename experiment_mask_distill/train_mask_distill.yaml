@@ -38,7 +38,7 @@ model:
   mask_embedding_dim: 256
   fused_embedding_dim: 256
   pc_last_dim: 256
-  alpha_max: 0.2
+  alpha_max: 0.5
 
 trainer:
   # ----- 学习率 -----

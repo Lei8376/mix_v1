@@ -279,7 +279,7 @@ class AdaptiveFusion(nn.Module):
 
 
 class ODISEPixelMaskFusionNet(nn.Module):
-    def __init__(self, pixel_dim, mask_dim=256, out_dim=256, alpha_max=0.2):
+    def __init__(self, pixel_dim, mask_dim=256, out_dim=256, alpha_max=0.5):
         super().__init__()
 
         self.pixel_proj = nn.Linear(pixel_dim, out_dim)
@@ -294,7 +294,7 @@ class ODISEPixelMaskFusionNet(nn.Module):
 
         # ODISE-residual fusion in ODISE's native space. Keep the residual
         # bounded so refine cannot immediately dominate the text-readable token.
-        self.alpha_raw = nn.Parameter(torch.tensor(-1.5))
+        self.alpha_raw = nn.Parameter(torch.tensor(-1.386))  # alpha starts at ≈0.1 when alpha_max=0.5
         self.alpha_max = alpha_max
 
     @property

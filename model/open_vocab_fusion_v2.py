@@ -29,7 +29,7 @@ class OpenVocabFusionModelV2Config:
     mask_embedding_dim: int = 256
     pixel_embedding_dim: int = 512
     fused_embedding_dim: int = 256
-    alpha_max: float = 0.2
+    alpha_max: float = 0.5
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
     lseg_ckpt_path: Optional[str] = None

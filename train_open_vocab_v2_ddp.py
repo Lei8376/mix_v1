@@ -418,7 +418,7 @@ def main() -> None:
         pixel_embedding_dim=_model.get("pixel_embedding_dim", 512),
         mask_embedding_dim=_model.get("mask_embedding_dim", 256),
         fused_embedding_dim=_model.get("fused_embedding_dim", 256),
-        alpha_max=_model.get("alpha_max", 0.2),
+        alpha_max=_model.get("alpha_max", 0.5),
         pc_last_dim=_model.get("pc_last_dim", 256),
     )
 
