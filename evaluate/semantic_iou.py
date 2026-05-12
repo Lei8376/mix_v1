@@ -269,7 +269,7 @@ def compute_iou(
     class_names: Sequence[str] = SCANNET_LABELS_20,
     eps: float = 1e-10,
 ) -> Dict:
-    """Convert accumulated OpenScene histograms to mIoU and per-class IoU."""
+    """Convert accumulated OpenScene histograms to mIoU/mAcc and per-class stats."""
     inter = torch.as_tensor(intersection, dtype=torch.float64).cpu().numpy()
     uni = torch.as_tensor(union, dtype=torch.float64).cpu().numpy()
     tgt = None if target is None else torch.as_tensor(target).cpu().numpy()
@@ -280,10 +280,23 @@ def compute_iou(
         for i in range(min(len(class_names), len(uni)))
         if valid[i]
     }
+    if tgt is not None:
+        valid_acc = tgt > 0
+        per_class_acc = {
+            class_names[i]: float(inter[i] / (tgt[i] + eps))
+            for i in range(min(len(class_names), len(tgt)))
+            if valid_acc[i]
+        }
+    else:
+        valid_acc = np.zeros_like(valid, dtype=bool)
+        per_class_acc = {}
     result = {
         "miou": float(np.mean(list(per_class_iou.values()))) if per_class_iou else 0.0,
+        "macc": float(np.mean(list(per_class_acc.values()))) if per_class_acc else 0.0,
         "per_class_iou": per_class_iou,
+        "per_class_acc": per_class_acc,
         "n_valid_classes": int(valid.sum()),
+        "n_valid_classes_acc": int(valid_acc.sum()),
     }
     if tgt is not None:
         result["target"] = {
@@ -649,8 +662,11 @@ class _SemanticAccumulator:
         result = compute_iou(self.intersection, self.union, self.target, self.class_names)
         return {
             prefix: result["miou"],
+            prefix.replace("miou", "macc"): result["macc"],
             f"per_class_iou_{prefix}": result["per_class_iou"],
+            f"per_class_acc_{prefix}": result["per_class_acc"],
             f"n_valid_classes_{prefix}": result["n_valid_classes"],
+            f"n_valid_classes_acc_{prefix}": result["n_valid_classes_acc"],
             f"target_{prefix}": result["target"],
         }
 
@@ -700,8 +716,11 @@ class Diff2SceneSemanticEvaluator:
         result = self.acc.compute("semantic_miou_diff2scene")
         return {
             "semantic_miou_diff2scene": result["semantic_miou_diff2scene"],
+            "semantic_macc_diff2scene": result["semantic_macc_diff2scene"],
             "per_class_iou_diff2scene": result["per_class_iou_semantic_miou_diff2scene"],
+            "per_class_acc_diff2scene": result["per_class_acc_semantic_miou_diff2scene"],
             "n_valid_classes": result["n_valid_classes_semantic_miou_diff2scene"],
+            "n_valid_classes_acc": result["n_valid_classes_acc_semantic_miou_diff2scene"],
             "target": result["target_semantic_miou_diff2scene"],
         }
 
@@ -764,8 +783,11 @@ class Diff2SceneSemanticMIoUTracker:
         result = self.acc.compute("semantic_miou_diff2scene")
         return {
             "semantic_miou_diff2scene": result["semantic_miou_diff2scene"],
+            "semantic_macc_diff2scene": result["semantic_macc_diff2scene"],
             "per_class_iou_diff2scene": result["per_class_iou_semantic_miou_diff2scene"],
+            "per_class_acc_diff2scene": result["per_class_acc_semantic_miou_diff2scene"],
             "n_valid_classes": result["n_valid_classes_semantic_miou_diff2scene"],
+            "n_valid_classes_acc": result["n_valid_classes_acc_semantic_miou_diff2scene"],
             "target": result["target_semantic_miou_diff2scene"],
         }
 
@@ -872,11 +894,20 @@ class ODISEPCSemanticMIoUTracker:
             "semantic_miou_hybrid_text": hybrid["semantic_miou_hybrid_text"],
             "semantic_miou_clip_text": clip["semantic_miou_clip_text"],
             "semantic_miou_pc": pc["semantic_miou_pc"],
+            "semantic_macc_hybrid_text": hybrid["semantic_macc_hybrid_text"],
+            "semantic_macc_clip_text": clip["semantic_macc_clip_text"],
+            "semantic_macc_pc": pc["semantic_macc_pc"],
             "per_class_iou_hybrid_text": hybrid["per_class_iou_semantic_miou_hybrid_text"],
             "per_class_iou_clip_text": clip["per_class_iou_semantic_miou_clip_text"],
             "per_class_iou_pc": pc["per_class_iou_semantic_miou_pc"],
+            "per_class_acc_hybrid_text": hybrid["per_class_acc_semantic_miou_hybrid_text"],
+            "per_class_acc_clip_text": clip["per_class_acc_semantic_miou_clip_text"],
+            "per_class_acc_pc": pc["per_class_acc_semantic_miou_pc"],
             "n_valid_classes_hybrid_text": hybrid["n_valid_classes_semantic_miou_hybrid_text"],
             "n_valid_classes_clip_text": clip["n_valid_classes_semantic_miou_clip_text"],
             "n_valid_classes_pc": pc["n_valid_classes_semantic_miou_pc"],
+            "n_valid_classes_acc_hybrid_text": hybrid["n_valid_classes_acc_semantic_miou_hybrid_text"],
+            "n_valid_classes_acc_clip_text": clip["n_valid_classes_acc_semantic_miou_clip_text"],
+            "n_valid_classes_acc_pc": pc["n_valid_classes_acc_semantic_miou_pc"],
             "target": pc["target_semantic_miou_pc"],
         }

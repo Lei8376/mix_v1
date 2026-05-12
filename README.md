@@ -68,6 +68,19 @@ fused        = mask_tokens + alpha * delta  # 256
 
 当前 `alpha` 是可学习参数，初始值 `1.0`。
 
+`alpha` 现在可在配置文件的 `model` 段控制：
+
+```yaml
+model:
+  alpha_mode: learnable  # learnable 或 fixed
+  alpha_init: 1.0
+  alpha_max: 2.0      # 只在 learnable 模式使用
+```
+
+- `alpha_mode: learnable`：`alpha` 从 `alpha_init` 初始化，并通过 sigmoid 参数化限制在 `[0, alpha_max]` 内自学习。
+- `alpha_mode: fixed`：`alpha` 固定为 `alpha_init`，不参与训练，没有 `alpha_max`/`alpha_min` 的概念；例如固定为 `1.0` 就设 `alpha_init: 1.0`。
+- 旧 checkpoint 中直接保存的 `fuse_embed.alpha` 会在加载时转换到新的 bounded alpha 参数；如果切换到 fixed 模式，配置文件里的固定值优先。
+
 注意：旧的 `768` 或 `512` 维 checkpoint 不能直接恢复到当前 `256` 维模型，相关投影层和 3D decoder 的参数形状会不匹配。重新训练时保持 `resume: ""`。当前主配置已经把 `resume` 清空，并把输出目录改成：
 
 - `checkpoints/diff2scene_hybrid_lseg_odise256_fusion`
@@ -239,3 +252,49 @@ cd /home/sunl/work/mix_v1
 conda activate mix
 tensorboard --logdir runs --host 0.0.0.0 --port 6006
 ```
+
+
+2. 模型有没有变化？
+2.1 融合网络主体没有明显变化
+
+两个分支的配置都还是：
+
+pixel_embedding_dim: 512
+mask_embedding_dim: 256
+fused_embedding_dim: 256
+pc_last_dim: 256
+
+也就是说，LSeg 512D + ODISE 256D → fused 256D 这个模型设计没有变。main 配置如此，run_in_test03_main 配置也是如此。
+
+2.2 但是 point-mask logits 的计算变了
+
+这是最重要的差异。
+
+当前 main 里，3D 点特征和 mask token 计算 logits 时使用了归一化和 logit_scale：
+
+point_features = F.normalize(pred_3d[point_mask], dim=-1)
+mask_tokens_norm = F.normalize(mask_tokens, dim=-1)
+logits = logit_scale * (point_features @ mask_tokens_norm.t())
+
+也就是优化角度相似度，和文本空间评估更一致。
+
+但是 run_in_test03_main 里这一段被改成了不归一化、不乘 logit_scale：
+
+point_features = pred_3d[point_mask]
+mask_tokens_unnorm = mask_tokens
+logits = point_features @ mask_tokens_unnorm.t()
+
+而且代码注释里写了“怀疑梯度消失”。
+
+所以这里必须明确：
+模型主体没变，但 forward 行为变了。这个变化会直接影响训练 loss、mask prediction、semantic eval，不是单纯评估变化。
+
+这个区别很大。因为归一化版本学的是：
+
+点特征方向 ↔ mask token 方向
+
+非归一化版本学的是：
+
+点特征范数 × mask token 范数 × 方向相似度
+
+后者可能让模型通过放大/缩小 feature norm 来降低 loss，而不一定提升语义方向。

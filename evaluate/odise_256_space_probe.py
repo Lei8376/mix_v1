@@ -188,6 +188,7 @@ def _make_loader(config: dict, split: str, max_samples: int, batch_size: int, nu
 
 def _build_model(config: dict, checkpoint_path: str, device: torch.device):
     model_cfg = config.get("model") or {}
+    alpha_max = model_cfg.get("alpha_max", 2.0)
     model = OpenVocab3DFusionModelV2(
         OpenVocabFusionModelV2Config(
             device=str(device),
@@ -196,6 +197,9 @@ def _build_model(config: dict, checkpoint_path: str, device: torch.device):
             mask_embedding_dim=model_cfg.get("mask_embedding_dim", 256),
             fused_embedding_dim=model_cfg.get("fused_embedding_dim", 256),
             pc_last_dim=model_cfg.get("pc_last_dim", 256),
+            alpha_mode=model_cfg.get("alpha_mode", "learnable"),
+            alpha_init=float(model_cfg.get("alpha_init", 1.0)),
+            alpha_max=None if alpha_max is None else float(alpha_max),
         )
     ).to(device)
     checkpoint, missing, unexpected = _load_model_state(model, checkpoint_path, str(device))

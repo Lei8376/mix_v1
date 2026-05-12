@@ -170,6 +170,7 @@ def main():
         collate_fn=open_vocab_collate_v2,
     )
 
+    alpha_max = model_cfg.get("alpha_max", 2.0)
     model = OpenVocab3DFusionModelV2(
         OpenVocabFusionModelV2Config(
             device=str(device),
@@ -178,6 +179,9 @@ def main():
             mask_embedding_dim=model_cfg.get("mask_embedding_dim", 256),
             fused_embedding_dim=model_cfg.get("fused_embedding_dim", 256),
             pc_last_dim=model_cfg.get("pc_last_dim", 256),
+            alpha_mode=model_cfg.get("alpha_mode", "learnable"),
+            alpha_init=float(model_cfg.get("alpha_init", 1.0)),
+            alpha_max=None if alpha_max is None else float(alpha_max),
         )
     ).to(device)
     checkpoint, missing, unexpected = _load_model_state(model, args.checkpoint, str(device))

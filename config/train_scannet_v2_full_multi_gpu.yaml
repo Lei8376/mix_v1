@@ -21,7 +21,7 @@ dataloader:
                   # - 单卡时: 总批大小
                   # - 显存不足时可减小到 4 或 2
   
-  num_workers: 12  # 数据加载线程数
+  num_workers: 16  # 数据加载线程数
                   # - 单卡建议: 4-8
                   # - 多卡建议: 8-16
                   # - 过大会占用过多内存
@@ -66,6 +66,12 @@ model:
   mask_embedding_dim: 256
   fused_embedding_dim: 256
   pc_last_dim: 256
+  # ODISE-residual fusion alpha:
+  #   learnable: alpha 从 alpha_init 初始化，并被限制在 [0, alpha_max] 内自学习
+  #   fixed:     alpha 固定为 alpha_init，不参与训练；此时 alpha_max 不使用
+  alpha_mode: learnable
+  alpha_init: 1.0
+  alpha_max: 2.0  # 只在 alpha_mode=learnable 时使用
 
 # ============================================================
 # 训练超参数配置
@@ -143,7 +149,7 @@ trainer:
   semantic_prompt_template: "a photo of a {}"
   
   # 【可选】恢复训练
-  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_8.pth  # 续训使用最新 256D epoch checkpoint
+  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_12.pth  # 续训使用最新 256D epoch checkpoint
 
 # ============================================================
 # 随机种子（确保可复现性）

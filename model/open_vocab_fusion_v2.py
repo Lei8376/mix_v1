@@ -29,6 +29,9 @@ class OpenVocabFusionModelV2Config:
     mask_embedding_dim: int = 256
     pixel_embedding_dim: int = 512
     fused_embedding_dim: int = 256
+    alpha_mode: str = "learnable"
+    alpha_init: float = 1.0
+    alpha_max: Optional[float] = 2.0
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
     lseg_ckpt_path: Optional[str] = None
@@ -64,6 +67,9 @@ class OpenVocab3DFusionModelV2(nn.Module):
             pixel_dim=config.pixel_embedding_dim,
             mask_dim=config.mask_embedding_dim,
             out_dim=config.fused_embedding_dim,
+            alpha_mode=config.alpha_mode,
+            alpha_init=config.alpha_init,
+            alpha_max=config.alpha_max,
         )
 
         # Learnable temperature for similarity

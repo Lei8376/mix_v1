@@ -2,7 +2,7 @@ import logging
 import numpy as np
 import operator
 from collections import OrderedDict
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 #import diffdist.functional as diff_dist
 import torch
 from detectron2.modeling.postprocessing import sem_seg_postprocess
@@ -278,9 +278,35 @@ class AdaptiveFusion(nn.Module):
         return g * pixel_feat + (1 - g) * mask_feat
 
 
+def _alpha_to_raw(alpha: float, alpha_max: float) -> float:
+    if alpha_max <= 0:
+        raise ValueError("alpha_max must be positive.")
+    eps = 1e-6
+    ratio = min(max(float(alpha) / float(alpha_max), eps), 1.0 - eps)
+    return float(torch.logit(torch.tensor(ratio)).item())
+
+
 class ODISEPixelMaskFusionNet(nn.Module):
-    def __init__(self, pixel_dim, mask_dim=256, out_dim=256):
+    def __init__(
+        self,
+        pixel_dim,
+        mask_dim=256,
+        out_dim=256,
+        alpha_mode: str = "learnable",
+        alpha_init: float = 1.0,
+        alpha_max: Optional[float] = 2.0,
+    ):
         super().__init__()
+        alpha_mode = str(alpha_mode).lower()
+        if alpha_mode not in {"learnable", "fixed"}:
+            raise ValueError(f"alpha_mode must be 'learnable' or 'fixed', got {alpha_mode!r}")
+        if alpha_init < 0:
+            raise ValueError("alpha_init must be non-negative.")
+        if alpha_mode == "learnable":
+            if alpha_max is None or alpha_max <= 0:
+                raise ValueError("learnable alpha requires a positive alpha_max.")
+            if alpha_init >= alpha_max:
+                raise ValueError("learnable alpha requires alpha_init < alpha_max.")
 
         self.pixel_proj = nn.Linear(pixel_dim, out_dim)
         self.mask_proj = nn.Identity() if mask_dim == out_dim else MaskTokenProjector(mask_dim, out_dim)
@@ -294,8 +320,67 @@ class ODISEPixelMaskFusionNet(nn.Module):
 
         # ODISE-residual fusion in ODISE's native space:
         # final = raw_odise_tokens + alpha * refine(raw_odise_tokens + gate * projected_lseg_tokens).
-        # Keep alpha learnable/adaptive, matching the original mix2_v1 backup.
-        self.alpha = nn.Parameter(torch.tensor(1.0))
+        # alpha can be either a bounded learnable scalar or a fixed scalar from config.
+        self.alpha_mode = alpha_mode
+        if alpha_mode == "learnable":
+            self.register_buffer("alpha_max", torch.tensor(float(alpha_max)))
+            raw_alpha = _alpha_to_raw(alpha_init, alpha_max)
+            self.raw_alpha = nn.Parameter(torch.tensor(raw_alpha, dtype=torch.float32))
+        else:
+            # Keep a non-trainable parameter so optimizer checkpoint loading can
+            # continue from runs that previously had a learnable alpha parameter.
+            self.raw_alpha = nn.Parameter(
+                torch.tensor(float(alpha_init), dtype=torch.float32),
+                requires_grad=False,
+            )
+
+    @property
+    def alpha(self):
+        if self.alpha_mode == "fixed":
+            return self.raw_alpha
+        return self.alpha_max * torch.sigmoid(self.raw_alpha)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Old checkpoints stored a direct unconstrained scalar at `fuse_embed.alpha`.
+        # Convert it to the current bounded raw parameter when alpha is learnable.
+        old_alpha_key = prefix + "alpha"
+        raw_alpha_key = prefix + "raw_alpha"
+        alpha_max_key = prefix + "alpha_max"
+
+        if self.alpha_mode == "fixed":
+            # Fixed alpha is always controlled by the current YAML value.
+            state_dict.pop(old_alpha_key, None)
+            state_dict.pop(alpha_max_key, None)
+            state_dict[raw_alpha_key] = self.raw_alpha.detach().clone()
+        else:
+            # Keep alpha_max governed by the current YAML config.
+            state_dict[alpha_max_key] = self.alpha_max.detach().clone()
+        if self.alpha_mode == "learnable" and old_alpha_key in state_dict and raw_alpha_key not in state_dict:
+            alpha_value = float(torch.as_tensor(state_dict.pop(old_alpha_key)).item())
+            state_dict[raw_alpha_key] = torch.tensor(
+                _alpha_to_raw(alpha_value, float(self.alpha_max.item())),
+                dtype=self.raw_alpha.dtype,
+                device=self.raw_alpha.device,
+            )
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, pixel_embed, mask_embed, masks, valid_mask):
         """

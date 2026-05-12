@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -25,6 +25,9 @@ class OpenVocabFusionModelConfig:
     mask_embedding_dim: int = 256
     pixel_embedding_dim: int = 512
     fused_embedding_dim: int = 256
+    alpha_mode: str = "learnable"
+    alpha_init: float = 1.0
+    alpha_max: Optional[float] = 2.0
 
 
 class OpenVocab3DFusionModel(nn.Module):
@@ -47,6 +50,9 @@ class OpenVocab3DFusionModel(nn.Module):
             pixel_dim=config.pixel_embedding_dim,
             mask_dim=config.mask_embedding_dim,
             out_dim=config.fused_embedding_dim,
+            alpha_mode=config.alpha_mode,
+            alpha_init=config.alpha_init,
+            alpha_max=config.alpha_max,
         )
         self.logit_scale = nn.Parameter(
             torch.ones([], device=self.device) * np.log(DEFAULT_LOGIT_SCALE)

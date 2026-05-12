@@ -388,6 +388,7 @@ def main() -> None:
         lseg_ckpt_path = os.path.join(repo_root, lseg_ckpt_path)
     if odise_config_path:
         odise_config_path = resolve_odise_config_path(odise_config_path, repo_root)
+    alpha_max = _model.get("alpha_max", 2.0)
 
     model_config = OpenVocabFusionModelV2Config(
         device=device,
@@ -399,6 +400,9 @@ def main() -> None:
         mask_embedding_dim=_model.get("mask_embedding_dim", 256),
         fused_embedding_dim=_model.get("fused_embedding_dim", 256),
         pc_last_dim=_model.get("pc_last_dim", 256),
+        alpha_mode=_model.get("alpha_mode", "learnable"),
+        alpha_init=float(_model.get("alpha_init", 1.0)),
+        alpha_max=None if alpha_max is None else float(alpha_max),
     )
 
     # Trainer config

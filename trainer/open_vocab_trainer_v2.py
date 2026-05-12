@@ -678,13 +678,16 @@ class OpenVocabTrainerV2:
         # 语义 mIoU：Diff2Scene Eq.3
         val_metrics["semantic_miou"]   = 0.0
         val_metrics["semantic_miou_diff2scene"] = 0.0
+        val_metrics["semantic_macc_diff2scene"] = 0.0
         val_metrics["n_valid_classes"] = 0
         if sem_tracker is not None:
             sem_res = sem_tracker.compute()
             val_metrics["semantic_miou"] = sem_res["semantic_miou_diff2scene"]
             val_metrics["semantic_miou_diff2scene"] = sem_res["semantic_miou_diff2scene"]
+            val_metrics["semantic_macc_diff2scene"] = sem_res["semantic_macc_diff2scene"]
             val_metrics["n_valid_classes"] = sem_res["n_valid_classes"]
             val_metrics["per_class_iou_diff2scene"] = sem_res.get("per_class_iou_diff2scene", {})
+            val_metrics["per_class_acc_diff2scene"] = sem_res.get("per_class_acc_diff2scene", {})
 
         return val_metrics
 
@@ -869,13 +872,18 @@ class OpenVocabTrainerV2:
                         self.writer.add_scalar("Metrics/Accuracy",                  val_metrics["accuracy"],                        epoch)
                         self.writer.add_scalar("Metrics/mAcc",                      val_metrics.get("macc", 0),                     epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_Diff2Scene",  val_metrics.get("semantic_miou_diff2scene", 0), epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mAcc_Diff2Scene",  val_metrics.get("semantic_macc_diff2scene", 0), epoch)
                         if "per_class_iou_diff2scene" in val_metrics:
                             for cls_name, iou_val in val_metrics["per_class_iou_diff2scene"].items():
                                 self.writer.add_scalar(f"PerClass_IoU_D2S/{cls_name}", iou_val, epoch)
+                        if "per_class_acc_diff2scene" in val_metrics:
+                            for cls_name, acc_val in val_metrics["per_class_acc_diff2scene"].items():
+                                self.writer.add_scalar(f"PerClass_Acc_D2S/{cls_name}", acc_val, epoch)
                     print(
                         f"  Val Loss: {val_metrics['loss']:.4f} "
                         f"[MaskIoU] {val_metrics.get('miou', 0):.4f}  "
-                        f"[语义mIoU-D2S] {val_metrics.get('semantic_miou_diff2scene', 0):.4f} "
+                        f"[语义-D2S] mIoU={val_metrics.get('semantic_miou_diff2scene', 0):.4f} "
+                        f"mAcc={val_metrics.get('semantic_macc_diff2scene', 0):.4f} "
                         f"({val_metrics.get('n_valid_classes', 0)} classes)  "
                         f"Acc: {val_metrics['accuracy']:.4f}"
                     )

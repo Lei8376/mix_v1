@@ -535,6 +535,9 @@ class MaskDistillTrainer:
             "semantic_miou_hybrid_text": 0.0,
             "semantic_miou_clip_text":   0.0,
             "semantic_miou_final":       0.0,
+            "semantic_macc_hybrid_text": 0.0,
+            "semantic_macc_clip_text":   0.0,
+            "semantic_macc_final":       0.0,
             "n_valid_classes_hybrid":    0,
             "n_valid_classes_clip":      0,
             "n_valid_classes_final":     0,
@@ -548,12 +551,18 @@ class MaskDistillTrainer:
             val_metrics["semantic_miou_clip_text"] = pc_res["semantic_miou_clip_text"]
             val_metrics["semantic_miou_final"] = pc_res["semantic_miou_pc"]
             val_metrics["semantic_miou"] = pc_res["semantic_miou_pc"]
+            val_metrics["semantic_macc_hybrid_text"] = pc_res["semantic_macc_hybrid_text"]
+            val_metrics["semantic_macc_clip_text"] = pc_res["semantic_macc_clip_text"]
+            val_metrics["semantic_macc_final"] = pc_res["semantic_macc_pc"]
             val_metrics["n_valid_classes_hybrid"] = pc_res["n_valid_classes_hybrid_text"]
             val_metrics["n_valid_classes_clip"] = pc_res["n_valid_classes_clip_text"]
             val_metrics["n_valid_classes_final"] = pc_res["n_valid_classes_pc"]
             val_metrics["per_class_iou_hybrid_text"] = pc_res.get("per_class_iou_hybrid_text", {})
             val_metrics["per_class_iou_clip_text"] = pc_res.get("per_class_iou_clip_text", {})
             val_metrics["per_class_iou_final"] = pc_res.get("per_class_iou_pc", {})
+            val_metrics["per_class_acc_hybrid_text"] = pc_res.get("per_class_acc_hybrid_text", {})
+            val_metrics["per_class_acc_clip_text"] = pc_res.get("per_class_acc_clip_text", {})
+            val_metrics["per_class_acc_final"] = pc_res.get("per_class_acc_pc", {})
 
         mask_res = mask_tracker.compute()
         val_metrics["mask_miou"] = mask_res["mask_miou"]
@@ -666,6 +675,9 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("Metrics/Semantic_mIoU_HybridText", val_metrics["semantic_miou_hybrid_text"], epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_CLIPText",   val_metrics["semantic_miou_clip_text"],   epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_FinalPC",    val_metrics["semantic_miou_final"],       epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mAcc_HybridText", val_metrics["semantic_macc_hybrid_text"], epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mAcc_CLIPText",   val_metrics["semantic_macc_clip_text"],   epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mAcc_FinalPC",    val_metrics["semantic_macc_final"],       epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Hybrid",   val_metrics["n_valid_classes_hybrid"],   epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_CLIP",     val_metrics["n_valid_classes_clip"],     epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Final",    val_metrics["n_valid_classes_final"],    epoch)
@@ -676,6 +688,9 @@ class MaskDistillTrainer:
                             "PerClass_IoU_HybridText": val_metrics.get("per_class_iou_hybrid_text", {}),
                             "PerClass_IoU_CLIPText": val_metrics.get("per_class_iou_clip_text", {}),
                             "PerClass_IoU_FinalPC": val_metrics.get("per_class_iou_final", {}),
+                            "PerClass_Acc_HybridText": val_metrics.get("per_class_acc_hybrid_text", {}),
+                            "PerClass_Acc_CLIPText": val_metrics.get("per_class_acc_clip_text", {}),
+                            "PerClass_Acc_FinalPC": val_metrics.get("per_class_acc_final", {}),
                         }
                         for tag_prefix, per_class in per_class_groups.items():
                             for cls_name, iou_val in per_class.items():
@@ -686,14 +701,17 @@ class MaskDistillTrainer:
                     sem_miou_h = val_metrics["semantic_miou_hybrid_text"]
                     sem_miou_c = val_metrics["semantic_miou_clip_text"]
                     sem_miou_final = val_metrics["semantic_miou_final"]
+                    sem_macc_h = val_metrics["semantic_macc_hybrid_text"]
+                    sem_macc_c = val_metrics["semantic_macc_clip_text"]
+                    sem_macc_final = val_metrics["semantic_macc_final"]
                     mask_miou  = val_metrics["mask_miou"]
                     n_cls      = val_metrics["n_valid_classes_final"]
                     print(
                         f"  Val Loss: {val_metrics['loss']:.4f} "
                         f"(distill={val_metrics['loss_mask_distill']:.4f})  "
-                        f"[Hybrid/Text] {sem_miou_h:.4f}  "
-                        f"[CLIP/Text] {sem_miou_c:.4f}  "
-                        f"[Final-PC] {sem_miou_final:.4f} ({n_cls} classes)  "
+                        f"[Hybrid/Text] mIoU={sem_miou_h:.4f} mAcc={sem_macc_h:.4f}  "
+                        f"[CLIP/Text] mIoU={sem_miou_c:.4f} mAcc={sem_macc_c:.4f}  "
+                        f"[Final-PC] mIoU={sem_miou_final:.4f} mAcc={sem_macc_final:.4f} ({n_cls} classes)  "
                         f"[MaskIoU] {mask_miou:.4f} ({val_metrics['n_masks']} masks)"
                     )
                     if self.is_main:

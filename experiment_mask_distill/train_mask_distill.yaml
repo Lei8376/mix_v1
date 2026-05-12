@@ -35,6 +35,9 @@ model:
   mask_embedding_dim: 256
   fused_embedding_dim: 256
   pc_last_dim: 256
+  alpha_mode: learnable  # learnable: 使用 alpha_init/alpha_max；fixed: 只固定为 alpha_init
+  alpha_init: 1.0
+  alpha_max: 2.0  # 只在 alpha_mode=learnable 时使用
 
 trainer:
   # ----- 学习率 -----
