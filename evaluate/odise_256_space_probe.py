@@ -43,6 +43,7 @@ from evaluate.semantic_iou import (  # noqa: E402
     SCANNET_LABELS_20,
     _SemanticAccumulator,
     diff2scene_mask_feature_predict,
+    mask_feature_class_probs,
 )
 from model.open_vocab_fusion_v2 import (  # noqa: E402
     OpenVocab3DFusionModelV2,
@@ -97,12 +98,14 @@ def _apply_probe(source: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 
 
 def _metric(acc: _SemanticAccumulator, name: str) -> dict:
-    out = acc.compute(name)
+    prefix = f"semantic_miou_{name}"
+    out = acc.compute(prefix)
     return {
-        "miou": out[name],
-        "per_class": out[f"per_class_iou_{name}"],
-        "target": out.get(f"target_{name}", {}),
-        "n_valid_classes": out[f"n_valid_classes_{name}"],
+        "miou": out[prefix],
+        "macc": out[f"semantic_macc_{name}"],
+        "per_class": out[f"per_class_iou_{prefix}"],
+        "target": out.get(f"target_{prefix}", {}),
+        "n_valid_classes": out[f"n_valid_classes_{prefix}"],
     }
 
 
@@ -218,6 +221,11 @@ def main():
     parser.add_argument("--max-samples", type=int, default=20)
     parser.add_argument("--probe-train-records", type=int, default=10)
     parser.add_argument("--ridge", type=float, default=1e-3)
+    parser.add_argument(
+        "--mix-lseg-weights",
+        default="0.3,0.5,0.7",
+        help="Comma-separated LSeg weights for normalized ODISE/LSeg semantic-query mixes.",
+    )
     parser.add_argument("--odise-model-config", default="Panoptic/odise_caption_coco_50e.py")
     parser.add_argument("--odise-prompt-template", default="a photo of a {}")
     parser.add_argument("--output-json", default="record/odise_256_space_probe_2026-05-07.json")
@@ -241,6 +249,14 @@ def main():
         args.odise_model_config,
         device,
     )
+    mix_lseg_weights = [
+        float(x.strip())
+        for x in str(args.mix_lseg_weights).split(",")
+        if x.strip()
+    ]
+    for w in mix_lseg_weights:
+        if w < 0.0 or w > 1.0:
+            raise ValueError(f"--mix-lseg-weights values must be in [0,1], got {w}")
 
     train_lseg = []
     train_fused = []
@@ -296,22 +312,28 @@ def main():
         args.ridge,
     )
 
+    def _new_accs():
+        accs = {
+            "odise_raw256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+            "lseg_model_pixel_proj256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+            "lseg512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+            "current_fused_direct_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+            "fused512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+            "mix_odise0.5_model_pixel_proj0.5_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+            "mix_odise0.5_ridge_lseg0.5_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
+        }
+        for w in mix_lseg_weights:
+            odise_w = 1.0 - w
+            key = f"mix_odise{odise_w:.1f}_lseg{w:.1f}_to_odise256_text256"
+            accs[key] = _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL)
+        accs["mix_entropy_conf_clamp02_06_text256"] = _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL)
+        accs["mix_agreement_gate_text256"] = _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL)
+        return accs
+
     split_accs = {
-        "all20": {
-            "odise_raw256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-            "lseg512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-            "fused512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-        },
-        "train10_probe_fit": {
-            "odise_raw256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-            "lseg512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-            "fused512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-        },
-        "test10_probe_eval": {
-            "odise_raw256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-            "lseg512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-            "fused512_to_odise256_text256": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
-        },
+        "all20": _new_accs(),
+        "train10_probe_fit": _new_accs(),
+        "test10_probe_eval": _new_accs(),
     }
 
     with torch.no_grad():
@@ -335,14 +357,61 @@ def main():
                 gt_b = batch["binary_label_3d"][pt_mask].detach().cpu().long()
                 pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
                 odise = batch["mask_embeddings"][b][valid_k].float()
+                lseg_model256 = model.fuse_embed.pixel_proj(batch["pixel_pooled"][b][valid_k].float())
                 lseg256 = _apply_probe(batch["pixel_pooled"][b][valid_k].float(), lseg_to_odise)
                 fused256 = _apply_probe(results["fused_embeddings"][b][valid_k].float(), fused_to_odise)
 
+                odise_norm = F.normalize(odise.float(), dim=-1)
+                lseg_model_norm = F.normalize(lseg_model256.float(), dim=-1)
+                lseg_norm = F.normalize(lseg256.float(), dim=-1)
+                mix_model_proj = F.normalize(0.5 * odise_norm + 0.5 * lseg_model_norm, dim=-1)
+                mix_ridge_proj = F.normalize(0.5 * odise_norm + 0.5 * lseg_norm, dim=-1)
+
                 preds = {
                     "odise_raw256_text256": diff2scene_mask_feature_predict(pred_logits, odise, text256),
+                    "lseg_model_pixel_proj256_text256": diff2scene_mask_feature_predict(
+                        pred_logits, lseg_model256, text256
+                    ),
                     "lseg512_to_odise256_text256": diff2scene_mask_feature_predict(pred_logits, lseg256, text256),
+                    "current_fused_direct_text256": diff2scene_mask_feature_predict(
+                        pred_logits,
+                        results["fused_embeddings"][b][valid_k].float(),
+                        text256,
+                    ),
                     "fused512_to_odise256_text256": diff2scene_mask_feature_predict(pred_logits, fused256, text256),
+                    "mix_odise0.5_model_pixel_proj0.5_text256": diff2scene_mask_feature_predict(
+                        pred_logits, mix_model_proj, text256
+                    ),
+                    "mix_odise0.5_ridge_lseg0.5_text256": diff2scene_mask_feature_predict(
+                        pred_logits, mix_ridge_proj, text256
+                    ),
                 }
+                for w in mix_lseg_weights:
+                    odise_w = 1.0 - w
+                    mix = F.normalize(odise_w * odise_norm + w * lseg_norm, dim=-1)
+                    key = f"mix_odise{odise_w:.1f}_lseg{w:.1f}_to_odise256_text256"
+                    preds[key] = diff2scene_mask_feature_predict(pred_logits, mix, text256)
+
+                odise_probs = mask_feature_class_probs(odise, text256)
+                lseg_probs = mask_feature_class_probs(lseg256, text256)
+                log_c = float(torch.log(torch.tensor(float(len(SCANNET_LABELS_20)), device=odise_probs.device)).item())
+                ent_odise = -(odise_probs * (odise_probs.clamp_min(1e-12)).log()).sum(dim=-1) / log_c
+                ent_lseg = -(lseg_probs * (lseg_probs.clamp_min(1e-12)).log()).sum(dim=-1) / log_c
+                conf_odise = 1.0 - ent_odise
+                conf_lseg = 1.0 - ent_lseg
+                w_lseg_conf = conf_lseg / (conf_lseg + conf_odise + 1e-6)
+                w_lseg_conf = w_lseg_conf.clamp(0.2, 0.6).unsqueeze(-1)
+                mix_conf = F.normalize((1.0 - w_lseg_conf) * odise_norm + w_lseg_conf * lseg_norm, dim=-1)
+                preds["mix_entropy_conf_clamp02_06_text256"] = diff2scene_mask_feature_predict(
+                    pred_logits, mix_conf, text256
+                )
+
+                agree = F.cosine_similarity(odise_norm, lseg_norm, dim=-1)
+                w_lseg_agree = (0.5 * torch.sigmoid(10.0 * (agree - 0.2))).unsqueeze(-1)
+                mix_agree = F.normalize((1.0 - w_lseg_agree) * odise_norm + w_lseg_agree * lseg_norm, dim=-1)
+                preds["mix_agreement_gate_text256"] = diff2scene_mask_feature_predict(
+                    pred_logits, mix_agree, text256
+                )
 
                 split_names = ["all20"]
                 split_names.append("train10_probe_fit" if record_idx < args.probe_train_records else "test10_probe_eval")
@@ -364,6 +433,7 @@ def main():
             "probe_test_records": max(0, len(dataset) - args.probe_train_records),
             "probe_fit": "ridge least squares on normalized source512 -> normalized ODISE raw256, bias included",
             "ridge": args.ridge,
+            "mix_lseg_weights": mix_lseg_weights,
             "odise_text256": f"{args.odise_model_config} word_head.text_proj, prompt: {args.odise_prompt_template}",
             "missing_keys": missing,
             "unexpected_keys": unexpected,

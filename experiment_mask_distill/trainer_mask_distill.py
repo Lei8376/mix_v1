@@ -17,7 +17,9 @@ from experiment_mask_distill.criterion_mask_distill import MaskDistillCriteria
 from experiment_mask_distill.semantic_miou import (
     MaskMIoUTracker, ODISEPCSemanticMIoUTracker,
     build_text_features,
+    diff2scene_mask_feature_predict,
 )
+from evaluate.semantic_iou import _SemanticAccumulator
 from utils.util import AverageMeter
 from trainer.open_vocab_trainer_v2 import MetricsTracker
 
@@ -408,6 +410,17 @@ class MaskDistillTrainer:
             if text_feats is not None and pixel_text_feats is not None
             else None
         )
+        odise256_probe_accs = (
+            {
+                "hybrid_odise256": _SemanticAccumulator(),
+                "clip_odise256": _SemanticAccumulator(),
+                "odise_odise256": _SemanticAccumulator(),
+                "base_odise256": _SemanticAccumulator(),
+                "refine_odise256": _SemanticAccumulator(),
+            }
+            if text_feats is not None
+            else None
+        )
 
         # Mask-level mIoU
         mask_tracker  = MaskMIoUTracker(threshold=0.5)
@@ -481,6 +494,41 @@ class MaskDistillTrainer:
                                 clip_text_features=pixel_text_feats,
                                 salient_masks=lifted[pt_mask][:, valid_k].float(),
                             )
+
+            # ---- ODISE-256 probe metrics for fusion components ----
+            # These expose the two learned branches and the pre/post-refine states:
+            #   odise_odise256: ODISE mask branch in the 256D ODISE text space
+            #   clip_odise256:  learned LSeg/CLIP projection into the ODISE 256D text space
+            #   base_odise256:  mask_tokens + gate * clip_tokens, before refine()
+            #   refine_odise256/hybrid_odise256: final fused token after refine residual
+            if odise256_probe_accs is not None:
+                component_map = {
+                    "hybrid_odise256": results["fused_embeddings"],
+                    "clip_odise256": results["clip_projected_embeddings"],
+                    "odise_odise256": results["odise_projected_embeddings"],
+                    "base_odise256": results["fusion_base_embeddings"],
+                    "refine_odise256": results["fused_embeddings"],
+                }
+                mask_valid_for_sem = results["mask_valid_from_masks"]
+                for b in range(len(results["outputs"])):
+                    if len(results["outputs"][b]) == 0:
+                        continue
+                    valid_k = mask_valid_for_sem[b]
+                    if not valid_k.any():
+                        continue
+                    pt_mask = results["batch_indices"] == b
+                    gt_b = batch["binary_label_3d"][pt_mask]
+                    pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
+                    for name, features_all in component_map.items():
+                        pred = diff2scene_mask_feature_predict(
+                            point_mask_logits=pred_logits,
+                            mask_features=features_all[b][valid_k],
+                            text_features=text_feats,
+                        )
+                        odise256_probe_accs[name].update_labels(
+                            pred,
+                            gt_b.detach().cpu().long(),
+                        )
 
             # ---- Mask-level mIoU ----
             B      = mask_valid.shape[0]
@@ -563,6 +611,15 @@ class MaskDistillTrainer:
             val_metrics["per_class_acc_hybrid_text"] = pc_res.get("per_class_acc_hybrid_text", {})
             val_metrics["per_class_acc_clip_text"] = pc_res.get("per_class_acc_clip_text", {})
             val_metrics["per_class_acc_final"] = pc_res.get("per_class_acc_pc", {})
+
+        if odise256_probe_accs is not None:
+            for name, acc in odise256_probe_accs.items():
+                res = acc.compute(f"semantic_miou_{name}")
+                val_metrics[f"semantic_miou_{name}"] = res[f"semantic_miou_{name}"]
+                val_metrics[f"semantic_macc_{name}"] = res[f"semantic_macc_{name}"]
+                val_metrics[f"n_valid_classes_{name}"] = res[f"n_valid_classes_semantic_miou_{name}"]
+                val_metrics[f"per_class_iou_{name}"] = res[f"per_class_iou_semantic_miou_{name}"]
+                val_metrics[f"per_class_acc_{name}"] = res[f"per_class_acc_semantic_miou_{name}"]
 
         mask_res = mask_tracker.compute()
         val_metrics["mask_miou"] = mask_res["mask_miou"]
@@ -714,11 +771,25 @@ class MaskDistillTrainer:
                         f"[Final-PC] mIoU={sem_miou_final:.4f} mAcc={sem_macc_final:.4f} ({n_cls} classes)  "
                         f"[MaskIoU] {mask_miou:.4f} ({val_metrics['n_masks']} masks)"
                     )
+                    if "semantic_miou_hybrid_odise256" in val_metrics:
+                        print(
+                            "  [ODISE-256 probes] "
+                            f"hybrid={val_metrics['semantic_miou_hybrid_odise256']:.4f}  "
+                            f"clip_proj={val_metrics['semantic_miou_clip_odise256']:.4f}  "
+                            f"odise={val_metrics['semantic_miou_odise_odise256']:.4f}  "
+                            f"base={val_metrics['semantic_miou_base_odise256']:.4f}  "
+                            f"refine={val_metrics['semantic_miou_refine_odise256']:.4f}"
+                        )
                     if self.is_main:
                         for name, key in (
                             ("Hybrid/Text", "per_class_iou_hybrid_text"),
                             ("CLIP/Text", "per_class_iou_clip_text"),
                             ("Final-PC", "per_class_iou_final"),
+                            ("Hybrid@ODISE256", "per_class_iou_hybrid_odise256"),
+                            ("CLIPProj@ODISE256", "per_class_iou_clip_odise256"),
+                            ("ODISE@ODISE256", "per_class_iou_odise_odise256"),
+                            ("Base@ODISE256", "per_class_iou_base_odise256"),
+                            ("Refine@ODISE256", "per_class_iou_refine_odise256"),
                         ):
                             per_cls = val_metrics.get(key, {})
                             if not per_cls:

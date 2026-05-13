@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
 import sys
 from pathlib import Path
@@ -71,7 +73,11 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--clip-cache-dir", default="/tmp/clip")
+    parser.add_argument("--metrics-json", default=None)
+    parser.add_argument(
+        "--clip-cache-dir",
+        default=str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"),
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("CLIP_CACHE_DIR", args.clip_cache_dir)
@@ -103,12 +109,21 @@ def main():
         aug=False,
         loop=1,
         eval_all=True,
-        max_samples=args.max_samples,
-        max_samples_ratio=None,
+        max_samples=args.max_samples if args.max_samples is not None else dataloader_cfg.get("val_max_samples"),
+        max_samples_ratio=None if args.max_samples is not None else dataloader_cfg.get("val_max_samples_ratio"),
     )
     val_dataset = OpenVocabScannetDatasetV2(val_config)
-    batch_size = args.batch_size or dataloader_cfg.get("batch_size", 2)
+    batch_size = args.batch_size or dataloader_cfg.get("val_batch_size", dataloader_cfg.get("batch_size", 2))
     num_workers = args.num_workers if args.num_workers is not None else dataloader_cfg.get("num_workers", 4)
+    if args.num_workers is None:
+        num_workers = dataloader_cfg.get("val_num_workers", num_workers)
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = dataloader_cfg.get("val_persistent_workers", False)
+        loader_kwargs["prefetch_factor"] = dataloader_cfg.get(
+            "val_prefetch_factor",
+            dataloader_cfg.get("prefetch_factor", 2),
+        )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=batch_size,
@@ -117,6 +132,7 @@ def main():
         pin_memory=(device != "cpu"),
         drop_last=False,
         collate_fn=open_vocab_collate_v2,
+        **loader_kwargs,
     )
 
     alpha_max = model_cfg.get("alpha_max", 2.0)
@@ -141,18 +157,40 @@ def main():
     if unexpected:
         print(f"[eval] unexpected_keys={unexpected}")
 
+    trainer_config_kwargs = {
+        "log_dir": trainer_cfg.get("log_dir", "runs/eval_only"),
+        "checkpoint_dir": trainer_cfg.get("checkpoint_dir", "checkpoints/eval_only"),
+        "use_amp": (not args.no_amp and device != "cpu"),
+        "mask_distill_weight": trainer_cfg.get("mask_distill_weight", 1.0),
+        "bce_weight": trainer_cfg.get("bce_weight", 0.0),
+        "dice_weight": trainer_cfg.get("dice_weight", 0.0),
+        "min_points_per_mask": trainer_cfg.get("min_points_per_mask", 10),
+        "semantic_clip_model": trainer_cfg.get("semantic_clip_model", "ODISE-256"),
+        "semantic_pixel_clip_model": trainer_cfg.get("semantic_pixel_clip_model", "ViT-B/32"),
+        "semantic_prompt_template": trainer_cfg.get("semantic_prompt_template", "a photo of a {}"),
+        "semantic_pc_lambda": trainer_cfg.get("semantic_pc_lambda", 0.5),
+        "validation_log_every_batches": trainer_cfg.get("validation_log_every_batches", 25),
+    }
+    trainer_config_fields = {field.name for field in dataclasses.fields(MaskDistillTrainerConfig)}
     trainer_config = MaskDistillTrainerConfig(
-        log_dir=trainer_cfg.get("log_dir", "runs/eval_only"),
-        checkpoint_dir=trainer_cfg.get("checkpoint_dir", "checkpoints/eval_only"),
-        use_amp=(not args.no_amp and device != "cpu"),
-        mask_distill_weight=trainer_cfg.get("mask_distill_weight", 1.0),
-        bce_weight=trainer_cfg.get("bce_weight", 0.0),
-        dice_weight=trainer_cfg.get("dice_weight", 0.0),
-        min_points_per_mask=trainer_cfg.get("min_points_per_mask", 10),
-        semantic_clip_model=trainer_cfg.get("semantic_clip_model", "ODISE-256"),
-        semantic_pixel_clip_model=trainer_cfg.get("semantic_pixel_clip_model", "ViT-B/32"),
-        semantic_prompt_template=trainer_cfg.get("semantic_prompt_template", "a photo of a {}"),
-        semantic_pc_lambda=trainer_cfg.get("semantic_pc_lambda", 0.5),
+        **{
+            key: value
+            for key, value in trainer_config_kwargs.items()
+            if key in trainer_config_fields
+        }
+    )
+    print("[eval] runtime config:")
+    print(f"  device: {device}")
+    print(f"  batch_size: {batch_size}")
+    print(f"  num_workers: {num_workers}")
+    print(f"  persistent_workers: {loader_kwargs.get('persistent_workers', False)}")
+    print(f"  prefetch_factor: {loader_kwargs.get('prefetch_factor', None)}")
+    print(f"  val_samples: {len(val_dataset)}")
+    print(f"  checkpoint_dir: {trainer_config.checkpoint_dir}")
+    print(f"  log_dir: {trainer_config.log_dir}")
+    print(
+        "  validation_log_every_batches: "
+        f"{getattr(trainer_config, 'validation_log_every_batches', 'unsupported')}"
     )
     trainer = MaskDistillTrainer(
         model=model,
@@ -163,7 +201,22 @@ def main():
         rank=0,
     )
     metrics = trainer._validate(checkpoint.get("epoch", 0))
+    if args.metrics_json:
+        metrics_path = Path(args.metrics_json)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, ensure_ascii=False)
+        print(f"[eval] wrote metrics_json={metrics_path}")
     print("[eval] metrics:")
+    if "semantic_miou_hybrid_odise256" in metrics:
+        print(
+            "  ODISE-256 probes: "
+            f"hybrid={metrics['semantic_miou_hybrid_odise256']} "
+            f"clip_proj={metrics['semantic_miou_clip_odise256']} "
+            f"odise={metrics['semantic_miou_odise_odise256']} "
+            f"base={metrics['semantic_miou_base_odise256']} "
+            f"refine={metrics['semantic_miou_refine_odise256']}"
+        )
     for key, value in metrics.items():
         if key.startswith("per_class") or key == "target":
             continue
@@ -175,6 +228,16 @@ def main():
         "per_class_acc_hybrid_text",
         "per_class_acc_clip_text",
         "per_class_acc_final",
+        "per_class_iou_hybrid_odise256",
+        "per_class_iou_clip_odise256",
+        "per_class_iou_odise_odise256",
+        "per_class_iou_base_odise256",
+        "per_class_iou_refine_odise256",
+        "per_class_acc_hybrid_odise256",
+        "per_class_acc_clip_odise256",
+        "per_class_acc_odise_odise256",
+        "per_class_acc_base_odise256",
+        "per_class_acc_refine_odise256",
     ):
         if key in metrics:
             print(f"  {key}:")

@@ -327,17 +327,15 @@ class ODISEPixelMaskFusionNet(nn.Module):
             raw_alpha = _alpha_to_raw(alpha_init, alpha_max)
             self.raw_alpha = nn.Parameter(torch.tensor(raw_alpha, dtype=torch.float32))
         else:
-            # Keep a non-trainable parameter so optimizer checkpoint loading can
-            # continue from runs that previously had a learnable alpha parameter.
-            self.raw_alpha = nn.Parameter(
-                torch.tensor(float(alpha_init), dtype=torch.float32),
-                requires_grad=False,
-            )
+            # Keep the scalar in the optimizer parameter list for checkpoint
+            # compatibility, but detach it in `alpha` so the fixed value is not
+            # trained.
+            self.raw_alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))
 
     @property
     def alpha(self):
         if self.alpha_mode == "fixed":
-            return self.raw_alpha
+            return self.raw_alpha.detach()
         return self.alpha_max * torch.sigmoid(self.raw_alpha)
 
     def _load_from_state_dict(
@@ -382,7 +380,7 @@ class ODISEPixelMaskFusionNet(nn.Module):
             error_msgs,
         )
 
-    def forward(self, pixel_embed, mask_embed, masks, valid_mask):
+    def forward(self, pixel_embed, mask_embed, masks, valid_mask, return_components: bool = False):
         """
         pixel_embed: either (B, H, W, Cp) pixel-level features, or (B, K, Cp) pre-pooled per-mask features.
         Returns:
@@ -417,10 +415,20 @@ class ODISEPixelMaskFusionNet(nn.Module):
         pixel_tokens = self.pixel_proj(pixel_pooled)  # (B,K,C_out)
 
         gate = torch.sigmoid(self.gate(torch.cat([mask_tokens, pixel_tokens], dim=-1)))
-        delta = self.refine(mask_tokens + gate * pixel_tokens)
+        fusion_base = mask_tokens + gate * pixel_tokens
+        delta = self.refine(fusion_base)
         fused = mask_tokens + self.alpha * delta
 
         fused = fused * valid_mask.unsqueeze(-1).float()
+        if return_components:
+            valid = valid_mask.unsqueeze(-1).float()
+            return {
+                "fused": fused,
+                "odise_tokens": mask_tokens * valid,
+                "clip_tokens": pixel_tokens * valid,
+                "fusion_base": fusion_base * valid,
+                "refine_delta": delta * valid,
+            }
         return fused
 
 

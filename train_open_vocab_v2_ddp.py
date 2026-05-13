@@ -125,6 +125,8 @@ def cleanup_distributed():
 class DataLoaderConfig:
     batch_size: int = 2
     num_workers: int = 4
+    val_batch_size: Optional[int] = None
+    val_num_workers: Optional[int] = None
     pin_memory: bool = True
     drop_last: bool = True
 
@@ -209,8 +211,8 @@ def create_data_loaders(
             loop=1,
             eval_all=True,
             input_color=dataset_config.input_color,
-            max_samples=getattr(dataset_config, "max_samples", None),
-            max_samples_ratio=getattr(dataset_config, "max_samples_ratio", None),
+            max_samples=getattr(dataset_config, "val_max_samples", None),
+            max_samples_ratio=getattr(dataset_config, "val_max_samples_ratio", None),
         )
         val_dataset = OpenVocabScannetDatasetV2(val_config)
         
@@ -223,19 +225,28 @@ def create_data_loaders(
                 shuffle=False,
             )
         
+        val_batch_size = dataloader_config.val_batch_size or dataloader_config.batch_size
+        val_num_workers = (
+            dataloader_config.num_workers
+            if dataloader_config.val_num_workers is None
+            else dataloader_config.val_num_workers
+        )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
-            batch_size=dataloader_config.batch_size,
+            batch_size=val_batch_size,
             shuffle=False,
             sampler=val_sampler,
-            num_workers=dataloader_config.num_workers,
+            num_workers=val_num_workers,
             pin_memory=dataloader_config.pin_memory,
             drop_last=False,
             collate_fn=open_vocab_collate_v2,
-            persistent_workers=dataloader_config.num_workers > 0,
+            persistent_workers=val_num_workers > 0,
         )
         if is_main_process():
-            print(f"Created validation loader with {len(val_dataset)} samples")
+            print(
+                f"Created validation loader with {len(val_dataset)} samples "
+                f"(batch_size={val_batch_size}, num_workers={val_num_workers})"
+            )
     except Exception as e:
         if is_main_process():
             print(f"Could not create validation loader: {e}")
@@ -359,6 +370,8 @@ def main() -> None:
         max_samples=_dataset.get("max_samples") or None,
         max_samples_ratio=_dataset.get("max_samples_ratio") or None,
     )
+    setattr(dataset_config, "val_max_samples", _dataset.get("val_max_samples") or None)
+    setattr(dataset_config, "val_max_samples_ratio", _dataset.get("val_max_samples_ratio") or None)
 
     _dataloader = yaml_config.get("dataloader") or {}
     raw_batch_size = _dataloader.get("batch_size", args.batch_size)
@@ -374,6 +387,8 @@ def main() -> None:
     dataloader_config = DataLoaderConfig(
         batch_size=per_gpu_batch_size,
         num_workers=_dataloader.get("num_workers", args.num_workers),
+        val_batch_size=_dataloader.get("val_batch_size"),
+        val_num_workers=_dataloader.get("val_num_workers"),
     )
 
     # Model config

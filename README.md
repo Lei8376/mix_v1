@@ -232,7 +232,7 @@ conda activate mix
 python -m py_compile model/modeling.py model/open_vocab_fusion_v2.py evaluate/semantic_iou.py train_open_vocab_v2.py
 ```
 
-如果要单独验证某个 256D checkpoint：
+如果要单独验证某个 256D checkpoint，使用从远端 `run_in_f_main` 分支同步后的评估入口：
 
 ```bash
 cd /home/sunl/work/mix_v1
@@ -244,6 +244,36 @@ python evaluate/eval_mask_distill_checkpoint.py \
   --batch-size 2 \
   --num-workers 0
 ```
+
+需要保存完整指标时可追加：
+
+```bash
+  --metrics-json runs/eval_only/metrics_epoch_1.json
+```
+
+如果要看融合前后语义结果，也就是 base/projection 和 refine/fused 后的对比，用诊断脚本：
+
+```bash
+cd /home/sunl/work/mix_v1
+conda activate mix
+python evaluate/projection_space_diagnostic.py \
+  --checkpoint checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_15.pth \
+  --config config/train_scannet_v2_full_multi_gpu.yaml \
+  --split val \
+  --device cuda \
+  --batch-size 2 \
+  --num-workers 0 \
+  --max-samples 20
+```
+
+输出里重点看这几项：
+
+- `odise_proj_256_text`: ODISE mask embedding/base 256D 和 ODISE text256 的结果
+- `lseg_raw_512_text`: LSeg 原始 512D 和 CLIP-B text512 的结果
+- `lseg_proj_256_text`: LSeg 512D 投影到 256D 后和 ODISE text256 的结果
+- `fused_256_text`: 经过 gate/refine/alpha 后的最终 fused 256D 和 ODISE text256 的结果
+
+其中 `fused_256_text` 就是 refine 后结果；和 `odise_proj_256_text`、`lseg_proj_256_text` 对比，可以判断 refine/fusion 是否提升或破坏语义。
 
 TensorBoard：
 

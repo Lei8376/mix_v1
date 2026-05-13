@@ -25,6 +25,9 @@ dataloader:
                   # - 单卡建议: 4-8
                   # - 多卡建议: 8-16
                   # - 过大会占用过多内存
+  # 验证阶段单独控制，避免 epoch 末验证 OOM。
+  val_batch_size: 12
+  val_num_workers: 8
 
 # ============================================================
 # 数据集配置
@@ -55,6 +58,10 @@ dataset:
                             # 💡 单卡和多卡都支持这个参数！
                             # 💡 多卡测试时建议先用 0.1 验证代码正常
 
+  # 验证集可单独限制样本数；设 null 表示完整验证集。
+  val_max_samples: null
+  val_max_samples_ratio: null
+
 # ============================================================
 # 模型配置
 # ============================================================
@@ -69,8 +76,8 @@ model:
   # ODISE-residual fusion alpha:
   #   learnable: alpha 从 alpha_init 初始化，并被限制在 [0, alpha_max] 内自学习
   #   fixed:     alpha 固定为 alpha_init，不参与训练；此时 alpha_max 不使用
-  alpha_mode: learnable
-  alpha_init: 1.0
+  alpha_mode: fixed
+  alpha_init: 1.25
   alpha_max: 2.0  # 只在 alpha_mode=learnable 时使用
 
 # ============================================================
@@ -109,16 +116,16 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_fusion
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_fusion.2
   
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_fusion
+  log_dir: runs/diff2scene_hybrid_lseg_odise256_fusion.2
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
   mask_distill_weight: 1.0
   bce_weight: 0.0            # 论文主 loss 不使用 BCE 辅助项
   dice_weight: 0.0           # 论文主 loss 不使用 Dice 辅助项
-  min_points_per_mask: 10    # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss
+  min_points_per_mask: 6    # lifted 2D mask 在 3D 中正样本数 < 此值则不参与 loss
                              # - 过滤 GT 中正样本过少的 mask（可能是噪声）
                              # - 推荐值: 5-10
                              # - 太高: 过滤太严，有效样本少
@@ -149,7 +156,7 @@ trainer:
   semantic_prompt_template: "a photo of a {}"
   
   # 【可选】恢复训练
-  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_12.pth  # 续训使用最新 256D epoch checkpoint
+  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_18.pth  # 续训使用最新 256D epoch checkpoint
 
 # ============================================================
 # 随机种子（确保可复现性）

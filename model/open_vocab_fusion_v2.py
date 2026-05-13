@@ -223,9 +223,11 @@ class OpenVocab3DFusionModelV2(nn.Module):
             )
 
         # Fuse 2D features
-        fused_embeddings = self.fuse_embed(
-            pixel_embeddings, mask_embeddings, mask_tensors, mask_valid
+        fusion_components = self.fuse_embed(
+            pixel_embeddings, mask_embeddings, mask_tensors, mask_valid,
+            return_components=True,
         )
+        fused_embeddings = fusion_components["fused"]
         pixel_pooled_embeddings = self._pool_pixel_embeddings_for_eval(
             pixel_embeddings, mask_tensors, mask_valid
         )
@@ -334,6 +336,10 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "mask_masks": mask_tensors,
             "batch_indices": batch_indices,
             "fused_embeddings": fused_embeddings,
+            "odise_projected_embeddings": fusion_components["odise_tokens"],
+            "clip_projected_embeddings": fusion_components["clip_tokens"],
+            "fusion_base_embeddings": fusion_components["fusion_base"],
+            "refine_delta_embeddings": fusion_components["refine_delta"],
             "pixel_pooled_embeddings": batch_input.get("clip_pooled", pixel_pooled_embeddings).float(),
             "pred_3d": pred_3d,
         }
