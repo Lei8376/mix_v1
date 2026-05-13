@@ -79,6 +79,17 @@ model:
   alpha_mode: fixed
   alpha_init: 1.25
   alpha_max: 2.0  # 只在 alpha_mode=learnable 时使用
+  # Decoupled semantic query:
+  # geometry query remains fused_embeddings for point-mask logits.
+  # semantic query uses normalized ODISE raw256 + independent LSeg semantic projection.
+  use_semantic_query: true
+  semantic_fusion_mode: fixed  # fixed 或 learnable
+  semantic_odise_weight: 0.5
+  semantic_lseg_weight: 0.5
+  semantic_init_odise_weight: 0.5
+  semantic_init_lseg_weight: 0.5
+  semantic_proj_path: null  # 例如 runs/eval_only/lseg_to_odise_ridge_probe.pt
+  freeze_semantic_proj: true
 
 # ============================================================
 # 训练超参数配置

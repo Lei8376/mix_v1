@@ -229,6 +229,11 @@ def main():
     parser.add_argument("--odise-model-config", default="Panoptic/odise_caption_coco_50e.py")
     parser.add_argument("--odise-prompt-template", default="a photo of a {}")
     parser.add_argument("--output-json", default="record/odise_256_space_probe_2026-05-07.json")
+    parser.add_argument(
+        "--output-semantic-proj",
+        default=None,
+        help="Optional .pt path for saving the fitted LSeg512->ODISE256 augmented ridge weights.",
+    )
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -311,6 +316,20 @@ def main():
         torch.cat(train_odise, dim=0).to(device),
         args.ridge,
     )
+    if args.output_semantic_proj:
+        proj_path = Path(_resolve_repo_path(args.output_semantic_proj))
+        proj_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "weights": lseg_to_odise.detach().cpu(),
+                "source_dim": torch.tensor(lseg_to_odise.shape[0] - 1),
+                "target_dim": torch.tensor(lseg_to_odise.shape[1]),
+                "ridge": torch.tensor(float(args.ridge)),
+                "probe_train_records": torch.tensor(int(args.probe_train_records)),
+            },
+            proj_path,
+        )
+        print(f"[probe] output_semantic_proj={proj_path}")
 
     def _new_accs():
         accs = {

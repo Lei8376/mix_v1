@@ -404,6 +404,9 @@ def main() -> None:
     if odise_config_path:
         odise_config_path = resolve_odise_config_path(odise_config_path, repo_root)
     alpha_max = _model.get("alpha_max", 2.0)
+    semantic_proj_path = _model.get("semantic_proj_path")
+    if semantic_proj_path and not os.path.isabs(semantic_proj_path):
+        semantic_proj_path = os.path.join(repo_root, semantic_proj_path)
 
     model_config = OpenVocabFusionModelV2Config(
         device=device,
@@ -418,6 +421,14 @@ def main() -> None:
         alpha_mode=_model.get("alpha_mode", "learnable"),
         alpha_init=float(_model.get("alpha_init", 1.0)),
         alpha_max=None if alpha_max is None else float(alpha_max),
+        use_semantic_query=bool(_model.get("use_semantic_query", True)),
+        semantic_fusion_mode=_model.get("semantic_fusion_mode", "fixed"),
+        semantic_odise_weight=float(_model.get("semantic_odise_weight", 0.5)),
+        semantic_lseg_weight=float(_model.get("semantic_lseg_weight", 0.5)),
+        semantic_init_odise_weight=float(_model.get("semantic_init_odise_weight", 0.5)),
+        semantic_init_lseg_weight=float(_model.get("semantic_init_lseg_weight", 0.5)),
+        semantic_proj_path=semantic_proj_path,
+        freeze_semantic_proj=bool(_model.get("freeze_semantic_proj", True)),
     )
 
     # Trainer config

@@ -304,11 +304,23 @@ class MaskDistillTrainer:
                     self.writer.add_scalar("Loss/Train_Aux",          loss_dict["loss_aux"],              self.global_step)
                     self.writer.add_scalar("LR", self.optimizer.param_groups[0]["lr"], self.global_step)
 
+                    model_ref = self.model.module if hasattr(self.model, "module") else self.model
                     # Log fusion alpha (ODISE-residual fusion mixing weight)
-                    fuse = self.model.fuse_embed if hasattr(self.model, "fuse_embed") \
-                        else getattr(self.model, "module", None) and self.model.module.fuse_embed
+                    fuse = getattr(model_ref, "fuse_embed", None)
                     if fuse is not None and hasattr(fuse, "alpha"):
                         self.writer.add_scalar("Fusion/alpha", fuse.alpha.item(), self.global_step)
+                    if hasattr(model_ref, "_get_semantic_fusion_weights"):
+                        w_o, w_l = model_ref._get_semantic_fusion_weights()
+                        self.writer.add_scalar(
+                            "FusionSemantic/w_odise",
+                            float(w_o.detach().cpu()),
+                            self.global_step,
+                        )
+                        self.writer.add_scalar(
+                            "FusionSemantic/w_lseg",
+                            float(w_l.detach().cpu()),
+                            self.global_step,
+                        )
 
                 self.global_step += 1
 
@@ -453,7 +465,7 @@ class MaskDistillTrainer:
 
             # ---- 语义 mIoU：Hybrid / CLIP / Final-PC ----
             if pc_tracker is not None:
-                fused_all = results["fused_embeddings"]
+                fused_all = results.get("semantic_embeddings", results["fused_embeddings"])
                 pixel_all = results.get("pixel_pooled_embeddings", None)
                 mask_valid_for_sem = results["mask_valid_from_masks"]
                 for b in range(len(results["outputs"])):

@@ -136,6 +136,7 @@ def main():
     )
 
     alpha_max = model_cfg.get("alpha_max", 2.0)
+    semantic_proj_path = _resolve_repo_path(model_cfg.get("semantic_proj_path"))
     model_config = OpenVocabFusionModelV2Config(
         device=device,
         pc_arch=model_cfg.get("pc_arch", "MinkUNet34C"),
@@ -146,6 +147,14 @@ def main():
         alpha_mode=model_cfg.get("alpha_mode", "learnable"),
         alpha_init=float(model_cfg.get("alpha_init", 1.0)),
         alpha_max=None if alpha_max is None else float(alpha_max),
+        use_semantic_query=bool(model_cfg.get("use_semantic_query", True)),
+        semantic_fusion_mode=model_cfg.get("semantic_fusion_mode", "fixed"),
+        semantic_odise_weight=float(model_cfg.get("semantic_odise_weight", 0.5)),
+        semantic_lseg_weight=float(model_cfg.get("semantic_lseg_weight", 0.5)),
+        semantic_init_odise_weight=float(model_cfg.get("semantic_init_odise_weight", 0.5)),
+        semantic_init_lseg_weight=float(model_cfg.get("semantic_init_lseg_weight", 0.5)),
+        semantic_proj_path=semantic_proj_path,
+        freeze_semantic_proj=bool(model_cfg.get("freeze_semantic_proj", True)),
     )
     model = OpenVocab3DFusionModelV2(model_config).to(device)
     checkpoint, missing, unexpected = _load_model_state(model, args.checkpoint, device)

@@ -32,6 +32,14 @@ class OpenVocabFusionModelV2Config:
     alpha_mode: str = "learnable"
     alpha_init: float = 1.0
     alpha_max: Optional[float] = 2.0
+    use_semantic_query: bool = True
+    semantic_fusion_mode: str = "fixed"
+    semantic_odise_weight: float = 0.5
+    semantic_lseg_weight: float = 0.5
+    semantic_init_odise_weight: float = 0.5
+    semantic_init_lseg_weight: float = 0.5
+    semantic_proj_path: Optional[str] = None
+    freeze_semantic_proj: bool = True
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
     lseg_ckpt_path: Optional[str] = None
@@ -72,6 +80,38 @@ class OpenVocab3DFusionModelV2(nn.Module):
             alpha_max=config.alpha_max,
         )
 
+        # Decoupled LSeg semantic projection. The shared fuse_embed.pixel_proj is
+        # trained for geometry fusion; this head is used only for text readout.
+        self.pixel_sem_proj = nn.Linear(
+            config.pixel_embedding_dim,
+            config.fused_embedding_dim,
+        )
+
+        semantic_mode = str(config.semantic_fusion_mode).lower()
+        if semantic_mode not in {"fixed", "learnable"}:
+            raise ValueError(
+                f"semantic_fusion_mode must be 'fixed' or 'learnable', got {config.semantic_fusion_mode!r}"
+            )
+        if semantic_mode == "learnable":
+            init = torch.tensor(
+                [
+                    float(config.semantic_init_odise_weight),
+                    float(config.semantic_init_lseg_weight),
+                ],
+                dtype=torch.float32,
+            )
+            init = init / init.sum().clamp_min(1e-6)
+            self.semantic_fusion_logits = nn.Parameter(torch.log(init.clamp_min(1e-6)))
+        else:
+            self.semantic_fusion_logits = None
+
+        if config.semantic_proj_path:
+            self._load_semantic_projection(config.semantic_proj_path)
+
+        if config.freeze_semantic_proj:
+            for p in self.pixel_sem_proj.parameters():
+                p.requires_grad = False
+
         # Learnable temperature for similarity
         self.logit_scale = nn.Parameter(
             torch.ones([]) * np.log(DEFAULT_LOGIT_SCALE)
@@ -80,6 +120,73 @@ class OpenVocab3DFusionModelV2(nn.Module):
         # Optional: online extractors (lazy initialization)
         self._pix_extractor = None
         self._mask_extractor = None
+
+    def _load_semantic_projection(self, path: str):
+        obj = torch.load(path, map_location="cpu")
+
+        if "weight" in obj and "bias" in obj:
+            weight = obj["weight"].float()
+            bias = obj["bias"].float()
+
+            # nn.Linear(512, 256).weight shape = (256, 512).
+            if weight.shape == (
+                self.config.pixel_embedding_dim,
+                self.config.fused_embedding_dim,
+            ):
+                weight = weight.t()
+
+            expected = (
+                self.config.fused_embedding_dim,
+                self.config.pixel_embedding_dim,
+            )
+            if tuple(weight.shape) != expected:
+                raise RuntimeError(
+                    f"semantic proj weight shape mismatch: got {tuple(weight.shape)}, expected {expected}"
+                )
+
+            if tuple(bias.shape) != (self.config.fused_embedding_dim,):
+                raise RuntimeError(
+                    "semantic proj bias shape mismatch: "
+                    f"got {tuple(bias.shape)}, expected {(self.config.fused_embedding_dim,)}"
+                )
+
+            self.pixel_sem_proj.weight.data.copy_(weight)
+            self.pixel_sem_proj.bias.data.copy_(bias)
+            return
+
+        if "weights" in obj:
+            # Augmented ridge weights: shape (513, 256), last row is bias.
+            W = obj["weights"].float()
+            if W.shape[0] != self.config.pixel_embedding_dim + 1:
+                raise RuntimeError(f"unexpected augmented probe shape: {tuple(W.shape)}")
+            self.pixel_sem_proj.weight.data.copy_(W[:-1].t())
+            self.pixel_sem_proj.bias.data.copy_(W[-1])
+            return
+
+        raise RuntimeError(f"Unknown semantic projection checkpoint format: {path}")
+
+    def _get_semantic_fusion_weights(self):
+        mode = str(self.config.semantic_fusion_mode).lower()
+
+        if mode == "learnable":
+            weights = torch.softmax(self.semantic_fusion_logits, dim=0)
+            return weights[0], weights[1]
+
+        if mode == "fixed":
+            w_odise = torch.tensor(
+                float(self.config.semantic_odise_weight),
+                device=self.pixel_sem_proj.weight.device,
+                dtype=self.pixel_sem_proj.weight.dtype,
+            )
+            w_lseg = torch.tensor(
+                float(self.config.semantic_lseg_weight),
+                device=self.pixel_sem_proj.weight.device,
+                dtype=self.pixel_sem_proj.weight.dtype,
+            )
+            s = (w_odise + w_lseg).clamp_min(1e-6)
+            return w_odise / s, w_lseg / s
+
+        raise RuntimeError(f"Unknown semantic_fusion_mode: {self.config.semantic_fusion_mode}")
 
     @property
     def pix_extractor(self):
@@ -231,6 +338,28 @@ class OpenVocab3DFusionModelV2(nn.Module):
         pixel_pooled_embeddings = self._pool_pixel_embeddings_for_eval(
             pixel_embeddings, mask_tensors, mask_valid
         )
+        pixel_for_sem = batch_input.get("clip_pooled", pixel_pooled_embeddings).float()
+
+        semantic_embeddings = None
+        lseg_semantic_embeddings = None
+        semantic_weight_odise = None
+        semantic_weight_lseg = None
+        if self.config.use_semantic_query:
+            if pixel_for_sem.shape[-1] != self.config.pixel_embedding_dim:
+                raise ValueError(
+                    f"semantic pixel feature dim mismatch: "
+                    f"{pixel_for_sem.shape[-1]} != {self.config.pixel_embedding_dim}"
+                )
+            odise_q = F.normalize(mask_embeddings.float(), dim=-1)
+            lseg_semantic_embeddings = self.pixel_sem_proj(pixel_for_sem).float()
+            lseg_sem_q = F.normalize(lseg_semantic_embeddings, dim=-1)
+            semantic_weight_odise, semantic_weight_lseg = self._get_semantic_fusion_weights()
+            semantic_embeddings = F.normalize(
+                semantic_weight_odise * odise_q + semantic_weight_lseg * lseg_sem_q,
+                dim=-1,
+            )
+            if mask_valid is not None:
+                semantic_embeddings = semantic_embeddings * mask_valid.unsqueeze(-1).float()
 
         # Process 3D points（MinkowskiEngine 体素化后输出点数 M 可能 < 输入点数 N）
         # 🔥 关键修复：正确映射每个输入点到其对应的体素特征
@@ -336,11 +465,15 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "mask_masks": mask_tensors,
             "batch_indices": batch_indices,
             "fused_embeddings": fused_embeddings,
+            "semantic_embeddings": semantic_embeddings if semantic_embeddings is not None else fused_embeddings,
             "odise_projected_embeddings": fusion_components["odise_tokens"],
             "clip_projected_embeddings": fusion_components["clip_tokens"],
             "fusion_base_embeddings": fusion_components["fusion_base"],
             "refine_delta_embeddings": fusion_components["refine_delta"],
-            "pixel_pooled_embeddings": batch_input.get("clip_pooled", pixel_pooled_embeddings).float(),
+            "lseg_semantic_embeddings": lseg_semantic_embeddings,
+            "semantic_weight_odise": semantic_weight_odise.detach() if semantic_weight_odise is not None else None,
+            "semantic_weight_lseg": semantic_weight_lseg.detach() if semantic_weight_lseg is not None else None,
+            "pixel_pooled_embeddings": pixel_for_sem,
             "pred_3d": pred_3d,
         }
 
