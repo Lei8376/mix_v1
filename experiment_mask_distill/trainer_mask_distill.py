@@ -429,6 +429,8 @@ class MaskDistillTrainer:
                 "odise_odise256": _SemanticAccumulator(),
                 "base_odise256": _SemanticAccumulator(),
                 "refine_odise256": _SemanticAccumulator(),
+                "lseg_semproj_odise256": _SemanticAccumulator(),
+                "semantic_query_odise256": _SemanticAccumulator(),
             }
             if text_feats is not None
             else None
@@ -520,6 +522,8 @@ class MaskDistillTrainer:
                     "odise_odise256": results["odise_projected_embeddings"],
                     "base_odise256": results["fusion_base_embeddings"],
                     "refine_odise256": results["fused_embeddings"],
+                    "lseg_semproj_odise256": results.get("lseg_semantic_embeddings"),
+                    "semantic_query_odise256": results.get("semantic_embeddings"),
                 }
                 mask_valid_for_sem = results["mask_valid_from_masks"]
                 for b in range(len(results["outputs"])):
@@ -532,6 +536,8 @@ class MaskDistillTrainer:
                     gt_b = batch["binary_label_3d"][pt_mask]
                     pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
                     for name, features_all in component_map.items():
+                        if features_all is None:
+                            continue
                         pred = diff2scene_mask_feature_predict(
                             point_mask_logits=pred_logits,
                             mask_features=features_all[b][valid_k],
@@ -678,6 +684,12 @@ class MaskDistillTrainer:
             print(f"[resume] missing keys (will use init values): {missing}")
         if unexpected and self.is_main:
             print(f"[resume] unexpected keys (ignored): {unexpected}")
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        semantic_proj_path = getattr(getattr(model_ref, "config", None), "semantic_proj_path", None)
+        if semantic_proj_path:
+            model_ref._load_semantic_projection(semantic_proj_path)
+            if self.is_main:
+                print(f"[resume] reloaded semantic projection from {semantic_proj_path}")
 
         if "optimizer_state_dict" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -750,6 +762,21 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Hybrid",   val_metrics["n_valid_classes_hybrid"],   epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_CLIP",     val_metrics["n_valid_classes_clip"],     epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Final",    val_metrics["n_valid_classes_final"],    epoch)
+                        for tag_name, metric_key in (
+                            ("Hybrid", "semantic_miou_hybrid_odise256"),
+                            ("CLIPProj", "semantic_miou_clip_odise256"),
+                            ("ODISE", "semantic_miou_odise_odise256"),
+                            ("Base", "semantic_miou_base_odise256"),
+                            ("Refine", "semantic_miou_refine_odise256"),
+                            ("LSegSemProj", "semantic_miou_lseg_semproj_odise256"),
+                            ("SemanticQuery", "semantic_miou_semantic_query_odise256"),
+                        ):
+                            if metric_key in val_metrics:
+                                self.writer.add_scalar(
+                                    f"Metrics_ODISE256/{tag_name}",
+                                    val_metrics[metric_key],
+                                    epoch,
+                                )
                         self.writer.add_scalar("Metrics/Mask_mIoU",               val_metrics["mask_miou"],                epoch)
                         self.writer.add_scalar("Metrics/N_Masks",                  val_metrics["n_masks"],                  epoch)
                         # 每类 IoU 写入 TensorBoard
@@ -790,7 +817,9 @@ class MaskDistillTrainer:
                             f"clip_proj={val_metrics['semantic_miou_clip_odise256']:.4f}  "
                             f"odise={val_metrics['semantic_miou_odise_odise256']:.4f}  "
                             f"base={val_metrics['semantic_miou_base_odise256']:.4f}  "
-                            f"refine={val_metrics['semantic_miou_refine_odise256']:.4f}"
+                            f"refine={val_metrics['semantic_miou_refine_odise256']:.4f}  "
+                            f"lseg_semproj={val_metrics.get('semantic_miou_lseg_semproj_odise256', 0.0):.4f}  "
+                            f"semantic_query={val_metrics.get('semantic_miou_semantic_query_odise256', 0.0):.4f}"
                         )
                     if self.is_main:
                         for name, key in (
@@ -802,6 +831,8 @@ class MaskDistillTrainer:
                             ("ODISE@ODISE256", "per_class_iou_odise_odise256"),
                             ("Base@ODISE256", "per_class_iou_base_odise256"),
                             ("Refine@ODISE256", "per_class_iou_refine_odise256"),
+                            ("LSegSemProj@ODISE256", "per_class_iou_lseg_semproj_odise256"),
+                            ("SemanticQuery@ODISE256", "per_class_iou_semantic_query_odise256"),
                         ):
                             per_cls = val_metrics.get(key, {})
                             if not per_cls:

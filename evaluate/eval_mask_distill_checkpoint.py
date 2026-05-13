@@ -60,6 +60,10 @@ def _load_model_state(model: torch.nn.Module, checkpoint_path: str, device: str)
     elif not model_is_ddp and ckpt_is_ddp:
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    model_ref = model.module if hasattr(model, "module") else model
+    semantic_proj_path = getattr(getattr(model_ref, "config", None), "semantic_proj_path", None)
+    if semantic_proj_path:
+        model_ref._load_semantic_projection(semantic_proj_path)
     return checkpoint, missing, unexpected
 
 
@@ -224,7 +228,9 @@ def main():
             f"clip_proj={metrics['semantic_miou_clip_odise256']} "
             f"odise={metrics['semantic_miou_odise_odise256']} "
             f"base={metrics['semantic_miou_base_odise256']} "
-            f"refine={metrics['semantic_miou_refine_odise256']}"
+            f"refine={metrics['semantic_miou_refine_odise256']} "
+            f"lseg_semproj={metrics.get('semantic_miou_lseg_semproj_odise256')} "
+            f"semantic_query={metrics.get('semantic_miou_semantic_query_odise256')}"
         )
     for key, value in metrics.items():
         if key.startswith("per_class") or key == "target":
@@ -242,11 +248,15 @@ def main():
         "per_class_iou_odise_odise256",
         "per_class_iou_base_odise256",
         "per_class_iou_refine_odise256",
+        "per_class_iou_lseg_semproj_odise256",
+        "per_class_iou_semantic_query_odise256",
         "per_class_acc_hybrid_odise256",
         "per_class_acc_clip_odise256",
         "per_class_acc_odise_odise256",
         "per_class_acc_base_odise256",
         "per_class_acc_refine_odise256",
+        "per_class_acc_lseg_semproj_odise256",
+        "per_class_acc_semantic_query_odise256",
     ):
         if key in metrics:
             print(f"  {key}:")
