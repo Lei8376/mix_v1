@@ -86,8 +86,8 @@ model:
   semantic_fusion_mode: fixed  # fixed 或 learnable
   semantic_odise_weight: 0.5
   semantic_lseg_weight: 0.5
-  semantic_init_odise_weight: 0.5
-  semantic_init_lseg_weight: 0.5
+  semantic_init_odise_weight: 0.3
+  semantic_init_lseg_weight: 0.7
   semantic_proj_path: null  # 例如 runs/eval_only/lseg_to_odise_ridge_probe.pt
   freeze_semantic_proj: true
 
@@ -127,9 +127,9 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_fusion.2
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.2
   
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_fusion.2
+  log_dir: runs/diff2scene_hybrid_lseg_odise256_semantic_query.2
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
@@ -165,9 +165,24 @@ trainer:
   # p_final ∝ p_hybrid^lambda * p_lseg^(1-lambda)
   semantic_pc_lambda: 0.5
   semantic_prompt_template: "a photo of a {}"
+
+  # ----- Dual-Space Semantic Probability Fusion -----
+  # Geometry logits still come from fused_embeddings. Semantic readout keeps
+  # ODISE and LSeg in their native text spaces, then fuses mask-class probs:
+  #   ODISE raw256 @ ODISE text256
+  #   LSeg raw512  @ CLIP text512
+  dual_space_eval: true
+  dual_space_odise_weight: 0.5
+  dual_space_lseg_weight: 0.5
+  dual_space_tau_odise: 0.07
+  dual_space_tau_lseg: 0.07
+  dual_space_use_confidence: false
+  dual_space_conf_min: 0.2
+  dual_space_conf_max: 0.7
+  best_monitor: "semantic_miou_dual_space_fixed"
   
   # 【可选】恢复训练
-  resume: checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_18.pth  # 续训使用最新 256D epoch checkpoint
+  # resume: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query/checkpoint_epoch_2.pth # 续训使用最新 256D epoch checkpoint
 
 # ============================================================
 # 随机种子（确保可复现性）

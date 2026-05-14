@@ -437,6 +437,15 @@ def main() -> None:
             semantic_pixel_clip_model=_trainer.get("semantic_pixel_clip_model", "ViT-B/32"),
             semantic_prompt_template=_trainer.get("semantic_prompt_template", "a photo of a {}"),
             semantic_pc_lambda=_trainer.get("semantic_pc_lambda", 0.5),
+            dual_space_eval=_trainer.get("dual_space_eval", True),
+            dual_space_odise_weight=_trainer.get("dual_space_odise_weight", 0.5),
+            dual_space_lseg_weight=_trainer.get("dual_space_lseg_weight", 0.5),
+            dual_space_tau_odise=_trainer.get("dual_space_tau_odise", 0.07),
+            dual_space_tau_lseg=_trainer.get("dual_space_tau_lseg", 0.07),
+            dual_space_use_confidence=_trainer.get("dual_space_use_confidence", False),
+            dual_space_conf_min=_trainer.get("dual_space_conf_min", 0.2),
+            dual_space_conf_max=_trainer.get("dual_space_conf_max", 0.7),
+            best_monitor=_trainer.get("best_monitor", "semantic_miou_dual_space_fixed"),
         )
 
     # Validate configuration

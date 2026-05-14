@@ -17,7 +17,9 @@ from experiment_mask_distill.criterion_mask_distill import MaskDistillCriteria
 from experiment_mask_distill.semantic_miou import (
     MaskMIoUTracker, ODISEPCSemanticMIoUTracker,
     build_text_features,
+    diff2scene_class_probs_predict,
     diff2scene_mask_feature_predict,
+    mask_feature_class_probs,
 )
 from evaluate.semantic_iou import _SemanticAccumulator
 from utils.util import AverageMeter
@@ -69,6 +71,49 @@ class MaskDistillTrainerConfig:
     semantic_pixel_clip_model:   str   = "ViT-B/32"
     semantic_prompt_template:    str   = "a photo of a {}"
     semantic_pc_lambda:          float = 0.5
+    dual_space_eval:             bool  = True
+    dual_space_odise_weight:     float = 0.5
+    dual_space_lseg_weight:      float = 0.5
+    dual_space_tau_odise:        float = 0.07
+    dual_space_tau_lseg:         float = 0.07
+    dual_space_use_confidence:   bool  = False
+    dual_space_conf_min:         float = 0.2
+    dual_space_conf_max:         float = 0.7
+    best_monitor:                str   = "semantic_miou_dual_space_fixed"
+
+
+def _mask_feature_class_probs_tau(
+    mask_features: torch.Tensor,
+    text_features: torch.Tensor,
+    tau: float,
+) -> torch.Tensor:
+    if tau <= 0:
+        raise ValueError(f"tau must be positive, got {tau}")
+    return mask_feature_class_probs(
+        mask_features=mask_features,
+        text_features=text_features,
+        logit_scale=1.0 / float(tau),
+    )
+
+
+def _dual_space_confidence_probs(
+    p_odise: torch.Tensor,
+    p_lseg: torch.Tensor,
+    conf_min: float,
+    conf_max: float,
+) -> torch.Tensor:
+    if p_odise.shape != p_lseg.shape:
+        raise RuntimeError(
+            f"class-prob shape mismatch: ODISE={tuple(p_odise.shape)} LSeg={tuple(p_lseg.shape)}"
+        )
+    log_c = math.log(float(p_odise.shape[-1]))
+    ent_odise = -(p_odise * p_odise.clamp_min(1e-12).log()).sum(dim=-1) / log_c
+    ent_lseg = -(p_lseg * p_lseg.clamp_min(1e-12).log()).sum(dim=-1) / log_c
+    conf_odise = 1.0 - ent_odise
+    conf_lseg = 1.0 - ent_lseg
+    w_lseg = conf_lseg / (conf_lseg + conf_odise + 1e-6)
+    w_lseg = w_lseg.clamp(conf_min, conf_max).unsqueeze(-1)
+    return (1.0 - w_lseg) * p_odise + w_lseg * p_lseg
 
 
 # ============================================================
@@ -435,6 +480,22 @@ class MaskDistillTrainer:
             if text_feats is not None
             else None
         )
+        dual_space_accs = (
+            {
+                "odise_only_text256": _SemanticAccumulator(),
+                "lseg_only_text512": _SemanticAccumulator(),
+                "current_fused_text256": _SemanticAccumulator(),
+                "dual_space_fixed": _SemanticAccumulator(),
+                "dual_space_confidence": _SemanticAccumulator(),
+            }
+            if self.config.dual_space_eval and text_feats is not None and pixel_text_feats is not None
+            else None
+        )
+        dual_weight_sum = self.config.dual_space_odise_weight + self.config.dual_space_lseg_weight
+        if dual_weight_sum <= 0:
+            raise ValueError("dual_space_odise_weight + dual_space_lseg_weight must be positive")
+        dual_w_odise = self.config.dual_space_odise_weight / dual_weight_sum
+        dual_w_lseg = self.config.dual_space_lseg_weight / dual_weight_sum
 
         # Mask-level mIoU
         mask_tracker  = MaskMIoUTracker(threshold=0.5)
@@ -548,6 +609,89 @@ class MaskDistillTrainer:
                             gt_b.detach().cpu().long(),
                         )
 
+            # ---- Dual-space semantic probability fusion ----
+            # ODISE raw256 is read by ODISE text256. LSeg raw512 is read by
+            # CLIP text512. No LSeg->ODISE projection is used here.
+            if dual_space_accs is not None:
+                mask_valid_for_sem = results["mask_valid_from_masks"]
+                lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
+                if lseg_all is None:
+                    raise RuntimeError("Dual-space eval requires raw LSeg pixel_pooled features.")
+                for b in range(len(results["outputs"])):
+                    if len(results["outputs"][b]) == 0:
+                        continue
+                    valid_k = mask_valid_for_sem[b]
+                    if not valid_k.any():
+                        continue
+                    pt_mask = results["batch_indices"] == b
+                    gt_b = batch["binary_label_3d"][pt_mask]
+                    pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
+                    odise_q = batch["mask_embeddings"][b][valid_k].float()
+                    lseg_q = lseg_all[b][valid_k].float()
+                    fused_q = results["fused_embeddings"][b][valid_k].float()
+
+                    if odise_q.shape[-1] != text_feats.shape[-1]:
+                        raise RuntimeError(
+                            f"Dual-space ODISE dim mismatch: mask={odise_q.shape[-1]} text={text_feats.shape[-1]}"
+                        )
+                    if lseg_q.shape[-1] != pixel_text_feats.shape[-1]:
+                        raise RuntimeError(
+                            f"Dual-space LSeg dim mismatch: mask={lseg_q.shape[-1]} text={pixel_text_feats.shape[-1]}"
+                        )
+                    if fused_q.shape[-1] != text_feats.shape[-1]:
+                        raise RuntimeError(
+                            f"Dual-space fused dim mismatch: mask={fused_q.shape[-1]} text={text_feats.shape[-1]}"
+                        )
+
+                    p_odise = _mask_feature_class_probs_tau(
+                        odise_q,
+                        text_feats,
+                        self.config.dual_space_tau_odise,
+                    )
+                    p_lseg = _mask_feature_class_probs_tau(
+                        lseg_q,
+                        pixel_text_feats,
+                        self.config.dual_space_tau_lseg,
+                    )
+                    p_fixed = dual_w_odise * p_odise + dual_w_lseg * p_lseg
+                    p_conf = _dual_space_confidence_probs(
+                        p_odise,
+                        p_lseg,
+                        self.config.dual_space_conf_min,
+                        self.config.dual_space_conf_max,
+                    )
+
+                    dual_preds = {
+                        "odise_only_text256": diff2scene_mask_feature_predict(
+                            pred_logits,
+                            odise_q,
+                            text_feats,
+                        ),
+                        "lseg_only_text512": diff2scene_mask_feature_predict(
+                            pred_logits,
+                            lseg_q,
+                            pixel_text_feats,
+                        ),
+                        "current_fused_text256": diff2scene_mask_feature_predict(
+                            pred_logits,
+                            fused_q,
+                            text_feats,
+                        ),
+                        "dual_space_fixed": diff2scene_class_probs_predict(
+                            pred_logits,
+                            p_fixed,
+                        ),
+                        "dual_space_confidence": diff2scene_class_probs_predict(
+                            pred_logits,
+                            p_conf,
+                        ),
+                    }
+                    for name, pred in dual_preds.items():
+                        dual_space_accs[name].update_labels(
+                            pred,
+                            gt_b.detach().cpu().long(),
+                        )
+
             # ---- Mask-level mIoU ----
             B      = mask_valid.shape[0]
             K_max  = mask_valid.shape[1]
@@ -609,6 +753,13 @@ class MaskDistillTrainer:
             "n_valid_classes_final":     0,
             "mask_miou":                 0.0,
             "n_masks":                   0,
+            "semantic_miou_dual_space_fixed": 0.0,
+            "semantic_macc_dual_space_fixed": 0.0,
+            "semantic_miou_dual_space_confidence": 0.0,
+            "semantic_macc_dual_space_confidence": 0.0,
+            "semantic_miou_odise_only_text256": 0.0,
+            "semantic_miou_lseg_only_text512": 0.0,
+            "semantic_miou_current_fused_text256": 0.0,
         }
 
         if pc_tracker is not None:
@@ -639,6 +790,15 @@ class MaskDistillTrainer:
                 val_metrics[f"per_class_iou_{name}"] = res[f"per_class_iou_semantic_miou_{name}"]
                 val_metrics[f"per_class_acc_{name}"] = res[f"per_class_acc_semantic_miou_{name}"]
 
+        if dual_space_accs is not None:
+            for name, acc in dual_space_accs.items():
+                res = acc.compute(f"semantic_miou_{name}")
+                val_metrics[f"semantic_miou_{name}"] = res[f"semantic_miou_{name}"]
+                val_metrics[f"semantic_macc_{name}"] = res[f"semantic_macc_{name}"]
+                val_metrics[f"n_valid_classes_{name}"] = res[f"n_valid_classes_semantic_miou_{name}"]
+                val_metrics[f"per_class_iou_{name}"] = res[f"per_class_iou_semantic_miou_{name}"]
+                val_metrics[f"per_class_acc_{name}"] = res[f"per_class_acc_semantic_miou_{name}"]
+
         mask_res = mask_tracker.compute()
         val_metrics["mask_miou"] = mask_res["mask_miou"]
         val_metrics["n_masks"]   = mask_res["n_masks"]
@@ -659,7 +819,7 @@ class MaskDistillTrainer:
             "scaler_state_dict":    self.scaler.state_dict(),
             "best_loss":            self.best_loss,
             "best_iou":             self.best_iou,
-            "best_monitor":         "semantic_miou_final",
+            "best_monitor":         self.config.best_monitor,
             "config":               self.config,
         }
         if suffix:
@@ -709,14 +869,17 @@ class MaskDistillTrainer:
         self.current_epoch = ckpt["epoch"] + 1
         self.global_step   = ckpt["global_step"]
         self.best_loss     = ckpt.get("best_loss", float("inf"))
-        if ckpt.get("best_monitor") == "semantic_miou_final":
+        if ckpt.get("best_monitor") == self.config.best_monitor:
             self.best_iou = ckpt.get("best_iou", 0.0)
         else:
-            # Older checkpoints stored mask_mIoU in best_iou. The current best
-            # model criterion is Final-PC semantic mIoU, so reset the baseline.
+            # Older checkpoints may have used a different validation monitor,
+            # so reset the baseline for the current run's monitor.
             self.best_iou = 0.0
             if self.is_main:
-                print("[resume] reset best_iou: checkpoint used old monitor, now using semantic_miou_final")
+                print(
+                    "[resume] reset best_iou: checkpoint used old monitor, "
+                    f"now using {self.config.best_monitor}"
+                )
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
 
     # ----------------------------------------------------------
@@ -759,6 +922,11 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("Metrics/Semantic_mAcc_HybridText", val_metrics["semantic_macc_hybrid_text"], epoch)
                         self.writer.add_scalar("Metrics/Semantic_mAcc_CLIPText",   val_metrics["semantic_macc_clip_text"],   epoch)
                         self.writer.add_scalar("Metrics/Semantic_mAcc_FinalPC",    val_metrics["semantic_macc_final"],       epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceFixed",      val_metrics["semantic_miou_dual_space_fixed"],      epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceConfidence", val_metrics["semantic_miou_dual_space_confidence"], epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_ODISEOnlyText256",    val_metrics["semantic_miou_odise_only_text256"],    epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_LSegOnlyText512",     val_metrics["semantic_miou_lseg_only_text512"],     epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_CurrentFusedText256", val_metrics["semantic_miou_current_fused_text256"], epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Hybrid",   val_metrics["n_valid_classes_hybrid"],   epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_CLIP",     val_metrics["n_valid_classes_clip"],     epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Final",    val_metrics["n_valid_classes_final"],    epoch)
@@ -787,6 +955,8 @@ class MaskDistillTrainer:
                             "PerClass_Acc_HybridText": val_metrics.get("per_class_acc_hybrid_text", {}),
                             "PerClass_Acc_CLIPText": val_metrics.get("per_class_acc_clip_text", {}),
                             "PerClass_Acc_FinalPC": val_metrics.get("per_class_acc_final", {}),
+                            "PerClass_IoU_DualSpaceFixed": val_metrics.get("per_class_iou_dual_space_fixed", {}),
+                            "PerClass_IoU_DualSpaceConfidence": val_metrics.get("per_class_iou_dual_space_confidence", {}),
                         }
                         for tag_prefix, per_class in per_class_groups.items():
                             for cls_name, iou_val in per_class.items():
@@ -810,6 +980,15 @@ class MaskDistillTrainer:
                         f"[Final-PC] mIoU={sem_miou_final:.4f} mAcc={sem_macc_final:.4f} ({n_cls} classes)  "
                         f"[MaskIoU] {mask_miou:.4f} ({val_metrics['n_masks']} masks)"
                     )
+                    if "semantic_miou_dual_space_fixed" in val_metrics:
+                        print(
+                            "  [Dual-Space] "
+                            f"odise={val_metrics['semantic_miou_odise_only_text256']:.4f}  "
+                            f"lseg={val_metrics['semantic_miou_lseg_only_text512']:.4f}  "
+                            f"fused={val_metrics['semantic_miou_current_fused_text256']:.4f}  "
+                            f"fixed={val_metrics['semantic_miou_dual_space_fixed']:.4f}  "
+                            f"conf={val_metrics['semantic_miou_dual_space_confidence']:.4f}"
+                        )
                     if "semantic_miou_hybrid_odise256" in val_metrics:
                         print(
                             "  [ODISE-256 probes] "
@@ -833,6 +1012,8 @@ class MaskDistillTrainer:
                             ("Refine@ODISE256", "per_class_iou_refine_odise256"),
                             ("LSegSemProj@ODISE256", "per_class_iou_lseg_semproj_odise256"),
                             ("SemanticQuery@ODISE256", "per_class_iou_semantic_query_odise256"),
+                            ("DualSpaceFixed", "per_class_iou_dual_space_fixed"),
+                            ("DualSpaceConfidence", "per_class_iou_dual_space_confidence"),
                         ):
                             per_cls = val_metrics.get(key, {})
                             if not per_cls:
@@ -845,14 +1026,20 @@ class MaskDistillTrainer:
 
             is_best = False
             if val_metrics is not None:
-                monitored = val_metrics.get("semantic_miou_final", 0.0)
+                monitored = val_metrics.get(
+                    self.config.best_monitor,
+                    val_metrics.get("semantic_miou_final", 0.0),
+                )
                 if monitored > self.best_iou + self.config.early_stopping_min_delta:
                     prev = self.best_iou
                     self.best_iou = monitored
                     self.epochs_without_improvement = 0
                     is_best = True
                     if self.is_main:
-                        print(f"  New best Final-PC semantic mIoU: {monitored:.4f} (prev: {prev:.4f})")
+                        print(
+                            f"  New best {self.config.best_monitor}: "
+                            f"{monitored:.4f} (prev: {prev:.4f})"
+                        )
                 else:
                     self.epochs_without_improvement += 1
                 if val_metrics["loss"] < self.best_loss:

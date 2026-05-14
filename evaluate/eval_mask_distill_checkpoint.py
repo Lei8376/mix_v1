@@ -182,6 +182,15 @@ def main():
         "semantic_pixel_clip_model": trainer_cfg.get("semantic_pixel_clip_model", "ViT-B/32"),
         "semantic_prompt_template": trainer_cfg.get("semantic_prompt_template", "a photo of a {}"),
         "semantic_pc_lambda": trainer_cfg.get("semantic_pc_lambda", 0.5),
+        "dual_space_eval": trainer_cfg.get("dual_space_eval", True),
+        "dual_space_odise_weight": trainer_cfg.get("dual_space_odise_weight", 0.5),
+        "dual_space_lseg_weight": trainer_cfg.get("dual_space_lseg_weight", 0.5),
+        "dual_space_tau_odise": trainer_cfg.get("dual_space_tau_odise", 0.07),
+        "dual_space_tau_lseg": trainer_cfg.get("dual_space_tau_lseg", 0.07),
+        "dual_space_use_confidence": trainer_cfg.get("dual_space_use_confidence", False),
+        "dual_space_conf_min": trainer_cfg.get("dual_space_conf_min", 0.2),
+        "dual_space_conf_max": trainer_cfg.get("dual_space_conf_max", 0.7),
+        "best_monitor": trainer_cfg.get("best_monitor", "semantic_miou_dual_space_fixed"),
         "validation_log_every_batches": trainer_cfg.get("validation_log_every_batches", 25),
     }
     trainer_config_fields = {field.name for field in dataclasses.fields(MaskDistillTrainerConfig)}
