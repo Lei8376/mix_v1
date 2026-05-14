@@ -67,7 +67,9 @@ dataset:
 # ============================================================
 model:
   # 使用预计算 2D 特征训练；这里只显式固定融合维度。
-  # LSeg pixel_pooled 输入仍是 512D，进入模型后投影到 ODISE 原生 256D 空间。
+  # Geometry branch keeps the existing fused 256D query for point-mask matching.
+  # Semantic MoE reads ODISE raw256 and LSeg raw512 in their own text spaces;
+  # it does not project LSeg512 into ODISE256.
   pc_arch: MinkUNet34C
   pixel_embedding_dim: 512
   mask_embedding_dim: 256
@@ -79,9 +81,8 @@ model:
   alpha_mode: fixed
   alpha_init: 1.25
   alpha_max: 2.0  # 只在 alpha_mode=learnable 时使用
-  # Decoupled semantic query:
-  # geometry query remains fused_embeddings for point-mask logits.
-  # semantic query uses normalized ODISE raw256 + independent LSeg semantic projection.
+  # Legacy semantic query is disabled. Source-aware semantic MoE below does not
+  # use pixel_sem_proj, semantic_embeddings, or LSeg512->ODISE256 projection.
   use_semantic_query: false
   semantic_fusion_mode: fixed  # fixed 或 learnable
   semantic_odise_weight: 0.5
@@ -188,7 +189,7 @@ trainer:
   source_gate_loss_weight: 0.03
   source_gate_start_epoch: 3
   source_gate_detach_teacher_probs: true
-  source_gate_detach_pred_logits: false
+  source_gate_detach_pred_logits: true
   source_gate_balance_reg: 0.0
   source_gate_entropy_reg: 0.0
   source_gate_monitor: "semantic_miou_dual_space_gate"

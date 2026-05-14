@@ -308,7 +308,6 @@ def compute_iou(
 
 
 @torch.no_grad()
-@torch.no_grad()
 def diff2scene_point_class_scores(
     point_mask_logits: torch.Tensor,
     mask_class_probs: torch.Tensor,
