@@ -82,7 +82,7 @@ model:
   # Decoupled semantic query:
   # geometry query remains fused_embeddings for point-mask logits.
   # semantic query uses normalized ODISE raw256 + independent LSeg semantic projection.
-  use_semantic_query: true
+  use_semantic_query: false
   semantic_fusion_mode: fixed  # fixed 或 learnable
   semantic_odise_weight: 0.5
   semantic_lseg_weight: 0.5
@@ -90,6 +90,11 @@ model:
   semantic_init_lseg_weight: 0.7
   semantic_proj_path: null  # 例如 runs/eval_only/lseg_to_odise_ridge_probe.pt
   freeze_semantic_proj: true
+  use_source_reliability_gate: true
+  source_gate_input_dim: 14
+  source_gate_hidden_dim: 64
+  source_gate_dropout: 0.1
+  source_gate_init_bias: 0.0
 
 # ============================================================
 # 训练超参数配置
@@ -127,9 +132,9 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.2
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.3
   
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_semantic_query.2
+  log_dir: runs/diff2scene_hybrid_lseg_odise256_semantic_query.3
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
@@ -179,7 +184,15 @@ trainer:
   dual_space_use_confidence: false
   dual_space_conf_min: 0.2
   dual_space_conf_max: 0.7
-  best_monitor: "semantic_miou_dual_space_fixed"
+  source_gate_train: true
+  source_gate_loss_weight: 0.03
+  source_gate_start_epoch: 3
+  source_gate_detach_teacher_probs: true
+  source_gate_detach_pred_logits: false
+  source_gate_balance_reg: 0.0
+  source_gate_entropy_reg: 0.0
+  source_gate_monitor: "semantic_miou_dual_space_gate"
+  best_monitor: "semantic_miou_dual_space_gate"
   
   # 【可选】恢复训练
   # resume: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query/checkpoint_epoch_2.pth # 续训使用最新 256D epoch checkpoint

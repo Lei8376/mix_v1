@@ -49,6 +49,7 @@ from model.open_vocab_fusion_v2 import (  # noqa: E402
     OpenVocab3DFusionModelV2,
     OpenVocabFusionModelV2Config,
 )
+from model.source_reliability_gate import build_source_gate_evidence  # noqa: E402
 
 
 def _load_yaml(path: Path) -> dict:
@@ -113,9 +114,10 @@ def _build_loader(config: dict, split: str, max_samples: int | None, batch_size:
     return dataset, loader
 
 
-def _build_model(config: dict, checkpoint_path: str, device: torch.device):
+def _build_model(config: dict, checkpoint_path: str, device: torch.device, use_source_gate: bool = False):
     model_cfg = config.get("model") or {}
     alpha_max = model_cfg.get("alpha_max", 2.0)
+    enable_source_gate = use_source_gate or bool(model_cfg.get("use_source_reliability_gate", False))
     model = OpenVocab3DFusionModelV2(
         OpenVocabFusionModelV2Config(
             device=str(device),
@@ -130,6 +132,11 @@ def _build_model(config: dict, checkpoint_path: str, device: torch.device):
             use_semantic_query=False,
             semantic_proj_path=None,
             freeze_semantic_proj=True,
+            use_source_reliability_gate=enable_source_gate,
+            source_gate_input_dim=int(model_cfg.get("source_gate_input_dim", 14)),
+            source_gate_hidden_dim=int(model_cfg.get("source_gate_hidden_dim", 64)),
+            source_gate_dropout=float(model_cfg.get("source_gate_dropout", 0.1)),
+            source_gate_init_bias=float(model_cfg.get("source_gate_init_bias", 0.0)),
         )
     ).to(device)
     checkpoint, missing, unexpected = _load_model_state(model, checkpoint_path, str(device))
@@ -187,6 +194,10 @@ def main():
     parser.add_argument("--tau-lseg", type=float, default=0.07)
     parser.add_argument("--odise-weight", type=float, default=0.5)
     parser.add_argument("--lseg-weight", type=float, default=0.5)
+    parser.add_argument("--conf-min", type=float, default=0.2)
+    parser.add_argument("--conf-max", type=float, default=0.7)
+    parser.add_argument("--use-source-gate", action="store_true")
+    parser.add_argument("--save-gate-stats", action="store_true")
     parser.add_argument("--output-json", default=None)
     parser.add_argument("--clip-cache-dir", default=str(REPO_ROOT / "checkpoints" / "pretrained" / "clip"))
     args = parser.parse_args()
@@ -210,7 +221,12 @@ def main():
         config,
         str(Path(_resolve_repo_path(args.checkpoint))),
         device,
+        use_source_gate=args.use_source_gate,
     )
+    model_ref = model.module if hasattr(model, "module") else model
+    source_gate = getattr(model_ref, "source_gate", None)
+    if args.use_source_gate and source_gate is None:
+        raise RuntimeError("--use-source-gate requires model.source_gate in the checkpoint/config.")
 
     prompt = trainer_cfg.get("semantic_prompt_template", "a photo of a {}")
     odise_text256 = build_text_features(
@@ -233,9 +249,12 @@ def main():
         "dual_space_fixed": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
         "dual_space_confidence": _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL),
     }
+    if args.use_source_gate:
+        accs["dual_space_gate"] = _SemanticAccumulator(SCANNET_LABELS_20, IGNORE_LABEL)
 
     total_points = 0
     total_valid_masks = 0
+    gate_values = []
     with torch.no_grad():
         for batch in loader:
             if "pixel_pooled" not in batch:
@@ -269,7 +288,12 @@ def main():
                 p_odise = _class_probs_tau(odise_q, odise_text256, args.tau_odise)
                 p_lseg = _class_probs_tau(lseg_q, clip_text512, args.tau_lseg)
                 p_fixed = w_odise * p_odise + w_lseg * p_lseg
-                p_conf = _dual_space_confidence_probs(p_odise, p_lseg)
+                p_conf = _dual_space_confidence_probs(
+                    p_odise,
+                    p_lseg,
+                    args.conf_min,
+                    args.conf_max,
+                )
 
                 preds = {
                     "odise_only_text256": diff2scene_mask_feature_predict(pred_logits, odise_q, odise_text256),
@@ -278,6 +302,20 @@ def main():
                     "dual_space_fixed": diff2scene_class_probs_predict(pred_logits, p_fixed),
                     "dual_space_confidence": diff2scene_class_probs_predict(pred_logits, p_conf),
                 }
+                if args.use_source_gate:
+                    point_mask_conf = torch.sigmoid(pred_logits).mean(dim=0).detach()
+                    evidence = build_source_gate_evidence(
+                        p_odise,
+                        p_lseg,
+                        point_mask_conf=point_mask_conf,
+                    )
+                    gate = source_gate(evidence)
+                    p_gate = (1.0 - gate) * p_odise + gate * p_lseg
+                    preds["dual_space_gate"] = diff2scene_class_probs_predict(
+                        pred_logits,
+                        p_gate,
+                    )
+                    gate_values.append(gate.detach().reshape(-1).cpu())
                 for name, pred in preds.items():
                     accs[name].update_labels(pred, gt_b)
                 total_points += int(gt_b.numel())
@@ -302,12 +340,23 @@ def main():
         "prompt_template": prompt,
         "odise_text": trainer_cfg.get("semantic_clip_model", "ODISE-256"),
         "clip_text512": trainer_cfg.get("semantic_pixel_clip_model", "ViT-B/32"),
+        "use_source_gate": args.use_source_gate,
+        "save_gate_stats": args.save_gate_stats,
         "missing_keys": missing,
         "unexpected_keys": unexpected,
         "total_points": total_points,
         "total_valid_masks": total_valid_masks,
     }
     output = {"setup": setup, "metrics": metrics}
+    if args.use_source_gate and gate_values:
+        gate_cat = torch.cat(gate_values)
+        gate_stats = {
+            "mean": float(gate_cat.mean().item()),
+            "std": float(gate_cat.std(unbiased=False).item()),
+            "min": float(gate_cat.min().item()),
+            "max": float(gate_cat.max().item()),
+        }
+        output["source_gate_stats"] = gate_stats
 
     print("[DUAL-SPACE SEMANTIC FUSION]")
     print(f"[dual-space] checkpoint={args.checkpoint}")
@@ -322,6 +371,15 @@ def main():
     print(f"Current fused @ ODISE text256:  mIoU={metrics['current_fused_text256']['miou']:.6f}")
     print(f"Dual fixed {w_odise:.1f}/{w_lseg:.1f}:             mIoU={metrics['dual_space_fixed']['miou']:.6f}")
     print(f"Dual confidence fusion:         mIoU={metrics['dual_space_confidence']['miou']:.6f}")
+    if args.use_source_gate:
+        print(f"Dual gate:                      mIoU={metrics['dual_space_gate']['miou']:.6f}")
+        if gate_values:
+            stats = output["source_gate_stats"]
+            print(
+                "[SourceGate] "
+                f"mean={stats['mean']:.6f} std={stats['std']:.6f} "
+                f"min={stats['min']:.6f} max={stats['max']:.6f}"
+            )
 
     if args.output_json:
         out_path = Path(_resolve_repo_path(args.output_json))

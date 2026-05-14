@@ -362,6 +362,33 @@ def diff2scene_point_class_scores(
     return torch.cat(scores, dim=0)
 
 
+def diff2scene_point_class_probs(
+    point_mask_logits: torch.Tensor,
+    mask_class_probs: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiable Eq.3 point class probabilities from mask class probs."""
+    if point_mask_logits.ndim != 2:
+        raise RuntimeError(
+            f"point_mask_logits must be (N,K), got {tuple(point_mask_logits.shape)}"
+        )
+    if mask_class_probs.ndim != 2:
+        raise RuntimeError(
+            f"mask_class_probs must be (K,C), got {tuple(mask_class_probs.shape)}"
+        )
+    if point_mask_logits.shape[1] != mask_class_probs.shape[0]:
+        raise RuntimeError(
+            f"mask count mismatch: logits K={point_mask_logits.shape[1]}, "
+            f"mask_class_probs K={mask_class_probs.shape[0]}"
+        )
+    point_mask_prob = torch.sigmoid(point_mask_logits.float())
+    point_class_scores = point_mask_prob @ mask_class_probs.float()
+    point_class_probs = point_class_scores / point_class_scores.sum(
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(1e-6)
+    return point_class_probs
+
+
 @torch.no_grad()
 def mask_feature_class_probs(
     mask_features: torch.Tensor,

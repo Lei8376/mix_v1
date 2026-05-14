@@ -20,6 +20,7 @@ from evaluate.semantic_iou import (
     diff2scene_dual_mask_class_probs_predict,
     mask_feature_class_probs,
     diff2scene_mask_feature_predict,
+    diff2scene_point_class_probs,
     odise_geometric_mask_feature_predict,
     odise_geometric_dual_mask_predict,
     diff2scene_point_class_scores,

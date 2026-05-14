@@ -371,6 +371,11 @@ def main() -> None:
         semantic_init_lseg_weight=float(_model.get("semantic_init_lseg_weight", 0.5)),
         semantic_proj_path=semantic_proj_path,
         freeze_semantic_proj=bool(_model.get("freeze_semantic_proj", True)),
+        use_source_reliability_gate=bool(_model.get("use_source_reliability_gate", False)),
+        source_gate_input_dim=int(_model.get("source_gate_input_dim", 14)),
+        source_gate_hidden_dim=int(_model.get("source_gate_hidden_dim", 64)),
+        source_gate_dropout=float(_model.get("source_gate_dropout", 0.1)),
+        source_gate_init_bias=float(_model.get("source_gate_init_bias", 0.0)),
     )
 
     # Trainer config
@@ -446,6 +451,14 @@ def main() -> None:
             dual_space_conf_min=_trainer.get("dual_space_conf_min", 0.2),
             dual_space_conf_max=_trainer.get("dual_space_conf_max", 0.7),
             best_monitor=_trainer.get("best_monitor", "semantic_miou_dual_space_fixed"),
+            source_gate_train=_trainer.get("source_gate_train", False),
+            source_gate_loss_weight=_trainer.get("source_gate_loss_weight", 0.03),
+            source_gate_start_epoch=_trainer.get("source_gate_start_epoch", 3),
+            source_gate_detach_teacher_probs=_trainer.get("source_gate_detach_teacher_probs", True),
+            source_gate_detach_pred_logits=_trainer.get("source_gate_detach_pred_logits", False),
+            source_gate_balance_reg=_trainer.get("source_gate_balance_reg", 0.0),
+            source_gate_entropy_reg=_trainer.get("source_gate_entropy_reg", 0.0),
+            source_gate_monitor=_trainer.get("source_gate_monitor", "semantic_miou_dual_space_gate"),
         )
 
     # Validate configuration

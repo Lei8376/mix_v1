@@ -19,9 +19,11 @@ from experiment_mask_distill.semantic_miou import (
     build_text_features,
     diff2scene_class_probs_predict,
     diff2scene_mask_feature_predict,
+    diff2scene_point_class_probs,
     mask_feature_class_probs,
 )
 from evaluate.semantic_iou import _SemanticAccumulator
+from model.source_reliability_gate import build_source_gate_evidence
 from utils.util import AverageMeter
 from trainer.open_vocab_trainer_v2 import MetricsTracker
 
@@ -80,6 +82,15 @@ class MaskDistillTrainerConfig:
     dual_space_conf_min:         float = 0.2
     dual_space_conf_max:         float = 0.7
     best_monitor:                str   = "semantic_miou_dual_space_fixed"
+    # Source-aware Semantic MoE
+    source_gate_train: bool = False
+    source_gate_loss_weight: float = 0.03
+    source_gate_start_epoch: int = 3
+    source_gate_detach_teacher_probs: bool = True
+    source_gate_detach_pred_logits: bool = False
+    source_gate_balance_reg: float = 0.0
+    source_gate_entropy_reg: float = 0.0
+    source_gate_monitor: str = "semantic_miou_dual_space_gate"
 
 
 def _mask_feature_class_probs_tau(
@@ -246,6 +257,116 @@ class MaskDistillTrainer:
             min_points_per_mask=self.config.min_points_per_mask,
         )
 
+    def _compute_source_gate_loss(
+        self,
+        results: Dict,
+        batch: Dict,
+        text_feats: Optional[torch.Tensor],
+        pixel_text_feats: Optional[torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Dict[str, float]]:
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        source_gate = getattr(model_ref, "source_gate", None)
+        empty_logs = {
+            "loss_source_gate": 0.0,
+            "source_gate_mean": 0.0,
+            "source_gate_std": 0.0,
+            "source_gate_min": 0.0,
+            "source_gate_max": 0.0,
+        }
+        if source_gate is None or text_feats is None or pixel_text_feats is None:
+            return None, empty_logs
+
+        lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
+        if lseg_all is None:
+            return None, empty_logs
+
+        loss_gate_total = None
+        num_gate_items = 0
+        gate_values_for_log = []
+        for b in range(len(results["outputs"])):
+            if len(results["outputs"][b]) == 0:
+                continue
+            valid_k = results["mask_valid_from_masks"][b]
+            if not valid_k.any():
+                continue
+            pt_mask = results["batch_indices"] == b
+            gt_b = batch["binary_label_3d"][pt_mask].long()
+            if not ((gt_b >= 0) & (gt_b != 255)).any():
+                continue
+
+            pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
+            pred_logits_for_gate = (
+                pred_logits.detach()
+                if self.config.source_gate_detach_pred_logits
+                else pred_logits
+            )
+            odise_q = batch["mask_embeddings"][b][valid_k].float()
+            lseg_q = lseg_all[b][valid_k].float()
+            if odise_q.shape[-1] != text_feats.shape[-1] or lseg_q.shape[-1] != pixel_text_feats.shape[-1]:
+                continue
+
+            p_odise = _mask_feature_class_probs_tau(
+                odise_q,
+                text_feats,
+                self.config.dual_space_tau_odise,
+            )
+            p_lseg = _mask_feature_class_probs_tau(
+                lseg_q,
+                pixel_text_feats,
+                self.config.dual_space_tau_lseg,
+            )
+            p_odise_gate = p_odise.detach() if self.config.source_gate_detach_teacher_probs else p_odise
+            p_lseg_gate = p_lseg.detach() if self.config.source_gate_detach_teacher_probs else p_lseg
+
+            point_mask_conf = torch.sigmoid(pred_logits_for_gate).mean(dim=0).detach()
+            evidence = build_source_gate_evidence(
+                p_odise_gate,
+                p_lseg_gate,
+                point_mask_conf=point_mask_conf,
+            )
+            gate = source_gate(evidence)
+            p_gate = (1.0 - gate) * p_odise_gate + gate * p_lseg_gate
+            point_probs = diff2scene_point_class_probs(
+                pred_logits_for_gate,
+                p_gate,
+            )
+            loss_gate = F.nll_loss(
+                torch.log(point_probs.clamp_min(1e-8)),
+                gt_b,
+                ignore_index=255,
+            )
+            if torch.isnan(loss_gate) or torch.isinf(loss_gate):
+                continue
+            loss_gate_total = loss_gate if loss_gate_total is None else loss_gate_total + loss_gate
+            num_gate_items += 1
+            gate_values_for_log.append(gate.detach())
+
+        if num_gate_items == 0 or loss_gate_total is None:
+            return None, empty_logs
+
+        loss_gate_total = loss_gate_total / num_gate_items
+        loss_extra = self.config.source_gate_loss_weight * loss_gate_total
+        gate_cat = torch.cat([g.reshape(-1) for g in gate_values_for_log])
+        logs = {
+            "loss_source_gate": float(loss_gate_total.detach().cpu()),
+            "source_gate_mean": float(gate_cat.mean().detach().cpu()),
+            "source_gate_std": float(gate_cat.std(unbiased=False).detach().cpu()),
+            "source_gate_min": float(gate_cat.min().detach().cpu()),
+            "source_gate_max": float(gate_cat.max().detach().cpu()),
+        }
+        if self.config.source_gate_balance_reg > 0:
+            loss_balance = (gate_cat.mean() - 0.5) ** 2
+            loss_extra = loss_extra + self.config.source_gate_balance_reg * loss_balance
+            logs["loss_source_gate_balance"] = float(loss_balance.detach().cpu())
+        if self.config.source_gate_entropy_reg > 0:
+            gate_entropy = -(
+                gate_cat.clamp_min(1e-6).log() * gate_cat
+                + (1.0 - gate_cat).clamp_min(1e-6).log() * (1.0 - gate_cat)
+            ).mean()
+            loss_extra = loss_extra - self.config.source_gate_entropy_reg * gate_entropy
+            logs["loss_source_gate_entropy"] = float(gate_entropy.detach().cpu())
+        return loss_extra, logs
+
     # ----------------------------------------------------------
     # 训练 epoch
     # ----------------------------------------------------------
@@ -255,7 +376,14 @@ class MaskDistillTrainer:
         epoch_loss        = AverageMeter()
         epoch_distill     = AverageMeter()
         epoch_aux         = AverageMeter()
+        epoch_gate        = AverageMeter()
         batch_time        = AverageMeter()
+        gate_train_enabled = (
+            self.config.source_gate_train
+            and epoch >= self.config.source_gate_start_epoch
+        )
+        gate_text_feats = self._get_text_features() if gate_train_enabled else None
+        gate_pixel_text_feats = self._get_pixel_text_features() if gate_train_enabled else None
 
         accum_steps    = self.accum_steps
         is_distributed = hasattr(self.model, "no_sync")
@@ -286,6 +414,28 @@ class MaskDistillTrainer:
                         results  = self.model(batch)
                         criteria = self._make_criteria(results, batch)
                         loss, loss_dict = criteria.compute_loss()
+                        gate_extra, gate_logs = (
+                            self._compute_source_gate_loss(
+                                results,
+                                batch,
+                                gate_text_feats,
+                                gate_pixel_text_feats,
+                            )
+                            if gate_train_enabled
+                            else (
+                                None,
+                                {
+                                    "loss_source_gate": 0.0,
+                                    "source_gate_mean": 0.0,
+                                    "source_gate_std": 0.0,
+                                    "source_gate_min": 0.0,
+                                    "source_gate_max": 0.0,
+                                },
+                            )
+                        )
+                        if gate_extra is not None:
+                            loss = loss + gate_extra
+                        loss_dict.update(gate_logs)
                         if torch.isnan(loss) or torch.isinf(loss):
                             raise ValueError(f"Invalid loss: {loss}")
                     except Exception as e:
@@ -298,6 +448,7 @@ class MaskDistillTrainer:
             epoch_loss.update(loss.item())
             epoch_distill.update(loss_dict["loss_mask_distill"])
             epoch_aux.update(loss_dict["loss_aux"])
+            epoch_gate.update(loss_dict.get("loss_source_gate", 0.0))
             batch_time.update(time.time() - end_time)
             end_time = time.time()
 
@@ -347,6 +498,11 @@ class MaskDistillTrainer:
                     self.writer.add_scalar("Loss/Train_Step",         loss.item(),                        self.global_step)
                     self.writer.add_scalar("Loss/Train_MaskDistill",  loss_dict["loss_mask_distill"],     self.global_step)
                     self.writer.add_scalar("Loss/Train_Aux",          loss_dict["loss_aux"],              self.global_step)
+                    self.writer.add_scalar("Loss/Train_SourceGate",   loss_dict.get("loss_source_gate", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/train_mean",   loss_dict.get("source_gate_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/train_std",    loss_dict.get("source_gate_std", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/train_min",    loss_dict.get("source_gate_min", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/train_max",    loss_dict.get("source_gate_max", 0.0), self.global_step)
                     self.writer.add_scalar("LR", self.optimizer.param_groups[0]["lr"], self.global_step)
 
                     model_ref = self.model.module if hasattr(self.model, "module") else self.model
@@ -378,7 +534,10 @@ class MaskDistillTrainer:
                     f"Epoch [{epoch+1}/{self.config.num_epochs}] "
                     f"Step [{step}/{len(self.train_loader)}] "
                     f"Loss: {loss.item():.4f} "
-                    f"(distill={loss_dict['loss_mask_distill']:.4f} aux={loss_dict['loss_aux']:.4f}) "
+                    f"(distill={loss_dict['loss_mask_distill']:.4f} aux={loss_dict['loss_aux']:.4f} "
+                    f"source_gate={loss_dict.get('loss_source_gate', 0.0):.4f}) "
+                    f"gate_mean={loss_dict.get('source_gate_mean', 0.0):.4f} "
+                    f"gate_std={loss_dict.get('source_gate_std', 0.0):.4f} "
                     f"avg={epoch_loss.avg:.4f}  LR: {lr:.2e}  ETA: {eta:.0f}s"
                 )
 
@@ -401,6 +560,7 @@ class MaskDistillTrainer:
         if self.writer is not None:
             self.writer.add_scalar("Loss/Train_MaskDistill_Epoch", epoch_distill.avg, epoch)
             self.writer.add_scalar("Loss/Train_Aux_Epoch",         epoch_aux.avg,     epoch)
+            self.writer.add_scalar("Loss/Train_SourceGate_Epoch",  epoch_gate.avg,    epoch)
 
         return epoch_loss.avg
 
@@ -487,10 +647,12 @@ class MaskDistillTrainer:
                 "current_fused_text256": _SemanticAccumulator(),
                 "dual_space_fixed": _SemanticAccumulator(),
                 "dual_space_confidence": _SemanticAccumulator(),
+                "dual_space_gate": _SemanticAccumulator(),
             }
             if self.config.dual_space_eval and text_feats is not None and pixel_text_feats is not None
             else None
         )
+        source_gate_val_values = []
         dual_weight_sum = self.config.dual_space_odise_weight + self.config.dual_space_lseg_weight
         if dual_weight_sum <= 0:
             raise ValueError("dual_space_odise_weight + dual_space_lseg_weight must be positive")
@@ -528,7 +690,7 @@ class MaskDistillTrainer:
 
             # ---- 语义 mIoU：Hybrid / CLIP / Final-PC ----
             if pc_tracker is not None:
-                fused_all = results.get("semantic_embeddings", results["fused_embeddings"])
+                fused_all = results["fused_embeddings"]
                 pixel_all = results.get("pixel_pooled_embeddings", None)
                 mask_valid_for_sem = results["mask_valid_from_masks"]
                 for b in range(len(results["outputs"])):
@@ -686,6 +848,22 @@ class MaskDistillTrainer:
                             p_conf,
                         ),
                     }
+                    model_ref = self.model.module if hasattr(self.model, "module") else self.model
+                    source_gate = getattr(model_ref, "source_gate", None)
+                    if source_gate is not None:
+                        point_mask_conf = torch.sigmoid(pred_logits).mean(dim=0).detach()
+                        evidence = build_source_gate_evidence(
+                            p_odise,
+                            p_lseg,
+                            point_mask_conf=point_mask_conf,
+                        )
+                        gate = source_gate(evidence)
+                        p_gate = (1.0 - gate) * p_odise + gate * p_lseg
+                        dual_preds["dual_space_gate"] = diff2scene_class_probs_predict(
+                            pred_logits,
+                            p_gate,
+                        )
+                        source_gate_val_values.append(gate.detach().reshape(-1).cpu())
                     for name, pred in dual_preds.items():
                         dual_space_accs[name].update_labels(
                             pred,
@@ -757,6 +935,12 @@ class MaskDistillTrainer:
             "semantic_macc_dual_space_fixed": 0.0,
             "semantic_miou_dual_space_confidence": 0.0,
             "semantic_macc_dual_space_confidence": 0.0,
+            "semantic_miou_dual_space_gate": 0.0,
+            "semantic_macc_dual_space_gate": 0.0,
+            "source_gate_val_mean": 0.0,
+            "source_gate_val_std": 0.0,
+            "source_gate_val_min": 0.0,
+            "source_gate_val_max": 0.0,
             "semantic_miou_odise_only_text256": 0.0,
             "semantic_miou_lseg_only_text512": 0.0,
             "semantic_miou_current_fused_text256": 0.0,
@@ -789,6 +973,12 @@ class MaskDistillTrainer:
                 val_metrics[f"n_valid_classes_{name}"] = res[f"n_valid_classes_semantic_miou_{name}"]
                 val_metrics[f"per_class_iou_{name}"] = res[f"per_class_iou_semantic_miou_{name}"]
                 val_metrics[f"per_class_acc_{name}"] = res[f"per_class_acc_semantic_miou_{name}"]
+            if source_gate_val_values:
+                gate_cat = torch.cat(source_gate_val_values)
+                val_metrics["source_gate_val_mean"] = float(gate_cat.mean().item())
+                val_metrics["source_gate_val_std"] = float(gate_cat.std(unbiased=False).item())
+                val_metrics["source_gate_val_min"] = float(gate_cat.min().item())
+                val_metrics["source_gate_val_max"] = float(gate_cat.max().item())
 
         if dual_space_accs is not None:
             for name, acc in dual_space_accs.items():
@@ -924,9 +1114,15 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("Metrics/Semantic_mAcc_FinalPC",    val_metrics["semantic_macc_final"],       epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceFixed",      val_metrics["semantic_miou_dual_space_fixed"],      epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceConfidence", val_metrics["semantic_miou_dual_space_confidence"], epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceGate",       val_metrics["semantic_miou_dual_space_gate"],       epoch)
+                        self.writer.add_scalar("Metrics/Semantic_mAcc_DualSpaceGate",       val_metrics["semantic_macc_dual_space_gate"],       epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_ODISEOnlyText256",    val_metrics["semantic_miou_odise_only_text256"],    epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_LSegOnlyText512",     val_metrics["semantic_miou_lseg_only_text512"],     epoch)
                         self.writer.add_scalar("Metrics/Semantic_mIoU_CurrentFusedText256", val_metrics["semantic_miou_current_fused_text256"], epoch)
+                        self.writer.add_scalar("SourceGate/val_mean", val_metrics["source_gate_val_mean"], epoch)
+                        self.writer.add_scalar("SourceGate/val_std",  val_metrics["source_gate_val_std"],  epoch)
+                        self.writer.add_scalar("SourceGate/val_min",  val_metrics["source_gate_val_min"],  epoch)
+                        self.writer.add_scalar("SourceGate/val_max",  val_metrics["source_gate_val_max"],  epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Hybrid",   val_metrics["n_valid_classes_hybrid"],   epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_CLIP",     val_metrics["n_valid_classes_clip"],     epoch)
                         self.writer.add_scalar("Metrics/N_Valid_Classes_Final",    val_metrics["n_valid_classes_final"],    epoch)
@@ -957,6 +1153,7 @@ class MaskDistillTrainer:
                             "PerClass_Acc_FinalPC": val_metrics.get("per_class_acc_final", {}),
                             "PerClass_IoU_DualSpaceFixed": val_metrics.get("per_class_iou_dual_space_fixed", {}),
                             "PerClass_IoU_DualSpaceConfidence": val_metrics.get("per_class_iou_dual_space_confidence", {}),
+                            "PerClass_IoU_DualSpaceGate": val_metrics.get("per_class_iou_dual_space_gate", {}),
                         }
                         for tag_prefix, per_class in per_class_groups.items():
                             for cls_name, iou_val in per_class.items():
@@ -987,7 +1184,15 @@ class MaskDistillTrainer:
                             f"lseg={val_metrics['semantic_miou_lseg_only_text512']:.4f}  "
                             f"fused={val_metrics['semantic_miou_current_fused_text256']:.4f}  "
                             f"fixed={val_metrics['semantic_miou_dual_space_fixed']:.4f}  "
-                            f"conf={val_metrics['semantic_miou_dual_space_confidence']:.4f}"
+                            f"conf={val_metrics['semantic_miou_dual_space_confidence']:.4f}  "
+                            f"gate={val_metrics['semantic_miou_dual_space_gate']:.4f}"
+                        )
+                        print(
+                            "  [SourceGate] "
+                            f"mean={val_metrics['source_gate_val_mean']:.4f}  "
+                            f"std={val_metrics['source_gate_val_std']:.4f}  "
+                            f"min={val_metrics['source_gate_val_min']:.4f}  "
+                            f"max={val_metrics['source_gate_val_max']:.4f}"
                         )
                     if "semantic_miou_hybrid_odise256" in val_metrics:
                         print(
@@ -1014,6 +1219,7 @@ class MaskDistillTrainer:
                             ("SemanticQuery@ODISE256", "per_class_iou_semantic_query_odise256"),
                             ("DualSpaceFixed", "per_class_iou_dual_space_fixed"),
                             ("DualSpaceConfidence", "per_class_iou_dual_space_confidence"),
+                            ("DualSpaceGate", "per_class_iou_dual_space_gate"),
                         ):
                             per_cls = val_metrics.get(key, {})
                             if not per_cls:
@@ -1026,10 +1232,18 @@ class MaskDistillTrainer:
 
             is_best = False
             if val_metrics is not None:
-                monitored = val_metrics.get(
-                    self.config.best_monitor,
-                    val_metrics.get("semantic_miou_final", 0.0),
-                )
+                monitor_name = self.config.best_monitor
+                monitor_value = val_metrics.get(monitor_name, None)
+                if monitor_value is None:
+                    monitor_name = "semantic_miou_dual_space_fixed"
+                    monitor_value = val_metrics.get(monitor_name, None)
+                if monitor_value is None:
+                    monitor_name = "semantic_miou_final"
+                    monitor_value = val_metrics.get(monitor_name, None)
+                if monitor_value is None:
+                    monitor_name = "val_loss"
+                    monitor_value = -val_metrics["loss"]
+                monitored = float(monitor_value)
                 if monitored > self.best_iou + self.config.early_stopping_min_delta:
                     prev = self.best_iou
                     self.best_iou = monitored
@@ -1037,7 +1251,7 @@ class MaskDistillTrainer:
                     is_best = True
                     if self.is_main:
                         print(
-                            f"  New best {self.config.best_monitor}: "
+                            f"  New best {monitor_name}: "
                             f"{monitored:.4f} (prev: {prev:.4f})"
                         )
                 else:

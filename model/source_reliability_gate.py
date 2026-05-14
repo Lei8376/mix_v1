@@ -1,0 +1,134 @@
+"""Source-aware semantic reliability gate for dual-space MoE fusion."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+from torch import nn
+
+
+class SourceReliabilityGate(nn.Module):
+    """Predict per-query, per-class LSeg reliability from teacher evidence.
+
+    gate=0 means prefer ODISE, gate=1 means prefer LSeg.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        init_bias: float = 0.0,
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
+        final_linear = self.net[-2]
+        nn.init.constant_(final_linear.bias, float(init_bias))
+
+    def forward(self, evidence: torch.Tensor) -> torch.Tensor:
+        if evidence.ndim != 3:
+            raise RuntimeError(f"evidence must be (K,C,D), got {tuple(evidence.shape)}")
+        return self.net(evidence).squeeze(-1)
+
+
+def _expand_query_feature(feature: torch.Tensor, c: int) -> torch.Tensor:
+    return feature.unsqueeze(-1).expand(-1, c)
+
+
+def _normalized_optional_query_feature(
+    value: Optional[torch.Tensor],
+    k: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    use_log: bool,
+) -> torch.Tensor:
+    if value is None:
+        return torch.zeros(k, device=device, dtype=dtype)
+    out = value.to(device=device, dtype=dtype).view(k)
+    if use_log:
+        out = torch.log1p(out.clamp_min(0.0))
+        max_val = out.max().clamp_min(1e-6)
+        out = out / max_val
+    else:
+        out = out.clamp(0.0, 1.0)
+    return out
+
+
+def _margin(probs: torch.Tensor) -> torch.Tensor:
+    if probs.shape[-1] < 2:
+        return probs.max(dim=-1).values.clamp(0.0, 1.0)
+    top2 = probs.topk(k=2, dim=-1).values
+    return (top2[:, 0] - top2[:, 1]).clamp(0.0, 1.0)
+
+
+def build_source_gate_evidence(
+    p_odise: torch.Tensor,
+    p_lseg: torch.Tensor,
+    logits_odise: Optional[torch.Tensor] = None,
+    logits_lseg: Optional[torch.Tensor] = None,
+    mask_area: Optional[torch.Tensor] = None,
+    lifted_point_count: Optional[torch.Tensor] = None,
+    point_mask_conf: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build 14D source reliability evidence for each query-class pair.
+
+    logits_odise/logits_lseg are accepted for API extensibility but the first
+    version intentionally uses only normalized probabilities and quality cues.
+    """
+    del logits_odise, logits_lseg
+    if p_odise.shape != p_lseg.shape:
+        raise RuntimeError(
+            f"p_odise and p_lseg shape mismatch: {tuple(p_odise.shape)} vs {tuple(p_lseg.shape)}"
+        )
+    if p_odise.ndim != 2:
+        raise RuntimeError(f"p_odise must be (K,C), got {tuple(p_odise.shape)}")
+
+    p_o = p_odise.float().clamp(1e-6, 1.0)
+    p_l = p_lseg.float().clamp(1e-6, 1.0)
+    k, c = p_o.shape
+    device = p_o.device
+    dtype = p_o.dtype
+
+    max_o = p_o.max(dim=-1).values
+    max_l = p_l.max(dim=-1).values
+    log_c = torch.log(torch.tensor(float(max(c, 2)), device=device, dtype=dtype))
+    ent_o = (-(p_o * p_o.log()).sum(dim=-1) / log_c).clamp(0.0, 1.0)
+    ent_l = (-(p_l * p_l.log()).sum(dim=-1) / log_c).clamp(0.0, 1.0)
+    margin_o = _margin(p_o)
+    margin_l = _margin(p_l)
+    agreement = (p_o.argmax(dim=-1) == p_l.argmax(dim=-1)).to(dtype)
+    area = _normalized_optional_query_feature(mask_area, k, device, dtype, use_log=True)
+    lifted = _normalized_optional_query_feature(lifted_point_count, k, device, dtype, use_log=True)
+    point_conf = _normalized_optional_query_feature(point_mask_conf, k, device, dtype, use_log=False)
+
+    evidence = torch.stack(
+        [
+            p_o,
+            p_l,
+            p_l - p_o,
+            (p_l - p_o).abs(),
+            _expand_query_feature(max_o, c),
+            _expand_query_feature(max_l, c),
+            _expand_query_feature(ent_o, c),
+            _expand_query_feature(ent_l, c),
+            _expand_query_feature(margin_o, c),
+            _expand_query_feature(margin_l, c),
+            _expand_query_feature(agreement, c),
+            _expand_query_feature(area, c),
+            _expand_query_feature(lifted, c),
+            _expand_query_feature(point_conf, c),
+        ],
+        dim=-1,
+    )
+    return evidence
