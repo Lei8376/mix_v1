@@ -419,6 +419,9 @@ def main() -> None:
         dual_branch_probe=bool(_model.get("dual_branch_probe", False)),
         dual_branch_lseg_match_dim=int(_model.get("dual_branch_lseg_match_dim", 512)),
         dual_branch_odise_match_dim=int(_model.get("dual_branch_odise_match_dim", 256)),
+        use_point_semantic_gate=bool(_model.get("use_point_semantic_gate", False)),
+        point_sem_gate_hidden_dim=int(_model.get("point_sem_gate_hidden_dim", 128)),
+        point_sem_gate_init_bias=float(_model.get("point_sem_gate_init_bias", 0.85)),
         alignment_query_mode=str(_model.get("alignment_query_mode", "fused")),
     )
 
@@ -496,7 +499,7 @@ def main() -> None:
             dual_space_use_confidence=_trainer.get("dual_space_use_confidence", False),
             dual_space_conf_min=_trainer.get("dual_space_conf_min", 0.2),
             dual_space_conf_max=_trainer.get("dual_space_conf_max", 0.7),
-            best_monitor=_trainer.get("monitor_metric", _trainer.get("best_monitor", "semantic_miou_dual_space_fixed")),
+            best_monitor=_trainer.get("monitor_metric", _trainer.get("best_monitor", "semantic_miou_learned_point_gate")),
             source_gate_train=_trainer.get("source_gate_train", False),
             source_gate_loss_weight=_trainer.get("source_gate_loss_weight", 0.03),
             source_gate_open_loss_weight=_trainer.get("source_gate_open_loss_weight", 0.03),
@@ -558,6 +561,19 @@ def main() -> None:
             semantic_projected_size_gamma=_trainer.get("semantic_projected_size_gamma", 0.20),
             semantic_projected_size_min=_trainer.get("semantic_projected_size_min", 0.35),
             semantic_projected_size_max=_trainer.get("semantic_projected_size_max", 0.85),
+            use_point_gate_loss=_trainer.get("use_point_gate_loss", False),
+            lambda_point_gate=_trainer.get("lambda_point_gate", 0.05),
+            point_gate_target_scale=_trainer.get("point_gate_target_scale", 10.0),
+            point_gate_target_min=_trainer.get("point_gate_target_min", 0.45),
+            point_gate_target_max=_trainer.get("point_gate_target_max", 0.85),
+            point_gate_target_default=_trainer.get("point_gate_target_default", 0.70),
+            point_gate_min_views=_trainer.get("point_gate_min_views", 2),
+            point_gate_max_points=_trainer.get("point_gate_max_points", 20000),
+            point_gate_loss_type=_trainer.get("point_gate_loss_type", "mse"),
+            point_gate_detach_target=_trainer.get("point_gate_detach_target", True),
+            multiview_batch=multiview_batch,
+            scenes_per_batch=scenes_per_batch,
+            views_per_scene=views_per_scene,
             semantic_readout_mode=_trainer.get("semantic_readout_mode", "projected_gate"),
             eval_only=eval_only,
             lambda_align=_trainer.get("lambda_align", _trainer.get("mask_distill_weight", 1.0)),
@@ -649,6 +665,7 @@ def main() -> None:
             f"val_loss={results.get('loss', 0.0):.4f} "
             f"alignment_loss={results.get('loss_mask_distill', 0.0):.4f} "
             f"mask_iou={results.get('mask_miou', 0.0):.4f} "
+            f"semantic_miou_learned_point_gate={results.get('semantic_miou_learned_point_gate', 0.0):.4f}  "
             f"semantic_miou_projected_gate={results.get('semantic_miou_projected_gate', 0.0):.4f}"
         )
     else:

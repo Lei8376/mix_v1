@@ -49,6 +49,9 @@ class OpenVocabFusionModelV2Config:
     dual_branch_probe: bool = False
     dual_branch_lseg_match_dim: int = 512
     dual_branch_odise_match_dim: int = 256
+    use_point_semantic_gate: bool = False
+    point_sem_gate_hidden_dim: int = 128
+    point_sem_gate_init_bias: float = 0.85
     alignment_query_mode: str = "fused"
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
@@ -144,6 +147,19 @@ class OpenVocab3DFusionModelV2(nn.Module):
                 point_head_in_dim,
                 int(config.dual_branch_lseg_match_dim),
             )
+
+        self.point_sem_gate_head = None
+        if config.use_point_semantic_gate:
+            point_head_in_dim = int(config.pc_last_dim or config.fused_embedding_dim)
+            hidden_dim = int(config.point_sem_gate_hidden_dim)
+            self.point_sem_gate_head = nn.Sequential(
+                nn.Linear(point_head_in_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 1),
+            )
+            final_linear = self.point_sem_gate_head[-1]
+            if hasattr(final_linear, "bias") and final_linear.bias is not None:
+                nn.init.constant_(final_linear.bias, float(config.point_sem_gate_init_bias))
 
         # Learnable temperature for similarity
         self.logit_scale = nn.Parameter(
@@ -463,9 +479,14 @@ class OpenVocab3DFusionModelV2(nn.Module):
         pred_3d = pred_3d_voxel[point_to_voxel_idx, :].float()
         pred_3d_odise = None
         pred_3d_lseg = None
+        point_sem_gate_logits = None
+        point_sem_gate = None
         if self.config.dual_branch_probe:
             pred_3d_odise = self.point_odise_head(pred_3d).float()
             pred_3d_lseg = self.point_lseg_head(pred_3d).float()
+        if self.point_sem_gate_head is not None:
+            point_sem_gate_logits = self.point_sem_gate_head(pred_3d).squeeze(-1).float()
+            point_sem_gate = torch.sigmoid(point_sem_gate_logits)
 
         # Compute per-point, per-mask similarity
         batch_indices = batch_input["ori_coords_3d"][:, 0].long()
@@ -555,6 +576,8 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "pred_3d": pred_3d,
             "pred_3d_odise": pred_3d_odise,
             "pred_3d_lseg": pred_3d_lseg,
+            "point_sem_gate_logits": point_sem_gate_logits,
+            "point_sem_gate": point_sem_gate,
         }
 
     def _pool_pixel_embeddings_for_eval(

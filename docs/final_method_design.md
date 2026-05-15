@@ -2,17 +2,18 @@
 
 ## Final Method
 
-The final method is **Fused Query Alignment + Projected Semantic Gate Readout**.
+The final method is **Fused Query Alignment + Learned Point-level Projected Semantic Gate**.
 
 It separates training-time alignment from inference-time semantic readout:
 
 1. Training uses a fused semantic-region query to supervise 3D point to 2D mask/query alignment.
 2. Semantic readout does not classify with the fused training embedding directly.
-3. Final open-vocabulary semantics come from dual-space score fusion:
+3. A point-level semantic gate is predicted from 3D point features and trained from projected multi-view consistency targets.
+4. Final open-vocabulary semantics come from dual-space score fusion:
    - `P_odise = sim(ODISE_256_feature, ODISE_text_256)`
    - `P_lseg = sim(LSeg_512_feature, CLIP_text_512)`
-   - `P_final = g_sem * P_lseg + (1 - g_sem) * P_odise`
-4. `g_sem` is a **projected semantic gate** computed from point/region-level projected consistency. It is a rule gate used at eval/inference time, not a trained MLP gate.
+   - `P_final = g_pred * P_lseg + (1 - g_pred) * P_odise`
+5. `g_pred` is a learned point-level gate. Its target is produced from projected multi-view semantic consistency, without semantic labels or text supervision in training.
 
 ## Training Path
 
@@ -28,8 +29,9 @@ Training uses:
 
 The default training loss is:
 
-- `L_total = L_align`
+- `L_total = L_align + lambda_point_gate * L_point_gate`
 - `L_align = MaskDistillLoss(pred_mask_logits, lifted_2d_masks)`
+- `L_point_gate = MSE(g_pred, g_target)`
 
 where:
 
@@ -51,7 +53,7 @@ Training does **not** use:
 
 Text is used only at eval/inference time to produce open-vocabulary readout scores.
 
-The default final configuration also keeps the old training-time routing path disabled:
+The default final configuration keeps the old training-time routing path disabled:
 
 - `use_source_reliability_gate: false`
 - `source_gate_train: false`
@@ -70,32 +72,32 @@ Therefore the default alignment query mode is:
 
 - `alignment_query_mode: fused`
 
-## Why Projected Gate for Semantic Readout
+## Why Learned Point Gate for Semantic Readout
 
-Readout ablation showed:
+The rule-based projected gate remains the teacher/baseline. The learned gate upgrades it by:
 
-- `projected_gate` is more stable than `odise_only`
-- `projected_gate` is stronger than `lseg_only`
-- `projected_gate` is slightly stronger and more stable than simple fixed fusion
-- size-aware variants are kept as ablations, not the default
+- predicting `g_pred` directly from 3D point features
+- supervising `g_pred` with projected multi-view ODISE/LSeg consistency
+- keeping the final readout in the dual-score space instead of embedding fusion
 
 Therefore the default semantic readout mode is:
 
-- `semantic_readout_mode: projected_gate`
+- `semantic_readout_mode: learned_point_gate`
 
 ## Projected Gate vs Old SourceGate
 
-The final `projected_gate` is **not** the old SourceGate.
+The learned point gate is **not** the old SourceGate.
 
 Differences:
 
-- no MLP gate training
+- no semantic labels
+- no text supervision during training
+- no ScanNet20 CE
 - no GT semantic supervision
-- no text-free MV loss in the default path
 - no open-reliability target in the default path
 - no GT upper-bound target in the default path
 
-The projected gate is a rule-based readout gate computed from projected semantic consistency across views.
+The rule-based `projected_gate` is still kept as a baseline/readout teacher. The final gate is the learned point-level version trained from projected consistency targets.
 
 ## What Is Main vs Ablation
 
@@ -103,12 +105,13 @@ Main method:
 
 - fused query alignment
 - dual-space semantic score readout
-- projected semantic gate
+- learned point-level projected semantic gate
 
 Ablations:
 
 - `alignment_query_mode: odise_only`
 - `alignment_query_mode: lseg_only`
+- rule-based `projected_gate`
 - fixed fusion weights
 - size-aware fusion
 - projected-size fusion
