@@ -103,7 +103,7 @@ class MaskDistillTrainerConfig:
     source_gate_balance_reg: float = 0.0
     source_gate_entropy_reg: float = 0.0
     source_gate_monitor: str = "semantic_miou_dual_space_gate"
-    source_gate_training_target: str = "text_free_mv_stability"
+    source_gate_training_target: str = "none"
     source_gate_single_weight: float = 1.0
     source_gate_multiview_weight: float = 1.0
     source_gate_conflict_weight: float = 0.5
@@ -594,40 +594,14 @@ class MaskDistillTrainer:
         text_feats: Optional[torch.Tensor],
         pixel_text_feats: Optional[torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
-        target = str(self.config.source_gate_training_target).lower()
-        if target == "none":
-            return None, self._empty_source_gate_logs()
-        if target == "text_free_mv_stability":
-            return self._compute_source_gate_text_free_mv_loss(results, batch)
-        if target == "open_reliability":
-            return self._compute_source_gate_open_reliability_loss(
-                results,
-                batch,
-                text_feats,
-                pixel_text_feats,
-            )
-        if target == "gt_ce_upper_bound":
-            if not self.config.allow_source_gate_gt_ce_upper_bound:
-                raise RuntimeError(
-                    "gt_ce_upper_bound uses semantic GT and is not open-vocabulary training. "
-                    "Set allow_source_gate_gt_ce_upper_bound=true only for upper-bound ablation."
-                )
-            if self.is_main and not self._warned_source_gate_gt_ce:
-                print(
-                    "WARNING: SourceGate GT CE uses semantic ground-truth labels. "
-                    "This is a closed-set supervised upper-bound ablation, not open-vocabulary training."
-                )
-                self._warned_source_gate_gt_ce = True
-            return self._compute_source_gate_gt_ce_upper_bound_loss(
-                results,
-                batch,
-                text_feats,
-                pixel_text_feats,
-            )
-        raise ValueError(
-            "source_gate_training_target must be one of "
-            "{'none', 'text_free_mv_stability', 'open_reliability', 'gt_ce_upper_bound'}, "
-            f"got {self.config.source_gate_training_target!r}"
+        from experiment_mask_distill.legacy.source_gate_legacy import compute_source_gate_loss
+
+        return compute_source_gate_loss(
+            self,
+            results,
+            batch,
+            text_feats,
+            pixel_text_feats,
         )
 
     def _empty_source_gate_logs(self) -> Dict[str, float]:
@@ -1358,95 +1332,8 @@ class MaskDistillTrainer:
         raise RuntimeError(
             "gt_ce_upper_bound uses semantic GT and is not allowed in the open-vocabulary training path."
         )
-        model_ref = self.model.module if hasattr(self.model, "module") else self.model
-        source_gate = getattr(model_ref, "source_gate", None)
-        empty_logs = self._empty_source_gate_logs()
-        if source_gate is None or text_feats is None or pixel_text_feats is None:
-            return None, empty_logs
 
-        lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
-        if lseg_all is None:
-            return None, empty_logs
-
-        loss_gate_total = None
-        num_gate_items = 0
-        gate_values_for_log = []
-        input_dim = _source_gate_input_dim(model_ref)
-        for b in range(len(results["outputs"])):
-            if len(results["outputs"][b]) == 0:
-                continue
-            valid_k = results["mask_valid_from_masks"][b]
-            if not valid_k.any():
-                continue
-            pt_mask = results["batch_indices"] == b
-            gt_b = batch["binary_label_3d"][pt_mask].long()
-            if not ((gt_b >= 0) & (gt_b != 255)).any():
-                continue
-
-            pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
-            pred_logits_for_gate = pred_logits.detach() if self.config.source_gate_detach_pred_logits else pred_logits
-            odise_q = batch["mask_embeddings"][b][valid_k].float()
-            lseg_q = lseg_all[b][valid_k].float()
-            if odise_q.shape[-1] != text_feats.shape[-1] or lseg_q.shape[-1] != pixel_text_feats.shape[-1]:
-                continue
-
-            p_odise = _mask_feature_class_probs_tau(odise_q, text_feats, self.config.dual_space_tau_odise)
-            p_lseg = _mask_feature_class_probs_tau(lseg_q, pixel_text_feats, self.config.dual_space_tau_lseg)
-            p_odise_gate = p_odise.detach() if self.config.source_gate_detach_teacher_probs else p_odise
-            p_lseg_gate = p_lseg.detach() if self.config.source_gate_detach_teacher_probs else p_lseg
-            point_mask_conf = torch.sigmoid(pred_logits_for_gate).mean(dim=0).detach()
-            if input_dim == 6:
-                k = int(point_mask_conf.numel())
-                mv_default = torch.full((k,), self.config.source_gate_mv_default_stability, device=pred_logits.device)
-                mv_valid = torch.zeros(k, device=pred_logits.device)
-                mask_area = batch["masks"][b][valid_k].float().sum(dim=(1, 2)).detach()
-                lifted_count = torch.ones(k, device=pred_logits.device)
-                evidence = build_text_free_source_gate_evidence(
-                    mv_default,
-                    mv_default,
-                    mv_valid,
-                    mask_area,
-                    lifted_count,
-                    point_mask_conf,
-                )
-                gate = source_gate(evidence)
-                p_gate = (1.0 - gate[:, None]) * p_odise_gate + gate[:, None] * p_lseg_gate
-            else:
-                evidence = build_source_gate_evidence(
-                    p_odise_gate,
-                    p_lseg_gate,
-                    point_mask_conf=point_mask_conf,
-                    input_dim=input_dim,
-                )
-                gate = source_gate(evidence)
-                p_gate = (1.0 - gate) * p_odise_gate + gate * p_lseg_gate
-            point_probs = diff2scene_point_class_probs(pred_logits_for_gate, p_gate)
-            loss_gate = F.nll_loss(torch.log(point_probs.clamp_min(1e-8)), gt_b, ignore_index=255)
-            if torch.isnan(loss_gate) or torch.isinf(loss_gate):
-                continue
-            loss_gate_total = loss_gate if loss_gate_total is None else loss_gate_total + loss_gate
-            num_gate_items += 1
-            gate_values_for_log.append(gate.detach())
-
-        if num_gate_items == 0 or loss_gate_total is None:
-            return None, empty_logs
-
-        loss_gate_total = loss_gate_total / num_gate_items
-        loss_extra = self.config.source_gate_loss_weight * loss_gate_total
-        gate_cat = torch.cat([g.reshape(-1) for g in gate_values_for_log])
-        logs = {
-            "loss_source_gate": float(loss_gate_total.detach().cpu()),
-            "loss_source_gate_open": 0.0,
-            "loss_source_gate_gt_ce_upper_bound": float(loss_gate_total.detach().cpu()),
-            "source_gate_mean": float(gate_cat.mean().detach().cpu()),
-            "source_gate_std": float(gate_cat.std(unbiased=False).detach().cpu()),
-            "source_gate_min": float(gate_cat.min().detach().cpu()),
-            "source_gate_max": float(gate_cat.max().detach().cpu()),
-        }
-        loss_extra = self._source_gate_regularizers(loss_extra, gate_cat, logs)
-        return loss_extra, logs
-
-    def _compute_dual_branch_mask_probe(
+    def _compute_dual_branch_mask_probe_impl(
         self,
         results: Dict,
         batch: Dict,
@@ -1612,7 +1499,7 @@ class MaskDistillTrainer:
             ),
         }
 
-    def _compute_projected_semantic_consistency_probe(
+    def _compute_projected_semantic_consistency_probe_impl(
         self,
         results: Dict,
         batch: Dict,
@@ -1821,10 +1708,20 @@ class MaskDistillTrainer:
                             loss = loss + gate_extra
                         loss_dict.update(gate_logs)
                         if self.config.dual_branch_probe:
-                            probe_logs = self._compute_dual_branch_mask_probe(results, batch)
+                            from experiment_mask_distill.legacy.source_gate_legacy import compute_dual_branch_mask_probe
+
+                            probe_logs = compute_dual_branch_mask_probe(self, results, batch)
                             loss_dict.update(probe_logs)
                         if self.config.projected_sem_probe:
-                            projected_logs = self._compute_projected_semantic_consistency_probe(results, batch)
+                            from experiment_mask_distill.legacy.source_gate_legacy import (
+                                compute_projected_semantic_consistency_probe,
+                            )
+
+                            projected_logs = compute_projected_semantic_consistency_probe(
+                                self,
+                                results,
+                                batch,
+                            )
                             loss_dict.update(projected_logs)
                         if gate_train_enabled and gate_target == "text_free_mv_stability":
                             mv_valid_ratio = float(loss_dict.get("source_gate_mv_valid_ratio", 0.0))
@@ -2894,16 +2791,6 @@ class MaskDistillTrainer:
                                 f"min={val_metrics['source_gate_val_min']:.4f}  "
                                 f"max={val_metrics['source_gate_val_max']:.4f}"
                             )
-                    print(
-                        "  [Alignment Query Mode] "
-                        f"mode={self.config.alignment_query_mode}  "
-                        f"val_loss={val_metrics['loss']:.4f}  "
-                        f"mask_iou={val_metrics['mask_miou']:.4f}  "
-                        f"semantic_miou_projected_gate={val_metrics.get('semantic_miou_projected_gate', 0.0):.4f}  "
-                        f"semantic_miou_fixed_05={val_metrics.get('semantic_miou_fixed_05', 0.0):.4f}  "
-                        f"semantic_miou_lseg_only={val_metrics.get('semantic_miou_lseg_only', 0.0):.4f}  "
-                        f"semantic_miou_odise_only={val_metrics.get('semantic_miou_odise_only', 0.0):.4f}"
-                    )
                     if self.config.semantic_readout_ablation:
                         print(
                             "  [Semantic Readout Ablation] "
@@ -2960,30 +2847,31 @@ class MaskDistillTrainer:
                                 sorted(per_cls.items(), key=lambda x: -x[1])[:10]
                             )
                             print(f"  Top-10 classes ({name}): {top10}")
-                        if self.config.semantic_readout_ablation:
-                            print("  [Top-K Per-Class Comparison]")
-                            baseline = val_metrics.get("per_class_iou_lseg_only", {})
-                            for compare_name, metric_key in (
-                                ("ODISEOnly", "per_class_iou_odise_only"),
-                                ("LSeg07", "per_class_iou_lseg_07"),
-                                ("SizeAware", "per_class_iou_size_aware"),
-                                ("ProjectedSizeGate", "per_class_iou_projected_size_gate"),
-                            ):
-                                per_cls = val_metrics.get(metric_key, {})
-                                if not baseline or not per_cls:
-                                    continue
-                                deltas = [
-                                    (cls_name, float(per_cls.get(cls_name, 0.0) - baseline.get(cls_name, 0.0)))
-                                    for cls_name in baseline.keys()
-                                ]
-                                gains = "  ".join(
-                                    f"{k}:{v:+.3f}" for k, v in sorted(deltas, key=lambda x: -x[1])[:5]
-                                )
-                                drops = "  ".join(
-                                    f"{k}:{v:+.3f}" for k, v in sorted(deltas, key=lambda x: x[1])[:5]
-                                )
-                                print(f"    {compare_name} gains: {gains}")
-                                print(f"    {compare_name} drops: {drops}")
+                    if self.is_main and self.config.semantic_readout_ablation:
+                        print("  [Top-K Per-Class Comparison]")
+                        baseline = val_metrics.get("per_class_iou_lseg_only", {})
+                        for compare_name, metric_key in (
+                            ("ODISEOnly", "per_class_iou_odise_only"),
+                            ("LSeg07", "per_class_iou_lseg_07"),
+                            ("ProjectedGate", "per_class_iou_projected_gate"),
+                            ("SizeAware", "per_class_iou_size_aware"),
+                            ("ProjectedSizeGate", "per_class_iou_projected_size_gate"),
+                        ):
+                            per_cls = val_metrics.get(metric_key, {})
+                            if not baseline or not per_cls:
+                                continue
+                            deltas = [
+                                (cls_name, float(per_cls.get(cls_name, 0.0) - baseline.get(cls_name, 0.0)))
+                                for cls_name in baseline.keys()
+                            ]
+                            gains = "  ".join(
+                                f"{k}:{v:+.3f}" for k, v in sorted(deltas, key=lambda x: -x[1])[:5]
+                            )
+                            drops = "  ".join(
+                                f"{k}:{v:+.3f}" for k, v in sorted(deltas, key=lambda x: x[1])[:5]
+                            )
+                            print(f"    {compare_name} gains: {gains}")
+                            print(f"    {compare_name} drops: {drops}")
 
             is_best = False
             if val_metrics is not None:

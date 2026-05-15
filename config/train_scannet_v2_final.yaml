@@ -49,8 +49,8 @@ trainer:
   num_epochs: 100
   val_every_epochs: 2
   save_every_epochs: 1
-  checkpoint_dir: checkpoints/diff2scene_fused_query_projected_gate_final
-  log_dir: runs/diff2scene_fused_query_projected_gate_final
+  checkpoint_dir: checkpoints/diff2scene_fused_query_projected_gate_final_v2
+  log_dir: runs/diff2scene_fused_query_projected_gate_final_v2
   log_every_steps: 20
   grad_clip_norm: 1.0
   early_stopping_patience: 10000
@@ -68,6 +68,7 @@ trainer:
 
   alignment_query_mode: fused
   source_gate_train: false
+  source_gate_training_target: none
   use_lseg_semantic_loss: false
   use_odise_semantic_loss: false
 

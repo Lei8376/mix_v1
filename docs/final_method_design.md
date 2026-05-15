@@ -51,6 +51,13 @@ Training does **not** use:
 
 Text is used only at eval/inference time to produce open-vocabulary readout scores.
 
+The default final configuration also keeps the old training-time routing path disabled:
+
+- `use_source_reliability_gate: false`
+- `source_gate_train: false`
+- `source_gate_training_target: none`
+- `use_semantic_query: false`
+
 ## Why Fused Query for Alignment
 
 Alignment ablation showed:
@@ -115,4 +122,4 @@ Legacy experiments:
 - dual-branch probes
 - projected-sem probe logging
 
-These legacy paths are disabled by default and should only be used for ablation or historical comparison.
+These legacy paths are disabled by default, archived under legacy configs/modules, and should only be used for ablation or historical comparison. The final semantic classifier does not use `semantic_embeddings` or `fused_embeddings` directly; it uses ODISE/LSeg dual-space score fusion with the projected semantic gate.

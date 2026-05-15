@@ -33,7 +33,7 @@ class OpenVocabFusionModelV2Config:
     alpha_mode: str = "learnable"
     alpha_init: float = 1.0
     alpha_max: Optional[float] = 2.0
-    use_semantic_query: bool = True
+    use_semantic_query: bool = False
     semantic_fusion_mode: str = "fixed"
     semantic_odise_weight: float = 0.5
     semantic_lseg_weight: float = 0.5
@@ -41,7 +41,7 @@ class OpenVocabFusionModelV2Config:
     semantic_init_lseg_weight: float = 0.5
     semantic_proj_path: Optional[str] = None
     freeze_semantic_proj: bool = True
-    use_source_reliability_gate: bool = True
+    use_source_reliability_gate: bool = False
     source_gate_input_dim: int = 6
     source_gate_hidden_dim: int = 64
     source_gate_dropout: float = 0.1
@@ -132,15 +132,18 @@ class OpenVocab3DFusionModelV2(nn.Module):
         else:
             self.source_gate = None
 
-        point_head_in_dim = int(config.pc_last_dim or config.fused_embedding_dim)
-        self.point_odise_head = nn.Linear(
-            point_head_in_dim,
-            int(config.dual_branch_odise_match_dim),
-        )
-        self.point_lseg_head = nn.Linear(
-            point_head_in_dim,
-            int(config.dual_branch_lseg_match_dim),
-        )
+        self.point_odise_head = None
+        self.point_lseg_head = None
+        if config.dual_branch_probe:
+            point_head_in_dim = int(config.pc_last_dim or config.fused_embedding_dim)
+            self.point_odise_head = nn.Linear(
+                point_head_in_dim,
+                int(config.dual_branch_odise_match_dim),
+            )
+            self.point_lseg_head = nn.Linear(
+                point_head_in_dim,
+                int(config.dual_branch_lseg_match_dim),
+            )
 
         # Learnable temperature for similarity
         self.logit_scale = nn.Parameter(
@@ -458,8 +461,11 @@ class OpenVocab3DFusionModelV2(nn.Module):
         
         # 用正确的映射索引体素特征：每个点 → 其体素索引 → 体素特征
         pred_3d = pred_3d_voxel[point_to_voxel_idx, :].float()
-        pred_3d_odise = self.point_odise_head(pred_3d).float()
-        pred_3d_lseg = self.point_lseg_head(pred_3d).float()
+        pred_3d_odise = None
+        pred_3d_lseg = None
+        if self.config.dual_branch_probe:
+            pred_3d_odise = self.point_odise_head(pred_3d).float()
+            pred_3d_lseg = self.point_lseg_head(pred_3d).float()
 
         # Compute per-point, per-mask similarity
         batch_indices = batch_input["ori_coords_3d"][:, 0].long()
