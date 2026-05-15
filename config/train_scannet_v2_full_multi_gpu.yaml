@@ -92,10 +92,10 @@ model:
   semantic_proj_path: null  # 例如 runs/eval_only/lseg_to_odise_ridge_probe.pt
   freeze_semantic_proj: true
   use_source_reliability_gate: true
-  source_gate_input_dim: 14
+  source_gate_input_dim: 17
   source_gate_hidden_dim: 64
   source_gate_dropout: 0.1
-  source_gate_init_bias: 0.0
+  source_gate_init_bias: -0.85
 
 # ============================================================
 # 训练超参数配置
@@ -125,7 +125,7 @@ trainer:
                    # - 100% 数据: 100-200 epochs
   
   # ----- 验证和保存 -----
-  val_every_epochs: 1  # 每 N 个 epoch 进行一次验证
+  val_every_epochs: 2  # 每 N 个 epoch 进行一次验证
                        # - 频繁验证: 及时发现问题，但耗时
                        # - 建议: 1-5
   
@@ -133,9 +133,9 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.3
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.moe
   
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_semantic_query.3
+  log_dir: runs/diff2scene_hybrid_lseg_odise256_semantic_query.moe
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
@@ -186,17 +186,29 @@ trainer:
   dual_space_conf_min: 0.2
   dual_space_conf_max: 0.7
   source_gate_train: true
+  source_gate_training_target: open_reliability
   source_gate_loss_weight: 0.03
   source_gate_start_epoch: 3
   source_gate_detach_teacher_probs: true
   source_gate_detach_pred_logits: true
+  source_gate_single_weight: 1.0
+  source_gate_multiview_weight: 1.0
+  source_gate_conflict_weight: 0.5
+  source_gate_odise_prior: 1.2
+  source_gate_lseg_prior: 1.0
+  source_gate_conflict_safe_min: 0.25
+  source_gate_mv_iou_threshold: 0.15
+  source_gate_mv_topk: 5
+  source_gate_mv_min_pairs: 1
+  source_gate_mv_default_stability: 0.5
   source_gate_balance_reg: 0.0
   source_gate_entropy_reg: 0.0
   source_gate_monitor: "semantic_miou_dual_space_gate"
+  allow_source_gate_gt_ce_upper_bound: false
   best_monitor: "semantic_miou_dual_space_gate"
   
   # 【可选】恢复训练
-  # resume: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query/checkpoint_epoch_2.pth # 续训使用最新 256D epoch checkpoint
+  resume: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.moe/checkpoint_epoch_22.pth # 续训使用最新 256D epoch checkpoint
 
 # ============================================================
 # 随机种子（确保可复现性）

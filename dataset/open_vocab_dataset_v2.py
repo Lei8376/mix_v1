@@ -552,6 +552,8 @@ class OpenVocabScannetDatasetV2(torch.utils.data.Dataset):
         out["binary_label_3d"] = out_3d["binary_label_3d"]
         out["binary_label_2d"] = out_3d["binary_label_2d"]
         out["label_2d"] = out_3d["label_2d"]
+        out["scene_name"] = scene_name
+        out["frame_stem"] = frame_stem
         return out
 
 
@@ -584,6 +586,8 @@ def open_vocab_collate_v2(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     binary_label_3d_list = []
     binary_label_2d_list = []
     label_2d_list = []
+    scene_names = []
+    frame_stems = []
 
     offset = 0
     for b, item in enumerate(batch):
@@ -604,6 +608,8 @@ def open_vocab_collate_v2(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         binary_label_3d_list.append(item["binary_label_3d"])
         binary_label_2d_list.append(item["binary_label_2d"])
         label_2d_list.append(item["label_2d"])
+        scene_names.append(item.get("scene_name", ""))
+        frame_stems.append(item.get("frame_stem", str(b)))
         offset += item["coords_3d"].shape[0]
 
     # 给 coords_3d / ori_coords_3d 第一列填 batch 索引
@@ -631,6 +637,8 @@ def open_vocab_collate_v2(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "binary_label_3d": torch.cat(binary_label_3d_list, dim=0),
         "binary_label_2d": torch.cat(binary_label_2d_list, dim=0),
         "label_2d": torch.cat(label_2d_list, dim=0),
+        "scene_name": scene_names,
+        "frame_stem": frame_stems,
     }
     if has_clip_pooled:
         out["clip_pooled"] = clip_pooled

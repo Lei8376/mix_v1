@@ -41,11 +41,11 @@ class OpenVocabFusionModelV2Config:
     semantic_init_lseg_weight: float = 0.5
     semantic_proj_path: Optional[str] = None
     freeze_semantic_proj: bool = True
-    use_source_reliability_gate: bool = False
-    source_gate_input_dim: int = 14
+    use_source_reliability_gate: bool = True
+    source_gate_input_dim: int = 17
     source_gate_hidden_dim: int = 64
     source_gate_dropout: float = 0.1
-    source_gate_init_bias: float = 0.0
+    source_gate_init_bias: float = -0.85
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
     lseg_ckpt_path: Optional[str] = None

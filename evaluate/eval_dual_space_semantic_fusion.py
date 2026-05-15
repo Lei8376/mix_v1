@@ -133,10 +133,10 @@ def _build_model(config: dict, checkpoint_path: str, device: torch.device, use_s
             semantic_proj_path=None,
             freeze_semantic_proj=True,
             use_source_reliability_gate=enable_source_gate,
-            source_gate_input_dim=int(model_cfg.get("source_gate_input_dim", 14)),
+            source_gate_input_dim=int(model_cfg.get("source_gate_input_dim", 17)),
             source_gate_hidden_dim=int(model_cfg.get("source_gate_hidden_dim", 64)),
             source_gate_dropout=float(model_cfg.get("source_gate_dropout", 0.1)),
-            source_gate_init_bias=float(model_cfg.get("source_gate_init_bias", 0.0)),
+            source_gate_init_bias=float(model_cfg.get("source_gate_init_bias", -0.85)),
         )
     ).to(device)
     checkpoint, missing, unexpected = _load_model_state(model, checkpoint_path, str(device))
@@ -308,6 +308,7 @@ def main():
                         p_odise,
                         p_lseg,
                         point_mask_conf=point_mask_conf,
+                        input_dim=int(getattr(getattr(model_ref, "config", None), "source_gate_input_dim", 17)),
                     )
                     gate = source_gate(evidence)
                     p_gate = (1.0 - gate) * p_odise + gate * p_lseg

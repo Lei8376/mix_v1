@@ -80,13 +80,21 @@ def build_source_gate_evidence(
     mask_area: Optional[torch.Tensor] = None,
     lifted_point_count: Optional[torch.Tensor] = None,
     point_mask_conf: Optional[torch.Tensor] = None,
+    mv_odise_stability: Optional[torch.Tensor] = None,
+    mv_lseg_stability: Optional[torch.Tensor] = None,
+    mv_valid: Optional[torch.Tensor] = None,
+    input_dim: int = 17,
 ) -> torch.Tensor:
-    """Build 14D source reliability evidence for each query-class pair.
+    """Build source reliability evidence for each query-text pair.
 
     logits_odise/logits_lseg are accepted for API extensibility but the first
     version intentionally uses only normalized probabilities and quality cues.
+    input_dim=14 preserves the original evidence layout for old checkpoints;
+    input_dim=17 appends multiview ODISE/LSeg stability and multiview validity.
     """
     del logits_odise, logits_lseg
+    if input_dim not in (14, 17):
+        raise ValueError(f"source gate evidence supports input_dim 14 or 17, got {input_dim}")
     if p_odise.shape != p_lseg.shape:
         raise RuntimeError(
             f"p_odise and p_lseg shape mismatch: {tuple(p_odise.shape)} vs {tuple(p_lseg.shape)}"
@@ -111,24 +119,34 @@ def build_source_gate_evidence(
     area = _normalized_optional_query_feature(mask_area, k, device, dtype, use_log=True)
     lifted = _normalized_optional_query_feature(lifted_point_count, k, device, dtype, use_log=True)
     point_conf = _normalized_optional_query_feature(point_mask_conf, k, device, dtype, use_log=False)
+    mv_o = _normalized_optional_query_feature(mv_odise_stability, k, device, dtype, use_log=False)
+    mv_l = _normalized_optional_query_feature(mv_lseg_stability, k, device, dtype, use_log=False)
+    mv_ok = _normalized_optional_query_feature(mv_valid, k, device, dtype, use_log=False)
 
-    evidence = torch.stack(
-        [
-            p_o,
-            p_l,
-            p_l - p_o,
-            (p_l - p_o).abs(),
-            _expand_query_feature(max_o, c),
-            _expand_query_feature(max_l, c),
-            _expand_query_feature(ent_o, c),
-            _expand_query_feature(ent_l, c),
-            _expand_query_feature(margin_o, c),
-            _expand_query_feature(margin_l, c),
-            _expand_query_feature(agreement, c),
-            _expand_query_feature(area, c),
-            _expand_query_feature(lifted, c),
-            _expand_query_feature(point_conf, c),
-        ],
-        dim=-1,
-    )
+    evidence_parts = [
+        p_o,
+        p_l,
+        p_l - p_o,
+        (p_l - p_o).abs(),
+        _expand_query_feature(max_o, c),
+        _expand_query_feature(max_l, c),
+        _expand_query_feature(ent_o, c),
+        _expand_query_feature(ent_l, c),
+        _expand_query_feature(margin_o, c),
+        _expand_query_feature(margin_l, c),
+        _expand_query_feature(agreement, c),
+        _expand_query_feature(area, c),
+        _expand_query_feature(lifted, c),
+        _expand_query_feature(point_conf, c),
+    ]
+    if input_dim == 17:
+        evidence_parts.extend(
+            [
+                _expand_query_feature(mv_o, c),
+                _expand_query_feature(mv_l, c),
+                _expand_query_feature(mv_ok, c),
+            ]
+        )
+
+    evidence = torch.stack(evidence_parts, dim=-1)
     return evidence

@@ -371,11 +371,11 @@ def main() -> None:
         semantic_init_lseg_weight=float(_model.get("semantic_init_lseg_weight", 0.5)),
         semantic_proj_path=semantic_proj_path,
         freeze_semantic_proj=bool(_model.get("freeze_semantic_proj", True)),
-        use_source_reliability_gate=bool(_model.get("use_source_reliability_gate", False)),
-        source_gate_input_dim=int(_model.get("source_gate_input_dim", 14)),
+        use_source_reliability_gate=bool(_model.get("use_source_reliability_gate", True)),
+        source_gate_input_dim=int(_model.get("source_gate_input_dim", 17)),
         source_gate_hidden_dim=int(_model.get("source_gate_hidden_dim", 64)),
         source_gate_dropout=float(_model.get("source_gate_dropout", 0.1)),
-        source_gate_init_bias=float(_model.get("source_gate_init_bias", 0.0)),
+        source_gate_init_bias=float(_model.get("source_gate_init_bias", -0.85)),
     )
 
     # Trainer config
@@ -459,6 +459,20 @@ def main() -> None:
             source_gate_balance_reg=_trainer.get("source_gate_balance_reg", 0.0),
             source_gate_entropy_reg=_trainer.get("source_gate_entropy_reg", 0.0),
             source_gate_monitor=_trainer.get("source_gate_monitor", "semantic_miou_dual_space_gate"),
+            source_gate_training_target=_trainer.get("source_gate_training_target", "open_reliability"),
+            source_gate_single_weight=_trainer.get("source_gate_single_weight", 1.0),
+            source_gate_multiview_weight=_trainer.get("source_gate_multiview_weight", 1.0),
+            source_gate_conflict_weight=_trainer.get("source_gate_conflict_weight", 0.5),
+            source_gate_odise_prior=_trainer.get("source_gate_odise_prior", 1.2),
+            source_gate_lseg_prior=_trainer.get("source_gate_lseg_prior", 1.0),
+            source_gate_conflict_safe_min=_trainer.get("source_gate_conflict_safe_min", 0.25),
+            source_gate_mv_iou_threshold=_trainer.get("source_gate_mv_iou_threshold", 0.15),
+            source_gate_mv_topk=_trainer.get("source_gate_mv_topk", 5),
+            source_gate_mv_min_pairs=_trainer.get("source_gate_mv_min_pairs", 1),
+            source_gate_mv_default_stability=_trainer.get("source_gate_mv_default_stability", 0.5),
+            allow_source_gate_gt_ce_upper_bound=_trainer.get("allow_source_gate_gt_ce_upper_bound", False),
+            source_gate_train_query_file=_trainer.get("source_gate_train_query_file", None),
+            source_gate_num_train_queries=_trainer.get("source_gate_num_train_queries", 64),
         )
 
     # Validate configuration
