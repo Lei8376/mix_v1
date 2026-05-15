@@ -49,7 +49,7 @@ from model.open_vocab_fusion_v2 import (  # noqa: E402
     OpenVocab3DFusionModelV2,
     OpenVocabFusionModelV2Config,
 )
-from model.source_reliability_gate import build_source_gate_evidence  # noqa: E402
+from model.source_reliability_gate import build_source_gate_evidence, build_text_free_source_gate_evidence  # noqa: E402
 
 
 def _load_yaml(path: Path) -> dict:
@@ -133,7 +133,7 @@ def _build_model(config: dict, checkpoint_path: str, device: torch.device, use_s
             semantic_proj_path=None,
             freeze_semantic_proj=True,
             use_source_reliability_gate=enable_source_gate,
-            source_gate_input_dim=int(model_cfg.get("source_gate_input_dim", 17)),
+            source_gate_input_dim=int(model_cfg.get("source_gate_input_dim", 6)),
             source_gate_hidden_dim=int(model_cfg.get("source_gate_hidden_dim", 64)),
             source_gate_dropout=float(model_cfg.get("source_gate_dropout", 0.1)),
             source_gate_init_bias=float(model_cfg.get("source_gate_init_bias", -0.85)),
@@ -304,14 +304,32 @@ def main():
                 }
                 if args.use_source_gate:
                     point_mask_conf = torch.sigmoid(pred_logits).mean(dim=0).detach()
-                    evidence = build_source_gate_evidence(
-                        p_odise,
-                        p_lseg,
-                        point_mask_conf=point_mask_conf,
-                        input_dim=int(getattr(getattr(model_ref, "config", None), "source_gate_input_dim", 17)),
-                    )
-                    gate = source_gate(evidence)
-                    p_gate = (1.0 - gate) * p_odise + gate * p_lseg
+                    input_dim = int(getattr(getattr(model_ref, "config", None), "source_gate_input_dim", 6))
+                    if input_dim == 6:
+                        k = int(pred_logits.shape[1])
+                        mv_default = torch.full((k,), 0.5, device=pred_logits.device, dtype=pred_logits.dtype)
+                        mv_valid = torch.zeros(k, device=pred_logits.device, dtype=pred_logits.dtype)
+                        mask_area = torch.zeros(k, device=pred_logits.device, dtype=pred_logits.dtype)
+                        lifted_count = torch.zeros(k, device=pred_logits.device, dtype=pred_logits.dtype)
+                        evidence = build_text_free_source_gate_evidence(
+                            mv_default,
+                            mv_default,
+                            mv_valid,
+                            mask_area,
+                            lifted_count,
+                            point_mask_conf,
+                        )
+                        gate = source_gate(evidence)
+                        p_gate = (1.0 - gate[:, None]) * p_odise + gate[:, None] * p_lseg
+                    else:
+                        evidence = build_source_gate_evidence(
+                            p_odise,
+                            p_lseg,
+                            point_mask_conf=point_mask_conf,
+                            input_dim=input_dim,
+                        )
+                        gate = source_gate(evidence)
+                        p_gate = (1.0 - gate) * p_odise + gate * p_lseg
                     preds["dual_space_gate"] = diff2scene_class_probs_predict(
                         pred_logits,
                         p_gate,

@@ -23,7 +23,7 @@ from experiment_mask_distill.semantic_miou import (
     mask_feature_class_probs,
 )
 from evaluate.semantic_iou import _SemanticAccumulator
-from model.source_reliability_gate import build_source_gate_evidence
+from model.source_reliability_gate import build_source_gate_evidence, build_text_free_source_gate_evidence
 from utils.util import AverageMeter
 from trainer.open_vocab_trainer_v2 import MetricsTracker
 
@@ -85,13 +85,14 @@ class MaskDistillTrainerConfig:
     # Source-aware Semantic MoE
     source_gate_train: bool = False
     source_gate_loss_weight: float = 0.03
+    source_gate_open_loss_weight: float = 0.03
     source_gate_start_epoch: int = 3
     source_gate_detach_teacher_probs: bool = True
     source_gate_detach_pred_logits: bool = False
     source_gate_balance_reg: float = 0.0
     source_gate_entropy_reg: float = 0.0
     source_gate_monitor: str = "semantic_miou_dual_space_gate"
-    source_gate_training_target: str = "open_reliability"
+    source_gate_training_target: str = "text_free_mv_stability"
     source_gate_single_weight: float = 1.0
     source_gate_multiview_weight: float = 1.0
     source_gate_conflict_weight: float = 0.5
@@ -101,7 +102,10 @@ class MaskDistillTrainerConfig:
     source_gate_mv_iou_threshold: float = 0.15
     source_gate_mv_topk: int = 5
     source_gate_mv_min_pairs: int = 1
+    source_gate_mv_min_lifted_points: int = 2
     source_gate_mv_default_stability: float = 0.5
+    source_gate_mask_quality_weight: float = 1.0
+    source_gate_point_conf_weight: float = 1.0
     allow_source_gate_gt_ce_upper_bound: bool = False
     source_gate_train_query_file: Optional[str] = None
     source_gate_num_train_queries: int = 64
@@ -143,7 +147,7 @@ def _dual_space_confidence_probs(
 
 def _source_gate_input_dim(model_ref) -> int:
     cfg = getattr(model_ref, "config", None)
-    return int(getattr(cfg, "source_gate_input_dim", 17))
+    return int(getattr(cfg, "source_gate_input_dim", 6))
 
 
 def _semantic_query_entropy(probs: torch.Tensor) -> torch.Tensor:
@@ -174,6 +178,7 @@ def compute_multiview_mask_stability(
     topk: int = 5,
     min_pairs: int = 1,
     default_stability: float = 0.5,
+    min_lifted_points: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Estimate per-mask same-teacher embedding stability across overlapping views."""
     device = odise_feats.device
@@ -196,11 +201,11 @@ def compute_multiview_mask_stability(
     odise_norm = F.normalize(odise_feats.float(), dim=-1)
     lseg_norm = F.normalize(lseg_feats.float(), dim=-1)
     for i in range(k):
-        if not point_sets[i]:
+        if len(point_sets[i]) < int(min_lifted_points):
             continue
         matches = []
         for j in range(k):
-            if i == j or not point_sets[j]:
+            if i == j or len(point_sets[j]) < int(min_lifted_points):
                 continue
             if scene_ids[i] != scene_ids[j] or view_ids[i] == view_ids[j]:
                 continue
@@ -224,6 +229,71 @@ def compute_multiview_mask_stability(
         mv_lseg[i] = _weighted_mean(sim_l, weights).to(dtype)
         mv_valid[i] = 1.0
     return mv_odise.clamp(0.0, 1.0), mv_lseg.clamp(0.0, 1.0), mv_valid
+
+
+def compute_text_free_mv_mask_stability(
+    mask_point_indices,
+    odise_feats: torch.Tensor,
+    lseg_feats: torch.Tensor,
+    scene_ids: Optional[list] = None,
+    view_ids: Optional[list] = None,
+    iou_threshold: float = 0.15,
+    topk: int = 5,
+    default_stability: float = 0.5,
+    min_lifted_points: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return compute_multiview_mask_stability(
+        mask_point_indices=mask_point_indices,
+        odise_feats=odise_feats,
+        lseg_feats=lseg_feats,
+        scene_ids=scene_ids,
+        view_ids=view_ids,
+        iou_threshold=iou_threshold,
+        topk=topk,
+        min_pairs=1,
+        default_stability=default_stability,
+        min_lifted_points=min_lifted_points,
+    )
+
+
+def _normalize_log_vector(value: torch.Tensor) -> torch.Tensor:
+    out = torch.log1p(value.float().clamp_min(0.0))
+    return out / out.max().clamp_min(1e-6)
+
+
+def build_text_free_mv_gate_target(
+    mv_odise: torch.Tensor,
+    mv_lseg: torch.Tensor,
+    mv_valid: torch.Tensor,
+    mask_area: torch.Tensor,
+    lifted_point_count: torch.Tensor,
+    point_mask_conf: torch.Tensor,
+    odise_prior: float = 1.2,
+    lseg_prior: float = 1.0,
+    mask_quality_weight: float = 1.0,
+    point_conf_weight: float = 1.0,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    area_q = _normalize_log_vector(mask_area)
+    lift_q = _normalize_log_vector(lifted_point_count)
+    point_q = point_mask_conf.float().clamp(0.0, 1.0)
+    mask_quality = (area_q + lift_q + float(point_conf_weight) * point_q) / (2.0 + float(point_conf_weight))
+    mask_quality = (float(mask_quality_weight) * mask_quality).clamp(0.0, 1.0)
+
+    neutral = torch.full_like(mv_odise, 0.5)
+    st_o = torch.where(mv_valid.bool(), mv_odise, neutral).clamp(0.0, 1.0)
+    st_l = torch.where(mv_valid.bool(), mv_lseg, neutral).clamp(0.0, 1.0)
+    r_o = float(odise_prior) * st_o * mask_quality
+    r_l = float(lseg_prior) * st_l * mask_quality
+    target_g = r_l / (r_o + r_l + eps)
+
+    mv_boost = torch.where(mv_valid.bool(), torch.ones_like(mv_valid), torch.full_like(mv_valid, 0.5))
+    loss_weight = mask_quality * mv_boost
+    loss_weight = loss_weight / loss_weight.mean().clamp_min(eps)
+    logs = {
+        "source_gate_mask_quality_mean": float(mask_quality.detach().mean().cpu()),
+    }
+    return target_g.detach(), loss_weight.detach(), logs
 
 
 def build_open_reliability_gate_target(
@@ -428,6 +498,8 @@ class MaskDistillTrainer:
         target = str(self.config.source_gate_training_target).lower()
         if target == "none":
             return None, self._empty_source_gate_logs()
+        if target == "text_free_mv_stability":
+            return self._compute_source_gate_text_free_mv_loss(results, batch)
         if target == "open_reliability":
             return self._compute_source_gate_open_reliability_loss(
                 results,
@@ -455,7 +527,7 @@ class MaskDistillTrainer:
             )
         raise ValueError(
             "source_gate_training_target must be one of "
-            "{'none', 'open_reliability', 'gt_ce_upper_bound'}, "
+            "{'none', 'text_free_mv_stability', 'open_reliability', 'gt_ce_upper_bound'}, "
             f"got {self.config.source_gate_training_target!r}"
         )
 
@@ -474,6 +546,7 @@ class MaskDistillTrainer:
             "source_gate_mv_odise_mean": 0.0,
             "source_gate_mv_lseg_mean": 0.0,
             "source_gate_conflict_mean": 0.0,
+            "source_gate_mask_quality_mean": 0.0,
         }
 
     def _source_gate_regularizers(
@@ -494,6 +567,167 @@ class MaskDistillTrainer:
             loss_extra = loss_extra - self.config.source_gate_entropy_reg * gate_entropy
             logs["loss_source_gate_entropy"] = float(gate_entropy.detach().cpu())
         return loss_extra
+
+    def _collect_text_free_gate_items(self, results: Dict, batch: Dict):
+        lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
+        if lseg_all is None:
+            return None
+        with torch.no_grad():
+            lifted, lifted_valid = build_lifted_3d_masks(
+                batch["masks"],
+                batch["mask_valid"],
+                batch["x_label"],
+                batch["y_label"],
+                results["batch_indices"],
+            )
+
+        global_mask_points = []
+        global_odise = []
+        global_lseg = []
+        global_scene_ids = []
+        global_view_ids = []
+        item_records = []
+        scene_names = batch.get("scene_name")
+        frame_stems = batch.get("frame_stem")
+
+        for b in range(len(results["outputs"])):
+            if len(results["outputs"][b]) == 0:
+                continue
+            valid_k = results["mask_valid_from_masks"][b]
+            if not valid_k.any():
+                continue
+            odise_q = batch["mask_embeddings"][b][valid_k].float()
+            lseg_q = lseg_all[b][valid_k].float()
+            pt_mask = results["batch_indices"] == b
+            lifted_b = lifted[pt_mask][:, valid_k]
+            lifted_valid_b = lifted_valid[pt_mask]
+            mask_points = [
+                torch.where((lifted_b[:, k] > 0.5) & lifted_valid_b)[0]
+                for k in range(lifted_b.shape[1])
+            ]
+            start = len(global_mask_points)
+            global_mask_points.extend(mask_points)
+            global_odise.append(odise_q)
+            global_lseg.append(lseg_q)
+            scene_id = scene_names[b] if isinstance(scene_names, (list, tuple)) and b < len(scene_names) else str(b)
+            view_id = frame_stems[b] if isinstance(frame_stems, (list, tuple)) and b < len(frame_stems) else str(b)
+            global_scene_ids.extend([scene_id] * int(valid_k.sum().item()))
+            global_view_ids.extend([view_id] * int(valid_k.sum().item()))
+            item_records.append((b, valid_k, start, len(mask_points), mask_points))
+
+        if not item_records:
+            return None
+        global_odise_t = torch.cat(global_odise, dim=0)
+        global_lseg_t = torch.cat(global_lseg, dim=0)
+        mv_odise_all, mv_lseg_all, mv_valid_all = compute_text_free_mv_mask_stability(
+            global_mask_points,
+            global_odise_t,
+            global_lseg_t,
+            scene_ids=global_scene_ids,
+            view_ids=global_view_ids,
+            iou_threshold=self.config.source_gate_mv_iou_threshold,
+            topk=self.config.source_gate_mv_topk,
+            default_stability=self.config.source_gate_mv_default_stability,
+            min_lifted_points=self.config.source_gate_mv_min_lifted_points,
+        )
+        return lseg_all, item_records, mv_odise_all, mv_lseg_all, mv_valid_all
+
+    def _compute_source_gate_text_free_mv_loss(
+        self,
+        results: Dict,
+        batch: Dict,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        source_gate = getattr(model_ref, "source_gate", None)
+        empty_logs = self._empty_source_gate_logs()
+        if source_gate is None:
+            return None, empty_logs
+
+        collected = self._collect_text_free_gate_items(results, batch)
+        if collected is None:
+            return None, empty_logs
+        lseg_all, item_records, mv_odise_all, mv_lseg_all, mv_valid_all = collected
+
+        loss_gate_total = None
+        num_gate_items = 0
+        gate_values_for_log = []
+        target_values_for_log = []
+        mv_valid_values = []
+        mv_odise_values = []
+        mv_lseg_values = []
+        mask_quality_values = []
+
+        for b, valid_k, start, count, mask_points in item_records:
+            pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
+            pred_logits_for_gate = pred_logits.detach() if self.config.source_gate_detach_pred_logits else pred_logits
+            point_mask_conf = torch.sigmoid(pred_logits_for_gate).mean(dim=0).detach()
+            lifted_point_count = torch.tensor(
+                [float(idx.numel()) for idx in mask_points],
+                device=pred_logits.device,
+                dtype=pred_logits.dtype,
+            )
+            mask_area = batch["masks"][b][valid_k].float().sum(dim=(1, 2)).detach()
+            mv_slice = slice(start, start + count)
+            mv_odise = mv_odise_all[mv_slice].to(pred_logits.device)
+            mv_lseg = mv_lseg_all[mv_slice].to(pred_logits.device)
+            mv_valid = mv_valid_all[mv_slice].to(pred_logits.device)
+
+            target_g, loss_weight, target_logs = build_text_free_mv_gate_target(
+                mv_odise,
+                mv_lseg,
+                mv_valid,
+                mask_area,
+                lifted_point_count,
+                point_mask_conf,
+                odise_prior=self.config.source_gate_odise_prior,
+                lseg_prior=self.config.source_gate_lseg_prior,
+                mask_quality_weight=self.config.source_gate_mask_quality_weight,
+                point_conf_weight=self.config.source_gate_point_conf_weight,
+            )
+            evidence = build_text_free_source_gate_evidence(
+                mv_odise,
+                mv_lseg,
+                mv_valid,
+                mask_area,
+                lifted_point_count,
+                point_mask_conf,
+            )
+            gate = source_gate(evidence)
+            loss_gate = ((gate - target_g) ** 2 * loss_weight).sum() / loss_weight.sum().clamp_min(1.0)
+            if torch.isnan(loss_gate) or torch.isinf(loss_gate):
+                continue
+            loss_gate_total = loss_gate if loss_gate_total is None else loss_gate_total + loss_gate
+            num_gate_items += 1
+            gate_values_for_log.append(gate.detach())
+            target_values_for_log.append(target_g.detach())
+            mv_valid_values.append(mv_valid.detach())
+            mv_odise_values.append(mv_odise.detach())
+            mv_lseg_values.append(mv_lseg.detach())
+            mask_quality_values.append(torch.tensor(target_logs["source_gate_mask_quality_mean"], device=gate.device))
+
+        if num_gate_items == 0 or loss_gate_total is None:
+            return None, empty_logs
+
+        loss_gate_total = loss_gate_total / num_gate_items
+        loss_extra = self.config.source_gate_open_loss_weight * loss_gate_total
+        gate_cat = torch.cat([g.reshape(-1) for g in gate_values_for_log])
+        logs = {
+            "loss_source_gate": float(loss_gate_total.detach().cpu()),
+            "loss_source_gate_open": float(loss_gate_total.detach().cpu()),
+            "loss_source_gate_gt_ce_upper_bound": 0.0,
+            "source_gate_mean": float(gate_cat.mean().detach().cpu()),
+            "source_gate_std": float(gate_cat.std(unbiased=False).detach().cpu()),
+            "source_gate_min": float(gate_cat.min().detach().cpu()),
+            "source_gate_max": float(gate_cat.max().detach().cpu()),
+            "source_gate_target_mean": float(torch.cat(target_values_for_log).mean().detach().cpu()),
+            "source_gate_target_std": float(torch.cat(target_values_for_log).std(unbiased=False).detach().cpu()),
+            "source_gate_mv_valid_ratio": float(torch.cat(mv_valid_values).float().mean().detach().cpu()),
+            "source_gate_mv_odise_mean": float(torch.cat(mv_odise_values).mean().detach().cpu()),
+            "source_gate_mv_lseg_mean": float(torch.cat(mv_lseg_values).mean().detach().cpu()),
+            "source_gate_mask_quality_mean": float(torch.stack(mask_quality_values).mean().detach().cpu()),
+        }
+        loss_extra = self._source_gate_regularizers(loss_extra, gate_cat, logs)
+        return loss_extra, logs
 
     def _compute_source_gate_open_reliability_loss(
         self,
@@ -723,14 +957,31 @@ class MaskDistillTrainer:
             p_odise_gate = p_odise.detach() if self.config.source_gate_detach_teacher_probs else p_odise
             p_lseg_gate = p_lseg.detach() if self.config.source_gate_detach_teacher_probs else p_lseg
             point_mask_conf = torch.sigmoid(pred_logits_for_gate).mean(dim=0).detach()
-            evidence = build_source_gate_evidence(
-                p_odise_gate,
-                p_lseg_gate,
-                point_mask_conf=point_mask_conf,
-                input_dim=input_dim,
-            )
-            gate = source_gate(evidence)
-            p_gate = (1.0 - gate) * p_odise_gate + gate * p_lseg_gate
+            if input_dim == 6:
+                k = int(point_mask_conf.numel())
+                mv_default = torch.full((k,), self.config.source_gate_mv_default_stability, device=pred_logits.device)
+                mv_valid = torch.zeros(k, device=pred_logits.device)
+                mask_area = batch["masks"][b][valid_k].float().sum(dim=(1, 2)).detach()
+                lifted_count = torch.ones(k, device=pred_logits.device)
+                evidence = build_text_free_source_gate_evidence(
+                    mv_default,
+                    mv_default,
+                    mv_valid,
+                    mask_area,
+                    lifted_count,
+                    point_mask_conf,
+                )
+                gate = source_gate(evidence)
+                p_gate = (1.0 - gate[:, None]) * p_odise_gate + gate[:, None] * p_lseg_gate
+            else:
+                evidence = build_source_gate_evidence(
+                    p_odise_gate,
+                    p_lseg_gate,
+                    point_mask_conf=point_mask_conf,
+                    input_dim=input_dim,
+                )
+                gate = source_gate(evidence)
+                p_gate = (1.0 - gate) * p_odise_gate + gate * p_lseg_gate
             point_probs = diff2scene_point_class_probs(pred_logits_for_gate, p_gate)
             loss_gate = F.nll_loss(torch.log(point_probs.clamp_min(1e-8)), gt_b, ignore_index=255)
             if torch.isnan(loss_gate) or torch.isinf(loss_gate):
@@ -772,7 +1023,8 @@ class MaskDistillTrainer:
             self.config.source_gate_train
             and epoch >= self.config.source_gate_start_epoch
         )
-        if gate_train_enabled:
+        gate_target = str(self.config.source_gate_training_target).lower()
+        if gate_train_enabled and gate_target in {"open_reliability", "gt_ce_upper_bound"}:
             gate_text_feats, gate_pixel_text_feats = self._get_source_gate_text_features()
         else:
             gate_text_feats, gate_pixel_text_feats = None, None
@@ -886,6 +1138,7 @@ class MaskDistillTrainer:
                     self.writer.add_scalar("Loss/Train_Aux",          loss_dict["loss_aux"],              self.global_step)
                     self.writer.add_scalar("Loss/Train_SourceGate",   loss_dict.get("loss_source_gate", 0.0), self.global_step)
                     self.writer.add_scalar("Loss/Train_SourceGate_Open", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
+                    self.writer.add_scalar("Loss/Train_SourceGate_TextFreeMV", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
                     self.writer.add_scalar("Loss/Train_SourceGate_OpenReliability", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
                     self.writer.add_scalar("Loss/Train_SourceGate_GTCE_UpperBound", loss_dict.get("loss_source_gate_gt_ce_upper_bound", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/train_mean",   loss_dict.get("source_gate_mean", 0.0), self.global_step)
@@ -898,6 +1151,7 @@ class MaskDistillTrainer:
                     self.writer.add_scalar("SourceGate/mv_odise_mean", loss_dict.get("source_gate_mv_odise_mean", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/mv_lseg_mean", loss_dict.get("source_gate_mv_lseg_mean", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/conflict_mean", loss_dict.get("source_gate_conflict_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/mask_quality_mean", loss_dict.get("source_gate_mask_quality_mean", 0.0), self.global_step)
                     self.writer.add_scalar("LR", self.optimizer.param_groups[0]["lr"], self.global_step)
 
                     model_ref = self.model.module if hasattr(self.model, "module") else self.model
@@ -945,7 +1199,7 @@ class MaskDistillTrainer:
                         f"mv_valid={loss_dict.get('source_gate_mv_valid_ratio', 0.0):.3f} "
                         f"mv_odise={loss_dict.get('source_gate_mv_odise_mean', 0.0):.3f} "
                         f"mv_lseg={loss_dict.get('source_gate_mv_lseg_mean', 0.0):.3f} "
-                        f"conflict={loss_dict.get('source_gate_conflict_mean', 0.0):.3f} "
+                        f"mask_quality={loss_dict.get('source_gate_mask_quality_mean', 0.0):.3f} "
                         f"gate_mean={loss_dict.get('source_gate_mean', 0.0):.4f} "
                         f"gate_std={loss_dict.get('source_gate_std', 0.0):.4f}"
                     )
@@ -1303,14 +1557,32 @@ class MaskDistillTrainer:
                     source_gate = getattr(model_ref, "source_gate", None)
                     if source_gate is not None:
                         point_mask_conf = torch.sigmoid(pred_logits).mean(dim=0).detach()
-                        evidence = build_source_gate_evidence(
-                            p_odise,
-                            p_lseg,
-                            point_mask_conf=point_mask_conf,
-                            input_dim=_source_gate_input_dim(model_ref),
-                        )
-                        gate = source_gate(evidence)
-                        p_gate = (1.0 - gate) * p_odise + gate * p_lseg
+                        input_dim = _source_gate_input_dim(model_ref)
+                        if input_dim == 6:
+                            lifted_b = lifted[pt_mask][:, valid_k]
+                            lifted_point_count = (lifted_b > 0.5).float().sum(dim=0)
+                            mask_area = batch["masks"][b][valid_k].float().sum(dim=(1, 2))
+                            mv_default = torch.full_like(point_mask_conf, self.config.source_gate_mv_default_stability)
+                            mv_valid = torch.zeros_like(point_mask_conf)
+                            evidence = build_text_free_source_gate_evidence(
+                                mv_default,
+                                mv_default,
+                                mv_valid,
+                                mask_area,
+                                lifted_point_count,
+                                point_mask_conf,
+                            )
+                            gate = source_gate(evidence)
+                            p_gate = (1.0 - gate[:, None]) * p_odise + gate[:, None] * p_lseg
+                        else:
+                            evidence = build_source_gate_evidence(
+                                p_odise,
+                                p_lseg,
+                                point_mask_conf=point_mask_conf,
+                                input_dim=input_dim,
+                            )
+                            gate = source_gate(evidence)
+                            p_gate = (1.0 - gate) * p_odise + gate * p_lseg
                         dual_preds["dual_space_gate"] = diff2scene_class_probs_predict(
                             pred_logits,
                             p_gate,

@@ -9,7 +9,7 @@ from torch import nn
 
 
 class SourceReliabilityGate(nn.Module):
-    """Predict per-query, per-class LSeg reliability from teacher evidence.
+    """Predict LSeg reliability from teacher/mask evidence.
 
     gate=0 means prefer ODISE, gate=1 means prefer LSeg.
     """
@@ -37,8 +37,8 @@ class SourceReliabilityGate(nn.Module):
         nn.init.constant_(final_linear.bias, float(init_bias))
 
     def forward(self, evidence: torch.Tensor) -> torch.Tensor:
-        if evidence.ndim != 3:
-            raise RuntimeError(f"evidence must be (K,C,D), got {tuple(evidence.shape)}")
+        if evidence.ndim not in (2, 3):
+            raise RuntimeError(f"evidence must be (K,D) or (K,Q,D), got {tuple(evidence.shape)}")
         return self.net(evidence).squeeze(-1)
 
 
@@ -63,6 +63,14 @@ def _normalized_optional_query_feature(
     else:
         out = out.clamp(0.0, 1.0)
     return out
+
+
+def normalize_log_feature(value: Optional[torch.Tensor], k: int) -> torch.Tensor:
+    if value is None:
+        raise ValueError("text-free source gate evidence requires all mask quality features")
+    out = value.float().view(k)
+    out = torch.log1p(out.clamp_min(0.0))
+    return out / out.max().clamp_min(1e-6)
 
 
 def _margin(probs: torch.Tensor) -> torch.Tensor:
@@ -149,4 +157,43 @@ def build_source_gate_evidence(
         )
 
     evidence = torch.stack(evidence_parts, dim=-1)
+    return evidence
+
+
+def build_text_free_source_gate_evidence(
+    mv_odise_stability: torch.Tensor,
+    mv_lseg_stability: torch.Tensor,
+    mv_valid: torch.Tensor,
+    mask_area: torch.Tensor,
+    lifted_point_count: torch.Tensor,
+    point_mask_conf: torch.Tensor,
+) -> torch.Tensor:
+    """Build 6D text-free mask-level source reliability evidence.
+
+    Evidence layout:
+      1. ODISE multiview stability
+      2. LSeg multiview stability
+      3. multiview validity
+      4. normalized mask area
+      5. normalized lifted point count
+      6. point-mask confidence
+    """
+    k = int(mv_odise_stability.numel())
+    if any(int(x.numel()) != k for x in (mv_lseg_stability, mv_valid, mask_area, lifted_point_count, point_mask_conf)):
+        raise RuntimeError("text-free source gate evidence inputs must all be shape (K,)")
+    device = mv_odise_stability.device
+    dtype = mv_odise_stability.dtype
+    area = normalize_log_feature(mask_area.to(device=device), k).to(dtype)
+    lifted = normalize_log_feature(lifted_point_count.to(device=device), k).to(dtype)
+    evidence = torch.stack(
+        [
+            mv_odise_stability.to(device=device, dtype=dtype).view(k).clamp(0.0, 1.0),
+            mv_lseg_stability.to(device=device, dtype=dtype).view(k).clamp(0.0, 1.0),
+            mv_valid.to(device=device, dtype=dtype).view(k).clamp(0.0, 1.0),
+            area,
+            lifted,
+            point_mask_conf.to(device=device, dtype=dtype).view(k).clamp(0.0, 1.0),
+        ],
+        dim=-1,
+    )
     return evidence

@@ -42,7 +42,7 @@ class OpenVocabFusionModelV2Config:
     semantic_proj_path: Optional[str] = None
     freeze_semantic_proj: bool = True
     use_source_reliability_gate: bool = True
-    source_gate_input_dim: int = 17
+    source_gate_input_dim: int = 6
     source_gate_hidden_dim: int = 64
     source_gate_dropout: float = 0.1
     source_gate_init_bias: float = -0.85
