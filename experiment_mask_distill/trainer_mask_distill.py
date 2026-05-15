@@ -82,7 +82,17 @@ class MaskDistillTrainerConfig:
     dual_space_use_confidence:   bool  = False
     dual_space_conf_min:         float = 0.2
     dual_space_conf_max:         float = 0.7
-    best_monitor:                str   = "semantic_miou_dual_space_fixed"
+    best_monitor:                str   = "semantic_miou_projected_gate"
+    lambda_align:                float = 1.0
+    semantic_readout_mode:       str   = "projected_gate"
+    eval_only:                   bool  = False
+    use_lseg_semantic_loss:      bool  = False
+    use_odise_semantic_loss:     bool  = False
+    enable_verbose_legacy_probes: bool = False
+    enable_legacy_source_gate_logs: bool = False
+    enable_size_aware_ablation:  bool  = True
+    enable_projected_size_gate_ablation: bool = True
+    allow_gt_ce_upper_bound:     bool  = False
     # Source-aware Semantic MoE
     source_gate_train: bool = False
     source_gate_loss_weight: float = 0.03
@@ -106,12 +116,45 @@ class MaskDistillTrainerConfig:
     source_gate_mv_min_lifted_points: int = 2
     source_gate_mv_min_valid_masks: int = 2
     source_gate_skip_when_no_mv: bool = True
+    source_gate_target_gamma: float = 2.0
+    source_gate_mv_margin: float = 0.03
+    source_gate_use_margin_filter: bool = True
     source_gate_mv_default_stability: float = 0.5
     source_gate_mask_quality_weight: float = 1.0
     source_gate_point_conf_weight: float = 1.0
     allow_source_gate_gt_ce_upper_bound: bool = False
     source_gate_train_query_file: Optional[str] = None
     source_gate_num_train_queries: int = 64
+    dual_branch_probe: bool = False
+    dual_branch_probe_weight: float = 0.0
+    dual_branch_oracle_margin: float = 0.02
+    dual_branch_probe_log_every: int = 20
+    projected_sem_probe: bool = False
+    projected_sem_probe_min_views: int = 2
+    projected_sem_probe_max_points: int = 4096
+    projected_sem_probe_region_mode: str = "point"
+    projected_sem_probe_iou_weighted: bool = False
+    projected_sem_probe_log_every: int = 20
+    projected_sem_gate_scale: float = 10.0
+    alignment_query_mode: str = "fused"
+    semantic_readout_ablation: bool = False
+    semantic_size_aware: bool = True
+    semantic_small_area_thr: float = 0.01
+    semantic_medium_area_thr: float = 0.10
+    semantic_small_lseg_weight: float = 0.45
+    semantic_medium_lseg_weight: float = 0.65
+    semantic_large_lseg_weight: float = 0.80
+    semantic_projected_gate: bool = True
+    semantic_projected_gate_scale: float = 10.0
+    semantic_projected_gate_min: float = 0.45
+    semantic_projected_gate_max: float = 0.85
+    semantic_projected_gate_default: float = 0.70
+    semantic_projected_size_gate: bool = True
+    semantic_projected_size_base: float = 0.65
+    semantic_projected_size_beta: float = 1.0
+    semantic_projected_size_gamma: float = 0.20
+    semantic_projected_size_min: float = 0.35
+    semantic_projected_size_max: float = 0.85
 
 
 def _mask_feature_class_probs_tau(
@@ -179,6 +222,23 @@ def _compute_batch_multiview_probe_logs(batch: Dict[str, Any]) -> Dict[str, floa
             "batch_unique_scenes": 0.0,
             "batch_frames_per_scene_mean": 0.0,
             "batch_same_scene_pair_count": 0.0,
+            "dual_branch_odise_loss_mean": 0.0,
+            "dual_branch_lseg_loss_mean": 0.0,
+            "dual_branch_fixed_loss_mean": 0.0,
+            "dual_branch_oracle_loss_mean": 0.0,
+            "dual_branch_odise_iou_mean": 0.0,
+            "dual_branch_lseg_iou_mean": 0.0,
+            "dual_branch_fixed_iou_mean": 0.0,
+            "dual_branch_oracle_iou_mean": 0.0,
+            "dual_branch_delta_loss_mean": 0.0,
+            "dual_branch_delta_loss_std": 0.0,
+            "dual_branch_odise_win_rate": 0.0,
+            "dual_branch_lseg_win_rate": 0.0,
+            "dual_branch_clear_win_rate": 0.0,
+            "dual_branch_oracle_gain_vs_best_single_loss": 0.0,
+            "dual_branch_oracle_gain_vs_fixed_loss": 0.0,
+            "dual_branch_oracle_gain_vs_best_single_iou": 0.0,
+            "dual_branch_oracle_gain_vs_fixed_iou": 0.0,
         }
     scene_counter = collections.Counter(str(scene) for scene in scene_names)
     same_scene_pair_count = sum(count * (count - 1) // 2 for count in scene_counter.values())
@@ -295,10 +355,11 @@ def build_text_free_mv_gate_target(
     point_mask_conf: torch.Tensor,
     odise_prior: float = 1.2,
     lseg_prior: float = 1.0,
+    target_gamma: float = 2.0,
     mask_quality_weight: float = 1.0,
     point_conf_weight: float = 1.0,
     eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     area_q = _normalize_log_vector(mask_area)
     lift_q = _normalize_log_vector(lifted_point_count)
     point_q = point_mask_conf.float().clamp(0.0, 1.0)
@@ -308,17 +369,21 @@ def build_text_free_mv_gate_target(
     neutral = torch.full_like(mv_odise, 0.5)
     st_o = torch.where(mv_valid.bool(), mv_odise, neutral).clamp(0.0, 1.0)
     st_l = torch.where(mv_valid.bool(), mv_lseg, neutral).clamp(0.0, 1.0)
-    r_o = float(odise_prior) * st_o * mask_quality
-    r_l = float(lseg_prior) * st_l * mask_quality
+    r_o_raw = float(odise_prior) * st_o
+    r_l_raw = float(lseg_prior) * st_l
+    diff = torch.abs(r_l_raw - r_o_raw)
+    gamma = float(target_gamma)
+    r_o = (r_o_raw.clamp_min(eps) ** gamma) * mask_quality
+    r_l = (r_l_raw.clamp_min(eps) ** gamma) * mask_quality
     target_g = r_l / (r_o + r_l + eps)
 
-    mv_boost = torch.where(mv_valid.bool(), torch.ones_like(mv_valid), torch.full_like(mv_valid, 0.5))
-    loss_weight = mask_quality * mv_boost
+    loss_weight = mask_quality
     loss_weight = loss_weight / loss_weight.mean().clamp_min(eps)
     logs = {
         "source_gate_mask_quality_mean": float(mask_quality.detach().mean().cpu()),
+        "source_gate_mv_diff_mean": float(diff.detach().mean().cpu()),
     }
-    return target_g.detach(), loss_weight.detach(), logs
+    return target_g.detach(), loss_weight.detach(), diff.detach(), logs
 
 
 def build_open_reliability_gate_target(
@@ -445,6 +510,12 @@ class MaskDistillTrainer:
         self._source_gate_zero_mv_steps = 0
         self._warned_source_gate_zero_mv = False
 
+        if str(self.config.source_gate_training_target).lower() == "gt_ce_upper_bound":
+            if not (self.config.allow_gt_ce_upper_bound and self.config.allow_source_gate_gt_ce_upper_bound):
+                raise RuntimeError(
+                    "gt_ce_upper_bound uses semantic GT and is not allowed in the open-vocabulary training path."
+                )
+
         if self.config.resume_checkpoint:
             self._load_checkpoint(self.config.resume_checkpoint)
 
@@ -452,6 +523,7 @@ class MaskDistillTrainer:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             total     = sum(p.numel() for p in model.parameters())
             print(f"[MaskDistillTrainer] Parameters: {trainable:,} trainable / {total:,} total")
+            print(f"[Alignment] query_mode={self.config.alignment_query_mode}")
             print(f"  mask_distill_weight={self.config.mask_distill_weight}  "
                   f"bce_weight={self.config.bce_weight}  "
                   f"dice_weight={self.config.dice_weight}")
@@ -575,8 +647,14 @@ class MaskDistillTrainer:
             "source_gate_skipped_no_mv": 0.0,
             "source_gate_mv_odise_mean": 0.0,
             "source_gate_mv_lseg_mean": 0.0,
+            "source_gate_mv_diff_mean": 0.0,
+            "source_gate_mv_diff_valid_mean": 0.0,
+            "source_gate_loss_valid_count": 0.0,
+            "source_gate_loss_valid_ratio": 0.0,
             "source_gate_gate_mean_valid": 0.0,
+            "source_gate_gate_std_valid": 0.0,
             "source_gate_target_mean_valid": 0.0,
+            "source_gate_target_std_valid": 0.0,
             "source_gate_mv_odise_mean_valid": 0.0,
             "source_gate_mv_lseg_mean_valid": 0.0,
             "source_gate_conflict_mean": 0.0,
@@ -604,6 +682,262 @@ class MaskDistillTrainer:
             loss_extra = loss_extra - self.config.source_gate_entropy_reg * gate_entropy
             logs["loss_source_gate_entropy"] = float(gate_entropy.detach().cpu())
         return loss_extra
+
+    def _empty_dual_branch_logs(self) -> Dict[str, float]:
+        return {
+            "dual_branch_odise_loss_mean": 0.0,
+            "dual_branch_lseg_loss_mean": 0.0,
+            "dual_branch_fixed_loss_mean": 0.0,
+            "dual_branch_oracle_loss_mean": 0.0,
+            "dual_branch_odise_iou_mean": 0.0,
+            "dual_branch_lseg_iou_mean": 0.0,
+            "dual_branch_fixed_iou_mean": 0.0,
+            "dual_branch_oracle_iou_mean": 0.0,
+            "dual_branch_delta_loss_mean": 0.0,
+            "dual_branch_delta_loss_std": 0.0,
+            "dual_branch_odise_win_rate": 0.0,
+            "dual_branch_lseg_win_rate": 0.0,
+            "dual_branch_clear_win_rate": 0.0,
+            "dual_branch_oracle_gain_vs_best_single_loss": 0.0,
+            "dual_branch_oracle_gain_vs_fixed_loss": 0.0,
+            "dual_branch_oracle_gain_vs_best_single_iou": 0.0,
+            "dual_branch_oracle_gain_vs_fixed_iou": 0.0,
+        }
+
+    def _empty_projected_sem_logs(self) -> Dict[str, float]:
+        return {
+            "projected_sem_point_count_total": 0.0,
+            "projected_sem_point_count_valid": 0.0,
+            "projected_sem_valid_ratio": 0.0,
+            "projected_sem_view_count_mean": 0.0,
+            "projected_sem_view_count_max": 0.0,
+            "projected_sem_odise_consistency_mean": 0.0,
+            "projected_sem_lseg_consistency_mean": 0.0,
+            "projected_sem_odise_consistency_std": 0.0,
+            "projected_sem_lseg_consistency_std": 0.0,
+            "projected_sem_diff_mean": 0.0,
+            "projected_sem_diff_std": 0.0,
+            "projected_sem_abs_diff_mean": 0.0,
+            "projected_sem_odise_win_rate": 0.0,
+            "projected_sem_lseg_win_rate": 0.0,
+            "projected_sem_clear_win_rate_001": 0.0,
+            "projected_sem_clear_win_rate_003": 0.0,
+            "projected_sem_clear_win_rate_005": 0.0,
+            "projected_sem_g_sem_rule_mean": 0.0,
+            "projected_sem_g_sem_rule_std": 0.0,
+            "projected_sem_g_sem_rule_min": 0.0,
+            "projected_sem_g_sem_rule_max": 0.0,
+        }
+
+    def _semantic_ablation_names(self) -> Tuple[str, ...]:
+        return (
+            "odise_only",
+            "lseg_only",
+            "fixed_05",
+            "lseg_06",
+            "lseg_07",
+            "lseg_08",
+            "size_aware",
+            "projected_gate",
+            "projected_size_gate",
+        )
+
+    def _semantic_size_group_names(self) -> Tuple[str, ...]:
+        return ("small", "medium", "large")
+
+    def _compute_size_aware_lseg_weight(self, mask_area_ratio: torch.Tensor) -> torch.Tensor:
+        small_thr = float(self.config.semantic_small_area_thr)
+        medium_thr = float(self.config.semantic_medium_area_thr)
+        weight = torch.full_like(mask_area_ratio, float(self.config.semantic_large_lseg_weight))
+        weight = torch.where(
+            mask_area_ratio < medium_thr,
+            torch.full_like(weight, float(self.config.semantic_medium_lseg_weight)),
+            weight,
+        )
+        weight = torch.where(
+            mask_area_ratio < small_thr,
+            torch.full_like(weight, float(self.config.semantic_small_lseg_weight)),
+            weight,
+        )
+        return weight.clamp(0.0, 1.0)
+
+    def _build_eval_semantic_aux(
+        self,
+        results: Dict,
+        batch: Dict,
+        lifted: torch.Tensor,
+        lifted_valid: torch.Tensor,
+        lseg_all,
+    ) -> Dict[str, Any]:
+        batch_size = len(results["outputs"])
+        point_groups = [None] * batch_size
+        projected_mask_diff = {}
+        projected_mask_valid = {}
+        if lseg_all is None:
+            return {
+                "point_groups": point_groups,
+                "projected_mask_diff": projected_mask_diff,
+                "projected_mask_valid": projected_mask_valid,
+            }
+
+        scene_names = batch.get("scene_name") or []
+        point_to_entries = collections.defaultdict(list)
+        point_to_views = collections.defaultdict(set)
+        mask_stats = collections.defaultdict(list)
+
+        for b in range(batch_size):
+            if len(results["outputs"][b]) == 0:
+                continue
+            valid_k = results["mask_valid_from_masks"][b]
+            if not valid_k.any():
+                continue
+            pt_mask = results["batch_indices"] == b
+            if not pt_mask.any():
+                continue
+
+            pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
+            lifted_b = lifted[pt_mask][:, valid_k]
+            lifted_valid_b = lifted_valid[pt_mask]
+            odise_q = batch["mask_embeddings"][b][valid_k].float()
+            lseg_q = lseg_all[b][valid_k].float()
+            point_coords = batch["ori_coords_3d"][pt_mask][:, 1:4].long()
+            mask_area = batch["masks"][b][valid_k].float().sum(dim=(1, 2))
+            image_area = float(batch["masks"][b].shape[-1] * batch["masks"][b].shape[-2])
+            mask_area_ratio = (mask_area / max(image_area, 1.0)).clamp(0.0, 1.0)
+            point_conf = torch.sigmoid(pred_logits)
+            point_group = torch.full(
+                (point_coords.shape[0],),
+                -1,
+                dtype=torch.long,
+                device=point_coords.device,
+            )
+            scene_name = (
+                str(scene_names[b])
+                if isinstance(scene_names, (list, tuple)) and b < len(scene_names)
+                else str(b)
+            )
+
+            for n in range(point_coords.shape[0]):
+                if not bool(lifted_valid_b[n]):
+                    continue
+                mask_ids = torch.where(lifted_b[n] > 0.5)[0]
+                if mask_ids.numel() == 0:
+                    continue
+                choose_idx = mask_ids[point_conf[n, mask_ids].argmax()]
+                area_ratio = float(mask_area_ratio[choose_idx].item())
+                if area_ratio < float(self.config.semantic_small_area_thr):
+                    point_group[n] = 0
+                elif area_ratio < float(self.config.semantic_medium_area_thr):
+                    point_group[n] = 1
+                else:
+                    point_group[n] = 2
+
+                key = (
+                    scene_name,
+                    int(point_coords[n, 0].item()),
+                    int(point_coords[n, 1].item()),
+                    int(point_coords[n, 2].item()),
+                )
+                point_to_entries[key].append((b, int(choose_idx.item()), odise_q[choose_idx], lseg_q[choose_idx]))
+                point_to_views[key].add(b)
+
+            point_groups[b] = point_group
+
+        def _avg_pairwise_cos(x: torch.Tensor) -> torch.Tensor:
+            if x.shape[0] < 2:
+                return x.new_tensor(0.0)
+            sim = x @ x.t()
+            idx = torch.triu_indices(x.shape[0], x.shape[0], offset=1, device=x.device)
+            return sim[idx[0], idx[1]].mean()
+
+        for key, entries in point_to_entries.items():
+            if len(point_to_views[key]) < int(self.config.projected_sem_probe_min_views):
+                continue
+            odise_stack = torch.stack([entry[2] for entry in entries], dim=0).float()
+            lseg_stack = torch.stack([entry[3] for entry in entries], dim=0).float()
+            diff = _avg_pairwise_cos(F.normalize(lseg_stack, dim=-1)) - _avg_pairwise_cos(
+                F.normalize(odise_stack, dim=-1)
+            )
+            diff_val = float(diff.detach().cpu().item())
+            for b, local_idx, _, _ in entries:
+                mask_stats[(b, local_idx)].append(diff_val)
+
+        for b in range(batch_size):
+            if len(results["outputs"][b]) == 0:
+                continue
+            valid_k = results["mask_valid_from_masks"][b]
+            if not valid_k.any():
+                continue
+            num_valid = int(valid_k.sum().item())
+            diff_t = torch.zeros(num_valid, dtype=torch.float32, device=self.device)
+            valid_t = torch.zeros(num_valid, dtype=torch.bool, device=self.device)
+            for local_idx in range(num_valid):
+                values = mask_stats.get((b, local_idx))
+                if not values:
+                    continue
+                diff_t[local_idx] = float(sum(values) / max(len(values), 1))
+                valid_t[local_idx] = True
+            projected_mask_diff[b] = diff_t
+            projected_mask_valid[b] = valid_t
+
+        return {
+            "point_groups": point_groups,
+            "projected_mask_diff": projected_mask_diff,
+            "projected_mask_valid": projected_mask_valid,
+        }
+
+    def _compute_semantic_readout_probs(
+        self,
+        p_odise: torch.Tensor,
+        p_lseg: torch.Tensor,
+        mask_area_ratio: torch.Tensor,
+        projected_diff: Optional[torch.Tensor],
+        projected_valid: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        probs = {
+            "odise_only": p_odise,
+            "lseg_only": p_lseg,
+            "fixed_05": 0.5 * p_lseg + 0.5 * p_odise,
+            "lseg_06": 0.6 * p_lseg + 0.4 * p_odise,
+            "lseg_07": 0.7 * p_lseg + 0.3 * p_odise,
+            "lseg_08": 0.8 * p_lseg + 0.2 * p_odise,
+        }
+        size_weight = self._compute_size_aware_lseg_weight(mask_area_ratio)
+        probs["size_aware"] = size_weight[:, None] * p_lseg + (1.0 - size_weight[:, None]) * p_odise
+
+        if projected_diff is None or projected_valid is None:
+            projected_diff = torch.zeros_like(mask_area_ratio)
+            projected_valid = torch.zeros_like(mask_area_ratio, dtype=torch.bool)
+
+        raw_proj = torch.sigmoid(float(self.config.semantic_projected_gate_scale) * projected_diff)
+        proj_weight = raw_proj.clamp(
+            float(self.config.semantic_projected_gate_min),
+            float(self.config.semantic_projected_gate_max),
+        )
+        proj_weight = torch.where(
+            projected_valid,
+            proj_weight,
+            torch.full_like(proj_weight, float(self.config.semantic_projected_gate_default)),
+        )
+        probs["projected_gate"] = proj_weight[:, None] * p_lseg + (1.0 - proj_weight[:, None]) * p_odise
+
+        small_score = (
+            (float(self.config.semantic_small_area_thr) - mask_area_ratio)
+            / max(float(self.config.semantic_small_area_thr), 1e-6)
+        ).clamp(0.0, 1.0)
+        proj_size_weight = (
+            float(self.config.semantic_projected_size_base)
+            + float(self.config.semantic_projected_size_beta) * projected_diff
+            - float(self.config.semantic_projected_size_gamma) * small_score
+        ).clamp(
+            float(self.config.semantic_projected_size_min),
+            float(self.config.semantic_projected_size_max),
+        )
+        proj_size_weight = torch.where(projected_valid, proj_size_weight, size_weight)
+        probs["projected_size_gate"] = (
+            proj_size_weight[:, None] * p_lseg + (1.0 - proj_size_weight[:, None]) * p_odise
+        )
+        return probs
 
     def _collect_text_free_gate_items(self, results: Dict, batch: Dict):
         lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
@@ -699,8 +1033,11 @@ class MaskDistillTrainer:
         target_valid_values = []
         mv_odise_valid_values = []
         mv_lseg_valid_values = []
+        mv_diff_values = []
+        mv_diff_valid_values = []
         total_valid_count = 0
         total_pair_count = 0
+        total_loss_valid_count = 0
         skipped_no_mv = 0
 
         for b, valid_k, start, count, mask_points in item_records:
@@ -719,7 +1056,7 @@ class MaskDistillTrainer:
             mv_valid = mv_valid_all[mv_slice].to(pred_logits.device)
             mv_pair_count = mv_pair_count_all[mv_slice].to(pred_logits.device)
 
-            target_g, loss_weight, target_logs = build_text_free_mv_gate_target(
+            target_g, loss_weight, diff, target_logs = build_text_free_mv_gate_target(
                 mv_odise,
                 mv_lseg,
                 mv_valid,
@@ -728,6 +1065,7 @@ class MaskDistillTrainer:
                 point_mask_conf,
                 odise_prior=self.config.source_gate_odise_prior,
                 lseg_prior=self.config.source_gate_lseg_prior,
+                target_gamma=self.config.source_gate_target_gamma,
                 mask_quality_weight=self.config.source_gate_mask_quality_weight,
                 point_conf_weight=self.config.source_gate_point_conf_weight,
             )
@@ -741,13 +1079,17 @@ class MaskDistillTrainer:
             )
             gate = source_gate(evidence)
             valid = mv_valid.bool()
-            valid_count = int(valid.sum().item())
-            total_valid_count += valid_count
+            mv_valid_count = int(valid.sum().item())
+            total_valid_count += mv_valid_count
             total_pair_count += int(mv_pair_count[valid].sum().item())
-            if valid_count == 0:
+            if mv_valid_count == 0:
                 skipped_no_mv += 1
                 continue
-            if self.config.source_gate_skip_when_no_mv and valid_count < int(self.config.source_gate_mv_min_valid_masks):
+            if self.config.source_gate_use_margin_filter:
+                valid = valid & (diff > float(self.config.source_gate_mv_margin))
+            loss_valid_count = int(valid.sum().item())
+            total_loss_valid_count += loss_valid_count
+            if self.config.source_gate_skip_when_no_mv and loss_valid_count < int(self.config.source_gate_mv_min_valid_masks):
                 skipped_no_mv += 1
                 continue
             loss_gate = (
@@ -762,15 +1104,21 @@ class MaskDistillTrainer:
             mv_valid_values.append(mv_valid.detach())
             mv_odise_values.append(mv_odise.detach())
             mv_lseg_values.append(mv_lseg.detach())
+            mv_diff_values.append(diff.detach())
             mask_quality_values.append(torch.tensor(target_logs["source_gate_mask_quality_mean"], device=gate.device))
             gate_valid_values.append(gate[valid].detach())
             target_valid_values.append(target_g[valid].detach())
             mv_odise_valid_values.append(mv_odise[valid].detach())
             mv_lseg_valid_values.append(mv_lseg[valid].detach())
+            mv_diff_valid_values.append(diff[valid].detach())
 
         if num_gate_items == 0 or loss_gate_total is None:
             empty_logs["source_gate_mv_valid_count"] = float(total_valid_count)
             empty_logs["source_gate_mv_pair_count"] = float(total_pair_count)
+            empty_logs["source_gate_loss_valid_count"] = float(total_loss_valid_count)
+            empty_logs["source_gate_loss_valid_ratio"] = float(
+                total_loss_valid_count / max(total_valid_count, 1)
+            )
             empty_logs["source_gate_skipped_no_mv"] = float(skipped_no_mv)
             empty_logs.update(batch_probe_logs)
             return None, empty_logs
@@ -782,6 +1130,8 @@ class MaskDistillTrainer:
         target_valid_cat = torch.cat([t.reshape(-1) for t in target_valid_values])
         mv_odise_valid_cat = torch.cat([v.reshape(-1) for v in mv_odise_valid_values])
         mv_lseg_valid_cat = torch.cat([v.reshape(-1) for v in mv_lseg_valid_values])
+        mv_diff_cat = torch.cat([v.reshape(-1) for v in mv_diff_values])
+        mv_diff_valid_cat = torch.cat([v.reshape(-1) for v in mv_diff_valid_values])
         logs = {
             "loss_source_gate": float(loss_gate_total.detach().cpu()),
             "loss_source_gate_open": float(loss_gate_total.detach().cpu()),
@@ -795,11 +1145,17 @@ class MaskDistillTrainer:
             "source_gate_mv_valid_ratio": float(torch.cat(mv_valid_values).float().mean().detach().cpu()),
             "source_gate_mv_valid_count": float(total_valid_count),
             "source_gate_mv_pair_count": float(total_pair_count),
+            "source_gate_mv_diff_mean": float(mv_diff_cat.mean().detach().cpu()),
+            "source_gate_mv_diff_valid_mean": float(mv_diff_valid_cat.mean().detach().cpu()),
+            "source_gate_loss_valid_count": float(total_loss_valid_count),
+            "source_gate_loss_valid_ratio": float(total_loss_valid_count / max(total_valid_count, 1)),
             "source_gate_skipped_no_mv": float(skipped_no_mv),
             "source_gate_mv_odise_mean": float(torch.cat(mv_odise_values).mean().detach().cpu()),
             "source_gate_mv_lseg_mean": float(torch.cat(mv_lseg_values).mean().detach().cpu()),
             "source_gate_gate_mean_valid": float(gate_valid_cat.mean().detach().cpu()),
+            "source_gate_gate_std_valid": float(gate_valid_cat.std(unbiased=False).detach().cpu()),
             "source_gate_target_mean_valid": float(target_valid_cat.mean().detach().cpu()),
+            "source_gate_target_std_valid": float(target_valid_cat.std(unbiased=False).detach().cpu()),
             "source_gate_mv_odise_mean_valid": float(mv_odise_valid_cat.mean().detach().cpu()),
             "source_gate_mv_lseg_mean_valid": float(mv_lseg_valid_cat.mean().detach().cpu()),
             "source_gate_mask_quality_mean": float(torch.stack(mask_quality_values).mean().detach().cpu()),
@@ -999,6 +1355,9 @@ class MaskDistillTrainer:
         text_feats: Optional[torch.Tensor],
         pixel_text_feats: Optional[torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
+        raise RuntimeError(
+            "gt_ce_upper_bound uses semantic GT and is not allowed in the open-vocabulary training path."
+        )
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
         source_gate = getattr(model_ref, "source_gate", None)
         empty_logs = self._empty_source_gate_logs()
@@ -1087,6 +1446,312 @@ class MaskDistillTrainer:
         loss_extra = self._source_gate_regularizers(loss_extra, gate_cat, logs)
         return loss_extra, logs
 
+    def _compute_dual_branch_mask_probe(
+        self,
+        results: Dict,
+        batch: Dict,
+    ) -> Dict[str, float]:
+        empty_logs = self._empty_dual_branch_logs()
+        outputs = results.get("outputs", [])
+        if not outputs:
+            return empty_logs
+
+        first_output = None
+        for batch_outputs in outputs:
+            if batch_outputs:
+                first_output = batch_outputs[0]
+                break
+        if first_output is None:
+            return empty_logs
+        if (
+            "pred_mask_logits_odise_branch" not in first_output
+            or "pred_mask_logits_lseg_branch" not in first_output
+        ):
+            return empty_logs
+
+        with torch.no_grad():
+            lifted, lifted_valid = build_lifted_3d_masks(
+                batch["masks"],
+                batch["mask_valid"],
+                batch["x_label"],
+                batch["y_label"],
+                results["batch_indices"],
+            )
+
+        odise_losses = []
+        lseg_losses = []
+        fixed_losses = []
+        oracle_losses = []
+        odise_ious = []
+        lseg_ious = []
+        fixed_ious = []
+        oracle_ious = []
+        delta_losses = []
+        odise_wins = []
+        lseg_wins = []
+        clear_wins = []
+
+        for b in range(len(outputs)):
+            if len(outputs[b]) == 0:
+                continue
+            valid_k = results["mask_valid_from_masks"][b]
+            if not valid_k.any():
+                continue
+
+            odise_logits_full = outputs[b][0]["pred_mask_logits_odise_branch"]
+            lseg_logits_full = outputs[b][0]["pred_mask_logits_lseg_branch"]
+            odise_logits = odise_logits_full[:, valid_k].float()
+            lseg_logits = lseg_logits_full[:, valid_k].float()
+
+            pt_mask = results["batch_indices"] == b
+            gt_masks = lifted[pt_mask][:, valid_k].float()
+            pt_valid = lifted_valid[pt_mask]
+            if not pt_valid.any():
+                continue
+
+            odise_logits = odise_logits[pt_valid]
+            lseg_logits = lseg_logits[pt_valid]
+            gt_masks = gt_masks[pt_valid]
+            pos_cnt = (gt_masks > 0.5).float().sum(dim=0)
+            keep = pos_cnt >= self.config.min_points_per_mask
+            if not keep.any():
+                continue
+
+            odise_logits = odise_logits[:, keep]
+            lseg_logits = lseg_logits[:, keep]
+            gt_masks = gt_masks[:, keep]
+            fixed_logits = 0.5 * (odise_logits + lseg_logits)
+            gt_binary = (gt_masks > 0.5).float()
+
+            loss_o = F.binary_cross_entropy_with_logits(
+                odise_logits, gt_binary, reduction="none"
+            ).mean(dim=0)
+            loss_l = F.binary_cross_entropy_with_logits(
+                lseg_logits, gt_binary, reduction="none"
+            ).mean(dim=0)
+            loss_f = F.binary_cross_entropy_with_logits(
+                fixed_logits, gt_binary, reduction="none"
+            ).mean(dim=0)
+
+            prob_o = torch.sigmoid(odise_logits) > 0.5
+            prob_l = torch.sigmoid(lseg_logits) > 0.5
+            prob_f = torch.sigmoid(fixed_logits) > 0.5
+            gt_bool = gt_binary > 0.5
+
+            def _mask_iou(pred_bool: torch.Tensor, gt_bool_local: torch.Tensor) -> torch.Tensor:
+                inter = (pred_bool & gt_bool_local).float().sum(dim=0)
+                union = (pred_bool | gt_bool_local).float().sum(dim=0)
+                return inter / union.clamp_min(1.0)
+
+            iou_o = _mask_iou(prob_o, gt_bool)
+            iou_l = _mask_iou(prob_l, gt_bool)
+            iou_f = _mask_iou(prob_f, gt_bool)
+
+            choose_odise = loss_o < loss_l
+            loss_oracle = torch.minimum(loss_o, loss_l)
+            iou_oracle = torch.where(choose_odise, iou_o, iou_l)
+            delta = loss_l - loss_o
+            clear = delta.abs() > float(self.config.dual_branch_oracle_margin)
+
+            odise_losses.append(loss_o.detach())
+            lseg_losses.append(loss_l.detach())
+            fixed_losses.append(loss_f.detach())
+            oracle_losses.append(loss_oracle.detach())
+            odise_ious.append(iou_o.detach())
+            lseg_ious.append(iou_l.detach())
+            fixed_ious.append(iou_f.detach())
+            oracle_ious.append(iou_oracle.detach())
+            delta_losses.append(delta.detach())
+            odise_wins.append((loss_o < loss_l).float().detach())
+            lseg_wins.append((loss_l < loss_o).float().detach())
+            clear_wins.append(clear.float().detach())
+
+        if not odise_losses:
+            return empty_logs
+
+        loss_o_cat = torch.cat([v.reshape(-1) for v in odise_losses])
+        loss_l_cat = torch.cat([v.reshape(-1) for v in lseg_losses])
+        loss_f_cat = torch.cat([v.reshape(-1) for v in fixed_losses])
+        loss_oracle_cat = torch.cat([v.reshape(-1) for v in oracle_losses])
+        iou_o_cat = torch.cat([v.reshape(-1) for v in odise_ious])
+        iou_l_cat = torch.cat([v.reshape(-1) for v in lseg_ious])
+        iou_f_cat = torch.cat([v.reshape(-1) for v in fixed_ious])
+        iou_oracle_cat = torch.cat([v.reshape(-1) for v in oracle_ious])
+        delta_cat = torch.cat([v.reshape(-1) for v in delta_losses])
+        odise_win_cat = torch.cat([v.reshape(-1) for v in odise_wins])
+        lseg_win_cat = torch.cat([v.reshape(-1) for v in lseg_wins])
+        clear_win_cat = torch.cat([v.reshape(-1) for v in clear_wins])
+        best_single_loss = torch.minimum(loss_o_cat, loss_l_cat)
+        best_single_iou = torch.maximum(iou_o_cat, iou_l_cat)
+
+        return {
+            "dual_branch_odise_loss_mean": float(loss_o_cat.mean().detach().cpu()),
+            "dual_branch_lseg_loss_mean": float(loss_l_cat.mean().detach().cpu()),
+            "dual_branch_fixed_loss_mean": float(loss_f_cat.mean().detach().cpu()),
+            "dual_branch_oracle_loss_mean": float(loss_oracle_cat.mean().detach().cpu()),
+            "dual_branch_odise_iou_mean": float(iou_o_cat.mean().detach().cpu()),
+            "dual_branch_lseg_iou_mean": float(iou_l_cat.mean().detach().cpu()),
+            "dual_branch_fixed_iou_mean": float(iou_f_cat.mean().detach().cpu()),
+            "dual_branch_oracle_iou_mean": float(iou_oracle_cat.mean().detach().cpu()),
+            "dual_branch_delta_loss_mean": float(delta_cat.mean().detach().cpu()),
+            "dual_branch_delta_loss_std": float(delta_cat.std(unbiased=False).detach().cpu()),
+            "dual_branch_odise_win_rate": float(odise_win_cat.mean().detach().cpu()),
+            "dual_branch_lseg_win_rate": float(lseg_win_cat.mean().detach().cpu()),
+            "dual_branch_clear_win_rate": float(clear_win_cat.mean().detach().cpu()),
+            "dual_branch_oracle_gain_vs_best_single_loss": float(
+                (best_single_loss.mean() - loss_oracle_cat.mean()).detach().cpu()
+            ),
+            "dual_branch_oracle_gain_vs_fixed_loss": float(
+                (loss_f_cat.mean() - loss_oracle_cat.mean()).detach().cpu()
+            ),
+            "dual_branch_oracle_gain_vs_best_single_iou": float(
+                (iou_oracle_cat.mean() - best_single_iou.mean()).detach().cpu()
+            ),
+            "dual_branch_oracle_gain_vs_fixed_iou": float(
+                (iou_oracle_cat.mean() - iou_f_cat.mean()).detach().cpu()
+            ),
+        }
+
+    def _compute_projected_semantic_consistency_probe(
+        self,
+        results: Dict,
+        batch: Dict,
+    ) -> Dict[str, float]:
+        if str(self.config.projected_sem_probe_region_mode).lower() != "point":
+            raise ValueError(
+                "Only projected_sem_probe_region_mode='point' is supported in the first version, "
+                f"got {self.config.projected_sem_probe_region_mode!r}"
+            )
+
+        empty_logs = self._empty_projected_sem_logs()
+        lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
+        if lseg_all is None:
+            return empty_logs
+
+        scene_names = batch.get("scene_name") or []
+        with torch.no_grad():
+            lifted, lifted_valid = build_lifted_3d_masks(
+                batch["masks"],
+                batch["mask_valid"],
+                batch["x_label"],
+                batch["y_label"],
+                results["batch_indices"],
+            )
+
+            point_to_odise = collections.defaultdict(list)
+            point_to_lseg = collections.defaultdict(list)
+            point_to_views = collections.defaultdict(set)
+            total_points = 0
+
+            for b in range(len(results["outputs"])):
+                if len(results["outputs"][b]) == 0:
+                    continue
+                valid_k = results["mask_valid_from_masks"][b]
+                if not valid_k.any():
+                    continue
+                pt_mask = results["batch_indices"] == b
+                if not pt_mask.any():
+                    continue
+
+                scene_name = (
+                    str(scene_names[b])
+                    if isinstance(scene_names, (list, tuple)) and b < len(scene_names)
+                    else str(b)
+                )
+                odise_q = batch["mask_embeddings"][b][valid_k].float()
+                lseg_q = lseg_all[b][valid_k].float()
+                lifted_b = lifted[pt_mask][:, valid_k]
+                lifted_valid_b = lifted_valid[pt_mask]
+                pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
+                point_coords = batch["ori_coords_3d"][pt_mask][:, 1:4].long()
+                mask_area = batch["masks"][b][valid_k].float().sum(dim=(1, 2))
+
+                point_conf = torch.sigmoid(pred_logits)
+                total_points += int(point_coords.shape[0])
+
+                for n in range(point_coords.shape[0]):
+                    if not bool(lifted_valid_b[n]):
+                        continue
+                    mask_ids = torch.where(lifted_b[n] > 0.5)[0]
+                    if mask_ids.numel() == 0:
+                        continue
+                    if point_conf.shape[0] > n:
+                        choose_idx = mask_ids[point_conf[n, mask_ids].argmax()]
+                    else:
+                        choose_idx = mask_ids[mask_area[mask_ids].argmin()]
+                    key = (
+                        scene_name,
+                        int(point_coords[n, 0].item()),
+                        int(point_coords[n, 1].item()),
+                        int(point_coords[n, 2].item()),
+                    )
+                    point_to_odise[key].append(odise_q[choose_idx].detach())
+                    point_to_lseg[key].append(lseg_q[choose_idx].detach())
+                    point_to_views[key].add(b)
+
+            valid_keys = [
+                key for key, views in point_to_views.items()
+                if len(views) >= int(self.config.projected_sem_probe_min_views)
+            ]
+            if not valid_keys:
+                empty_logs["projected_sem_point_count_total"] = float(total_points)
+                return empty_logs
+
+            max_points = int(self.config.projected_sem_probe_max_points)
+            if len(valid_keys) > max_points:
+                perm = torch.randperm(len(valid_keys))[:max_points].tolist()
+                valid_keys = [valid_keys[i] for i in perm]
+
+            def _avg_pairwise_cos(x: torch.Tensor) -> torch.Tensor:
+                if x.shape[0] < 2:
+                    return x.new_tensor(0.0)
+                sim = x @ x.t()
+                idx = torch.triu_indices(x.shape[0], x.shape[0], offset=1, device=x.device)
+                return sim[idx[0], idx[1]].mean()
+
+            odise_cons = []
+            lseg_cons = []
+            view_counts = []
+            for key in valid_keys:
+                odise_stack = torch.stack(point_to_odise[key], dim=0).float()
+                lseg_stack = torch.stack(point_to_lseg[key], dim=0).float()
+                odise_norm = F.normalize(odise_stack, dim=-1)
+                lseg_norm = F.normalize(lseg_stack, dim=-1)
+                odise_cons.append(_avg_pairwise_cos(odise_norm))
+                lseg_cons.append(_avg_pairwise_cos(lseg_norm))
+                view_counts.append(float(len(point_to_views[key])))
+
+            odise_cons_t = torch.stack(odise_cons)
+            lseg_cons_t = torch.stack(lseg_cons)
+            diff_t = lseg_cons_t - odise_cons_t
+            abs_diff_t = diff_t.abs()
+            g_sem_rule = torch.sigmoid(float(self.config.projected_sem_gate_scale) * diff_t)
+            view_count_t = torch.tensor(view_counts, dtype=torch.float32, device=odise_cons_t.device)
+
+            return {
+                "projected_sem_point_count_total": float(total_points),
+                "projected_sem_point_count_valid": float(len(valid_keys)),
+                "projected_sem_valid_ratio": float(len(valid_keys) / max(total_points, 1)),
+                "projected_sem_view_count_mean": float(view_count_t.mean().detach().cpu()),
+                "projected_sem_view_count_max": float(view_count_t.max().detach().cpu()),
+                "projected_sem_odise_consistency_mean": float(odise_cons_t.mean().detach().cpu()),
+                "projected_sem_lseg_consistency_mean": float(lseg_cons_t.mean().detach().cpu()),
+                "projected_sem_odise_consistency_std": float(odise_cons_t.std(unbiased=False).detach().cpu()),
+                "projected_sem_lseg_consistency_std": float(lseg_cons_t.std(unbiased=False).detach().cpu()),
+                "projected_sem_diff_mean": float(diff_t.mean().detach().cpu()),
+                "projected_sem_diff_std": float(diff_t.std(unbiased=False).detach().cpu()),
+                "projected_sem_abs_diff_mean": float(abs_diff_t.mean().detach().cpu()),
+                "projected_sem_odise_win_rate": float((odise_cons_t > lseg_cons_t).float().mean().detach().cpu()),
+                "projected_sem_lseg_win_rate": float((lseg_cons_t > odise_cons_t).float().mean().detach().cpu()),
+                "projected_sem_clear_win_rate_001": float((abs_diff_t > 0.01).float().mean().detach().cpu()),
+                "projected_sem_clear_win_rate_003": float((abs_diff_t > 0.03).float().mean().detach().cpu()),
+                "projected_sem_clear_win_rate_005": float((abs_diff_t > 0.05).float().mean().detach().cpu()),
+                "projected_sem_g_sem_rule_mean": float(g_sem_rule.mean().detach().cpu()),
+                "projected_sem_g_sem_rule_std": float(g_sem_rule.std(unbiased=False).detach().cpu()),
+                "projected_sem_g_sem_rule_min": float(g_sem_rule.min().detach().cpu()),
+                "projected_sem_g_sem_rule_max": float(g_sem_rule.max().detach().cpu()),
+            }
+
     # ----------------------------------------------------------
     # 训练 epoch
     # ----------------------------------------------------------
@@ -1098,6 +1763,8 @@ class MaskDistillTrainer:
         epoch_aux         = AverageMeter()
         epoch_gate        = AverageMeter()
         batch_time        = AverageMeter()
+        verbose_legacy = bool(self.config.enable_verbose_legacy_probes)
+        legacy_gate_logs = bool(self.config.enable_legacy_source_gate_logs)
         gate_train_enabled = (
             self.config.source_gate_train
             and epoch >= self.config.source_gate_start_epoch
@@ -1153,6 +1820,12 @@ class MaskDistillTrainer:
                         if gate_extra is not None:
                             loss = loss + gate_extra
                         loss_dict.update(gate_logs)
+                        if self.config.dual_branch_probe:
+                            probe_logs = self._compute_dual_branch_mask_probe(results, batch)
+                            loss_dict.update(probe_logs)
+                        if self.config.projected_sem_probe:
+                            projected_logs = self._compute_projected_semantic_consistency_probe(results, batch)
+                            loss_dict.update(projected_logs)
                         if gate_train_enabled and gate_target == "text_free_mv_stability":
                             mv_valid_ratio = float(loss_dict.get("source_gate_mv_valid_ratio", 0.0))
                             if mv_valid_ratio <= 0.0:
@@ -1231,34 +1904,81 @@ class MaskDistillTrainer:
 
                 if self.writer is not None:
                     self.writer.add_scalar("Loss/Train_Step",         loss.item(),                        self.global_step)
+                    self.writer.add_scalar("Loss/Train_Alignment",    loss_dict["loss_mask_distill"],     self.global_step)
                     self.writer.add_scalar("Loss/Train_MaskDistill",  loss_dict["loss_mask_distill"],     self.global_step)
                     self.writer.add_scalar("Loss/Train_Aux",          loss_dict["loss_aux"],              self.global_step)
-                    self.writer.add_scalar("Loss/Train_SourceGate",   loss_dict.get("loss_source_gate", 0.0), self.global_step)
-                    self.writer.add_scalar("Loss/Train_SourceGate_Open", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
-                    self.writer.add_scalar("Loss/Train_SourceGate_TextFreeMV", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
-                    self.writer.add_scalar("Loss/Train_SourceGate_OpenReliability", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
-                    self.writer.add_scalar("Loss/Train_SourceGate_GTCE_UpperBound", loss_dict.get("loss_source_gate_gt_ce_upper_bound", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/train_mean",   loss_dict.get("source_gate_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/train_std",    loss_dict.get("source_gate_std", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/train_min",    loss_dict.get("source_gate_min", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/train_max",    loss_dict.get("source_gate_max", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/target_mean",  loss_dict.get("source_gate_target_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/target_std",   loss_dict.get("source_gate_target_std", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mv_valid_ratio", loss_dict.get("source_gate_mv_valid_ratio", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mv_valid_count", loss_dict.get("source_gate_mv_valid_count", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mv_pair_count", loss_dict.get("source_gate_mv_pair_count", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/skipped_no_mv", loss_dict.get("source_gate_skipped_no_mv", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mv_odise_mean", loss_dict.get("source_gate_mv_odise_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mv_lseg_mean", loss_dict.get("source_gate_mv_lseg_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/gate_mean_valid", loss_dict.get("source_gate_gate_mean_valid", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/target_mean_valid", loss_dict.get("source_gate_target_mean_valid", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mv_odise_mean_valid", loss_dict.get("source_gate_mv_odise_mean_valid", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mv_lseg_mean_valid", loss_dict.get("source_gate_mv_lseg_mean_valid", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/batch_unique_scenes", loss_dict.get("batch_unique_scenes", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/batch_frames_per_scene_mean", loss_dict.get("batch_frames_per_scene_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/batch_same_scene_pair_count", loss_dict.get("batch_same_scene_pair_count", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/conflict_mean", loss_dict.get("source_gate_conflict_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("SourceGate/mask_quality_mean", loss_dict.get("source_gate_mask_quality_mean", 0.0), self.global_step)
+                    if legacy_gate_logs:
+                        self.writer.add_scalar("Loss/Train_SourceGate",   loss_dict.get("loss_source_gate", 0.0), self.global_step)
+                    if verbose_legacy:
+                        self.writer.add_scalar("Loss/Train_SourceGate_Open", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
+                        self.writer.add_scalar("Loss/Train_SourceGate_TextFreeMV", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
+                        self.writer.add_scalar("Loss/Train_SourceGate_OpenReliability", loss_dict.get("loss_source_gate_open", 0.0), self.global_step)
+                        self.writer.add_scalar("Loss/Train_SourceGate_GTCE_UpperBound", loss_dict.get("loss_source_gate_gt_ce_upper_bound", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/train_mean",   loss_dict.get("source_gate_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/train_std",    loss_dict.get("source_gate_std", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/train_min",    loss_dict.get("source_gate_min", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/train_max",    loss_dict.get("source_gate_max", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/target_mean",  loss_dict.get("source_gate_target_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/target_std",   loss_dict.get("source_gate_target_std", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_valid_ratio", loss_dict.get("source_gate_mv_valid_ratio", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_valid_count", loss_dict.get("source_gate_mv_valid_count", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_pair_count", loss_dict.get("source_gate_mv_pair_count", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_diff_mean", loss_dict.get("source_gate_mv_diff_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_diff_valid_mean", loss_dict.get("source_gate_mv_diff_valid_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/loss_valid_count", loss_dict.get("source_gate_loss_valid_count", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/loss_valid_ratio", loss_dict.get("source_gate_loss_valid_ratio", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/skipped_no_mv", loss_dict.get("source_gate_skipped_no_mv", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_odise_mean", loss_dict.get("source_gate_mv_odise_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_lseg_mean", loss_dict.get("source_gate_mv_lseg_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/gate_mean_valid", loss_dict.get("source_gate_gate_mean_valid", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/gate_std_valid", loss_dict.get("source_gate_gate_std_valid", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/target_mean_valid", loss_dict.get("source_gate_target_mean_valid", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/target_std_valid", loss_dict.get("source_gate_target_std_valid", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_odise_mean_valid", loss_dict.get("source_gate_mv_odise_mean_valid", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mv_lseg_mean_valid", loss_dict.get("source_gate_mv_lseg_mean_valid", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/batch_unique_scenes", loss_dict.get("batch_unique_scenes", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/batch_frames_per_scene_mean", loss_dict.get("batch_frames_per_scene_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/batch_same_scene_pair_count", loss_dict.get("batch_same_scene_pair_count", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/conflict_mean", loss_dict.get("source_gate_conflict_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("SourceGate/mask_quality_mean", loss_dict.get("source_gate_mask_quality_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/odise_loss_mean", loss_dict.get("dual_branch_odise_loss_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/lseg_loss_mean", loss_dict.get("dual_branch_lseg_loss_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/fixed_loss_mean", loss_dict.get("dual_branch_fixed_loss_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/oracle_loss_mean", loss_dict.get("dual_branch_oracle_loss_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/odise_iou_mean", loss_dict.get("dual_branch_odise_iou_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/lseg_iou_mean", loss_dict.get("dual_branch_lseg_iou_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/fixed_iou_mean", loss_dict.get("dual_branch_fixed_iou_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/oracle_iou_mean", loss_dict.get("dual_branch_oracle_iou_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/delta_loss_mean", loss_dict.get("dual_branch_delta_loss_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/delta_loss_std", loss_dict.get("dual_branch_delta_loss_std", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/odise_win_rate", loss_dict.get("dual_branch_odise_win_rate", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/lseg_win_rate", loss_dict.get("dual_branch_lseg_win_rate", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/clear_win_rate", loss_dict.get("dual_branch_clear_win_rate", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/oracle_gain_vs_best_single_loss", loss_dict.get("dual_branch_oracle_gain_vs_best_single_loss", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/oracle_gain_vs_fixed_loss", loss_dict.get("dual_branch_oracle_gain_vs_fixed_loss", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/oracle_gain_vs_best_single_iou", loss_dict.get("dual_branch_oracle_gain_vs_best_single_iou", 0.0), self.global_step)
+                        self.writer.add_scalar("DualBranch/oracle_gain_vs_fixed_iou", loss_dict.get("dual_branch_oracle_gain_vs_fixed_iou", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/point_count_total", loss_dict.get("projected_sem_point_count_total", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/point_count_valid", loss_dict.get("projected_sem_point_count_valid", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/valid_ratio", loss_dict.get("projected_sem_valid_ratio", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/view_count_mean", loss_dict.get("projected_sem_view_count_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/view_count_max", loss_dict.get("projected_sem_view_count_max", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/odise_consistency_mean", loss_dict.get("projected_sem_odise_consistency_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/lseg_consistency_mean", loss_dict.get("projected_sem_lseg_consistency_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/odise_consistency_std", loss_dict.get("projected_sem_odise_consistency_std", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/lseg_consistency_std", loss_dict.get("projected_sem_lseg_consistency_std", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/diff_mean", loss_dict.get("projected_sem_diff_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/diff_std", loss_dict.get("projected_sem_diff_std", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/abs_diff_mean", loss_dict.get("projected_sem_abs_diff_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/odise_win_rate", loss_dict.get("projected_sem_odise_win_rate", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/lseg_win_rate", loss_dict.get("projected_sem_lseg_win_rate", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/clear_win_rate_001", loss_dict.get("projected_sem_clear_win_rate_001", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/clear_win_rate_003", loss_dict.get("projected_sem_clear_win_rate_003", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/clear_win_rate_005", loss_dict.get("projected_sem_clear_win_rate_005", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/g_sem_rule_mean", loss_dict.get("projected_sem_g_sem_rule_mean", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/g_sem_rule_std", loss_dict.get("projected_sem_g_sem_rule_std", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/g_sem_rule_min", loss_dict.get("projected_sem_g_sem_rule_min", 0.0), self.global_step)
+                        self.writer.add_scalar("ProjectedSem/g_sem_rule_max", loss_dict.get("projected_sem_g_sem_rule_max", 0.0), self.global_step)
                     self.writer.add_scalar("LR", self.optimizer.param_groups[0]["lr"], self.global_step)
 
                     model_ref = self.model.module if hasattr(self.model, "module") else self.model
@@ -1290,15 +2010,10 @@ class MaskDistillTrainer:
                     f"Epoch [{epoch+1}/{self.config.num_epochs}] "
                     f"Step [{step}/{len(self.train_loader)}] "
                     f"Loss: {loss.item():.4f} "
-                    f"(distill={loss_dict['loss_mask_distill']:.4f} aux={loss_dict['loss_aux']:.4f} "
-                    f"source_gate={loss_dict.get('loss_source_gate', 0.0):.4f}) "
-                    f"gate_mean={loss_dict.get('source_gate_mean', 0.0):.4f} "
-                    f"gate_std={loss_dict.get('source_gate_std', 0.0):.4f} "
-                    f"mv_valid={loss_dict.get('source_gate_mv_valid_ratio', 0.0):.3f} "
-                    f"target={self.config.source_gate_training_target} "
+                    f"(alignment={loss_dict['loss_mask_distill']:.4f} aux={loss_dict['loss_aux']:.4f}) "
                     f"avg={epoch_loss.avg:.4f}  LR: {lr:.2e}  ETA: {eta:.0f}s"
                 )
-                if gate_train_enabled:
+                if gate_train_enabled and legacy_gate_logs:
                     print(
                         "  [OpenVocab Gate Training] "
                         f"source_gate_target={self.config.source_gate_training_target} "
@@ -1309,14 +2024,59 @@ class MaskDistillTrainer:
                         f"batch_same_scene_pair_count={loss_dict.get('batch_same_scene_pair_count', 0.0):.0f} "
                         f"mv_valid_count={loss_dict.get('source_gate_mv_valid_count', 0.0):.0f} "
                         f"mv_pair_count={loss_dict.get('source_gate_mv_pair_count', 0.0):.0f} "
+                        f"mv_diff={loss_dict.get('source_gate_mv_diff_mean', 0.0):.4f} "
+                        f"mv_diff_valid={loss_dict.get('source_gate_mv_diff_valid_mean', 0.0):.4f} "
+                        f"loss_valid_count={loss_dict.get('source_gate_loss_valid_count', 0.0):.0f} "
+                        f"loss_valid_ratio={loss_dict.get('source_gate_loss_valid_ratio', 0.0):.3f} "
                         f"skipped_no_mv={loss_dict.get('source_gate_skipped_no_mv', 0.0):.0f} "
                         f"mv_odise={loss_dict.get('source_gate_mv_odise_mean', 0.0):.3f} "
                         f"mv_lseg={loss_dict.get('source_gate_mv_lseg_mean', 0.0):.3f} "
                         f"gate_valid={loss_dict.get('source_gate_gate_mean_valid', 0.0):.4f} "
+                        f"gate_std_valid={loss_dict.get('source_gate_gate_std_valid', 0.0):.4f} "
                         f"target_valid={loss_dict.get('source_gate_target_mean_valid', 0.0):.4f} "
+                        f"target_std_valid={loss_dict.get('source_gate_target_std_valid', 0.0):.4f} "
                         f"mask_quality={loss_dict.get('source_gate_mask_quality_mean', 0.0):.3f} "
                         f"gate_mean={loss_dict.get('source_gate_mean', 0.0):.4f} "
                         f"gate_std={loss_dict.get('source_gate_std', 0.0):.4f}"
+                    )
+                if (
+                    verbose_legacy
+                    and self.config.dual_branch_probe
+                    and step % max(int(self.config.dual_branch_probe_log_every), 1) == 0
+                    and self.is_main
+                ):
+                    print(
+                        "  [DualBranch Probe] "
+                        f"odise_loss={loss_dict.get('dual_branch_odise_loss_mean', 0.0):.4f} "
+                        f"lseg_loss={loss_dict.get('dual_branch_lseg_loss_mean', 0.0):.4f} "
+                        f"fixed_loss={loss_dict.get('dual_branch_fixed_loss_mean', 0.0):.4f} "
+                        f"oracle_loss={loss_dict.get('dual_branch_oracle_loss_mean', 0.0):.4f} "
+                        f"odise_iou={loss_dict.get('dual_branch_odise_iou_mean', 0.0):.4f} "
+                        f"lseg_iou={loss_dict.get('dual_branch_lseg_iou_mean', 0.0):.4f} "
+                        f"fixed_iou={loss_dict.get('dual_branch_fixed_iou_mean', 0.0):.4f} "
+                        f"oracle_iou={loss_dict.get('dual_branch_oracle_iou_mean', 0.0):.4f} "
+                        f"clear_win={loss_dict.get('dual_branch_clear_win_rate', 0.0):.3f} "
+                        f"oracle_gain_fixed_loss={loss_dict.get('dual_branch_oracle_gain_vs_fixed_loss', 0.0):.4f}"
+                    )
+                if (
+                    verbose_legacy
+                    and self.config.projected_sem_probe
+                    and step % max(int(self.config.projected_sem_probe_log_every), 1) == 0
+                    and self.is_main
+                ):
+                    print(
+                        "  [ProjectedSem Probe] "
+                        f"valid_points={loss_dict.get('projected_sem_point_count_valid', 0.0):.0f} "
+                        f"view_mean={loss_dict.get('projected_sem_view_count_mean', 0.0):.2f} "
+                        f"odise_cons={loss_dict.get('projected_sem_odise_consistency_mean', 0.0):.4f} "
+                        f"lseg_cons={loss_dict.get('projected_sem_lseg_consistency_mean', 0.0):.4f} "
+                        f"diff={loss_dict.get('projected_sem_diff_mean', 0.0):.4f} "
+                        f"abs_diff={loss_dict.get('projected_sem_abs_diff_mean', 0.0):.4f} "
+                        f"odise_win={loss_dict.get('projected_sem_odise_win_rate', 0.0):.3f} "
+                        f"lseg_win={loss_dict.get('projected_sem_lseg_win_rate', 0.0):.3f} "
+                        f"clear@0.03={loss_dict.get('projected_sem_clear_win_rate_003', 0.0):.3f} "
+                        f"g_sem_mean={loss_dict.get('projected_sem_g_sem_rule_mean', 0.0):.4f} "
+                        f"g_sem_std={loss_dict.get('projected_sem_g_sem_rule_std', 0.0):.4f}"
                     )
 
         # 处理 epoch 末尾剩余 micro-step
@@ -1338,7 +2098,8 @@ class MaskDistillTrainer:
         if self.writer is not None:
             self.writer.add_scalar("Loss/Train_MaskDistill_Epoch", epoch_distill.avg, epoch)
             self.writer.add_scalar("Loss/Train_Aux_Epoch",         epoch_aux.avg,     epoch)
-            self.writer.add_scalar("Loss/Train_SourceGate_Epoch",  epoch_gate.avg,    epoch)
+            if self.config.enable_legacy_source_gate_logs:
+                self.writer.add_scalar("Loss/Train_SourceGate_Epoch",  epoch_gate.avg,    epoch)
 
         return epoch_loss.avg
 
@@ -1435,16 +2196,13 @@ class MaskDistillTrainer:
         val_loss      = AverageMeter()
         val_distill   = AverageMeter()
         val_aux       = AverageMeter()
+        verbose_legacy = bool(self.config.enable_verbose_legacy_probes)
 
-        # 语义 mIoU：只保留三项：
-        # 1) Hybrid/Text: fused 256D vs ODISE text256
-        # 2) CLIP/Text: raw LSeg/CLIP 512D vs CLIP-B text512
-        # 3) Final-PC: geometric fused final result
         text_feats = self._get_text_features()
         pixel_text_feats = self._get_pixel_text_features()
         pc_tracker = (
             ODISEPCSemanticMIoUTracker(pc_lambda=self.config.semantic_pc_lambda)
-            if text_feats is not None and pixel_text_feats is not None
+            if verbose_legacy and text_feats is not None and pixel_text_feats is not None
             else None
         )
         odise256_probe_accs = (
@@ -1457,7 +2215,7 @@ class MaskDistillTrainer:
                 "lseg_semproj_odise256": _SemanticAccumulator(),
                 "semantic_query_odise256": _SemanticAccumulator(),
             }
-            if text_feats is not None
+            if verbose_legacy and text_feats is not None
             else None
         )
         dual_space_accs = (
@@ -1468,8 +2226,25 @@ class MaskDistillTrainer:
                 "dual_space_fixed": _SemanticAccumulator(),
                 "dual_space_confidence": _SemanticAccumulator(),
                 "dual_space_gate": _SemanticAccumulator(),
+                "odise_only": _SemanticAccumulator(),
+                "lseg_only": _SemanticAccumulator(),
+                "fixed_05": _SemanticAccumulator(),
+                "lseg_06": _SemanticAccumulator(),
+                "lseg_07": _SemanticAccumulator(),
+                "lseg_08": _SemanticAccumulator(),
+                "size_aware": _SemanticAccumulator(),
+                "projected_gate": _SemanticAccumulator(),
+                "projected_size_gate": _SemanticAccumulator(),
             }
             if self.config.dual_space_eval and text_feats is not None and pixel_text_feats is not None
+            else None
+        )
+        dual_space_group_accs = (
+            {
+                group: {name: _SemanticAccumulator() for name in self._semantic_ablation_names()}
+                for group in self._semantic_size_group_names()
+            }
+            if dual_space_accs is not None and self.config.semantic_readout_ablation
             else None
         )
         source_gate_val_values = []
@@ -1507,6 +2282,14 @@ class MaskDistillTrainer:
                 batch_indices = results["batch_indices"],
             )
             # lifted: (N_total, K_max)
+            eval_lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
+            semantic_eval_aux = self._build_eval_semantic_aux(
+                results=results,
+                batch=batch,
+                lifted=lifted,
+                lifted_valid=lifted_valid,
+                lseg_all=eval_lseg_all,
+            )
 
             # ---- 语义 mIoU：Hybrid / CLIP / Final-PC ----
             if pc_tracker is not None:
@@ -1596,7 +2379,7 @@ class MaskDistillTrainer:
             # CLIP text512. No LSeg->ODISE projection is used here.
             if dual_space_accs is not None:
                 mask_valid_for_sem = results["mask_valid_from_masks"]
-                lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
+                lseg_all = eval_lseg_all
                 if lseg_all is None:
                     raise RuntimeError("Dual-space eval requires raw LSeg pixel_pooled features.")
                 for b in range(len(results["outputs"])):
@@ -1611,6 +2394,11 @@ class MaskDistillTrainer:
                     odise_q = batch["mask_embeddings"][b][valid_k].float()
                     lseg_q = lseg_all[b][valid_k].float()
                     fused_q = results["fused_embeddings"][b][valid_k].float()
+                    image_area = float(batch["masks"][b].shape[-1] * batch["masks"][b].shape[-2])
+                    mask_area = batch["masks"][b][valid_k].float().sum(dim=(1, 2))
+                    mask_area_ratio = (mask_area / max(image_area, 1.0)).clamp(0.0, 1.0)
+                    projected_diff = semantic_eval_aux["projected_mask_diff"].get(b)
+                    projected_valid = semantic_eval_aux["projected_mask_valid"].get(b)
 
                     if odise_q.shape[-1] != text_feats.shape[-1]:
                         raise RuntimeError(
@@ -1642,6 +2430,13 @@ class MaskDistillTrainer:
                         self.config.dual_space_conf_min,
                         self.config.dual_space_conf_max,
                     )
+                    semantic_probs = self._compute_semantic_readout_probs(
+                        p_odise=p_odise,
+                        p_lseg=p_lseg,
+                        mask_area_ratio=mask_area_ratio,
+                        projected_diff=projected_diff,
+                        projected_valid=projected_valid,
+                    )
 
                     dual_preds = {
                         "odise_only_text256": diff2scene_mask_feature_predict(
@@ -1668,6 +2463,11 @@ class MaskDistillTrainer:
                             p_conf,
                         ),
                     }
+                    for name, class_probs in semantic_probs.items():
+                        dual_preds[name] = diff2scene_class_probs_predict(
+                            pred_logits,
+                            class_probs,
+                        )
                     model_ref = self.model.module if hasattr(self.model, "module") else self.model
                     source_gate = getattr(model_ref, "source_gate", None)
                     if source_gate is not None:
@@ -1708,6 +2508,19 @@ class MaskDistillTrainer:
                             pred,
                             gt_b.detach().cpu().long(),
                         )
+                        if dual_space_group_accs is None or name not in self._semantic_ablation_names():
+                            continue
+                        point_group = semantic_eval_aux["point_groups"][b]
+                        if point_group is None:
+                            continue
+                        gt_cpu = gt_b.detach().cpu().long()
+                        for group_idx, group_name in enumerate(self._semantic_size_group_names()):
+                            group_mask = (point_group == group_idx).detach().cpu()
+                            if bool(group_mask.any()):
+                                dual_space_group_accs[group_name][name].update_labels(
+                                    pred[group_mask],
+                                    gt_cpu[group_mask],
+                                )
 
             # ---- Mask-level mIoU ----
             B      = mask_valid.shape[0]
@@ -1783,6 +2596,15 @@ class MaskDistillTrainer:
             "semantic_miou_odise_only_text256": 0.0,
             "semantic_miou_lseg_only_text512": 0.0,
             "semantic_miou_current_fused_text256": 0.0,
+            "semantic_miou_odise_only": 0.0,
+            "semantic_miou_lseg_only": 0.0,
+            "semantic_miou_fixed_05": 0.0,
+            "semantic_miou_lseg_06": 0.0,
+            "semantic_miou_lseg_07": 0.0,
+            "semantic_miou_lseg_08": 0.0,
+            "semantic_miou_size_aware": 0.0,
+            "semantic_miou_projected_gate": 0.0,
+            "semantic_miou_projected_size_gate": 0.0,
         }
 
         if pc_tracker is not None:
@@ -1827,6 +2649,25 @@ class MaskDistillTrainer:
                 val_metrics[f"n_valid_classes_{name}"] = res[f"n_valid_classes_semantic_miou_{name}"]
                 val_metrics[f"per_class_iou_{name}"] = res[f"per_class_iou_semantic_miou_{name}"]
                 val_metrics[f"per_class_acc_{name}"] = res[f"per_class_acc_semantic_miou_{name}"]
+            readout_mode = str(self.config.semantic_readout_mode).lower()
+            metric_key = f"semantic_miou_{readout_mode}"
+            metric_acc_key = f"semantic_macc_{readout_mode}"
+            if metric_key in val_metrics:
+                val_metrics["semantic_miou"] = val_metrics[metric_key]
+            if metric_acc_key in val_metrics:
+                val_metrics["semantic_macc_final"] = val_metrics[metric_acc_key]
+        if dual_space_group_accs is not None:
+            for group_name, group_accs in dual_space_group_accs.items():
+                for name, acc in group_accs.items():
+                    res = acc.compute(f"semantic_miou_{group_name}_{name}")
+                    val_metrics[f"semantic_miou_{group_name}_{name}"] = res[f"semantic_miou_{group_name}_{name}"]
+                    val_metrics[f"semantic_macc_{group_name}_{name}"] = res[f"semantic_macc_{group_name}_{name}"]
+                    val_metrics[f"per_class_iou_{group_name}_{name}"] = res[
+                        f"per_class_iou_semantic_miou_{group_name}_{name}"
+                    ]
+                    val_metrics[f"per_class_acc_{group_name}_{name}"] = res[
+                        f"per_class_acc_semantic_miou_{group_name}_{name}"
+                    ]
 
         mask_res = mask_tracker.compute()
         val_metrics["mask_miou"] = mask_res["mask_miou"]
@@ -1892,7 +2733,14 @@ class MaskDistillTrainer:
                 print(f"[resume] reloaded semantic projection from {semantic_proj_path}")
 
         if "optimizer_state_dict" in ckpt and not mismatched:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except ValueError as exc:
+                if self.is_main:
+                    print(
+                        "[resume] skipped optimizer state because parameter groups changed: "
+                        f"{exc}"
+                    )
         elif "optimizer_state_dict" in ckpt and mismatched and self.is_main:
             print("[resume] skipped optimizer state because model parameter shapes changed")
         if self.config.override_optimizer_hparams_on_resume:
@@ -1923,6 +2771,12 @@ class MaskDistillTrainer:
                     f"now using {self.config.best_monitor}"
                 )
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+
+    @torch.no_grad()
+    def evaluate_only(self) -> Dict:
+        if self.is_main:
+            print("[EvalOnly] Running validation only")
+        return self._validate(max(self.current_epoch - 1, 0))
 
     # ----------------------------------------------------------
     # 主训练入口
@@ -1956,80 +2810,73 @@ class MaskDistillTrainer:
                 if val_metrics and self.is_main:
                     if self.writer is not None:
                         self.writer.add_scalar("Loss/Val",                   val_metrics["loss"],                       epoch)
+                        self.writer.add_scalar("Loss/Val_Alignment",         val_metrics["loss_mask_distill"],          epoch)
                         self.writer.add_scalar("Loss/Val_MaskDistill",       val_metrics["loss_mask_distill"],          epoch)
                         self.writer.add_scalar("Loss/Val_Aux",               val_metrics["loss_aux"],                   epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_HybridText", val_metrics["semantic_miou_hybrid_text"], epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_CLIPText",   val_metrics["semantic_miou_clip_text"],   epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_FinalPC",    val_metrics["semantic_miou_final"],       epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mAcc_HybridText", val_metrics["semantic_macc_hybrid_text"], epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mAcc_CLIPText",   val_metrics["semantic_macc_clip_text"],   epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mAcc_FinalPC",    val_metrics["semantic_macc_final"],       epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceFixed",      val_metrics["semantic_miou_dual_space_fixed"],      epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceConfidence", val_metrics["semantic_miou_dual_space_confidence"], epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceGate",       val_metrics["semantic_miou_dual_space_gate"],       epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mAcc_DualSpaceGate",       val_metrics["semantic_macc_dual_space_gate"],       epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_ODISEOnlyText256",    val_metrics["semantic_miou_odise_only_text256"],    epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_LSegOnlyText512",     val_metrics["semantic_miou_lseg_only_text512"],     epoch)
-                        self.writer.add_scalar("Metrics/Semantic_mIoU_CurrentFusedText256", val_metrics["semantic_miou_current_fused_text256"], epoch)
-                        self.writer.add_scalar("SourceGate/val_mean", val_metrics["source_gate_val_mean"], epoch)
-                        self.writer.add_scalar("SourceGate/val_std",  val_metrics["source_gate_val_std"],  epoch)
-                        self.writer.add_scalar("SourceGate/val_min",  val_metrics["source_gate_val_min"],  epoch)
-                        self.writer.add_scalar("SourceGate/val_max",  val_metrics["source_gate_val_max"],  epoch)
-                        self.writer.add_scalar("Metrics/N_Valid_Classes_Hybrid",   val_metrics["n_valid_classes_hybrid"],   epoch)
-                        self.writer.add_scalar("Metrics/N_Valid_Classes_CLIP",     val_metrics["n_valid_classes_clip"],     epoch)
-                        self.writer.add_scalar("Metrics/N_Valid_Classes_Final",    val_metrics["n_valid_classes_final"],    epoch)
-                        for tag_name, metric_key in (
-                            ("Hybrid", "semantic_miou_hybrid_odise256"),
-                            ("CLIPProj", "semantic_miou_clip_odise256"),
-                            ("ODISE", "semantic_miou_odise_odise256"),
-                            ("Base", "semantic_miou_base_odise256"),
-                            ("Refine", "semantic_miou_refine_odise256"),
-                            ("LSegSemProj", "semantic_miou_lseg_semproj_odise256"),
-                            ("SemanticQuery", "semantic_miou_semantic_query_odise256"),
-                        ):
-                            if metric_key in val_metrics:
-                                self.writer.add_scalar(
-                                    f"Metrics_ODISE256/{tag_name}",
-                                    val_metrics[metric_key],
-                                    epoch,
-                                )
+                        self.writer.add_scalar("SemanticReadout/odise_only",          val_metrics["semantic_miou_odise_only"],          epoch)
+                        self.writer.add_scalar("SemanticReadout/lseg_only",           val_metrics["semantic_miou_lseg_only"],           epoch)
+                        self.writer.add_scalar("SemanticReadout/fixed_05",            val_metrics["semantic_miou_fixed_05"],            epoch)
+                        self.writer.add_scalar("SemanticReadout/lseg_06",             val_metrics["semantic_miou_lseg_06"],             epoch)
+                        self.writer.add_scalar("SemanticReadout/lseg_07",             val_metrics["semantic_miou_lseg_07"],             epoch)
+                        self.writer.add_scalar("SemanticReadout/lseg_08",             val_metrics["semantic_miou_lseg_08"],             epoch)
+                        self.writer.add_scalar("SemanticReadout/size_aware",          val_metrics["semantic_miou_size_aware"],          epoch)
+                        self.writer.add_scalar("SemanticReadout/projected_gate",      val_metrics["semantic_miou_projected_gate"],      epoch)
+                        self.writer.add_scalar("SemanticReadout/projected_size_gate", val_metrics["semantic_miou_projected_size_gate"], epoch)
                         self.writer.add_scalar("Metrics/Mask_mIoU",               val_metrics["mask_miou"],                epoch)
                         self.writer.add_scalar("Metrics/N_Masks",                  val_metrics["n_masks"],                  epoch)
-                        # 每类 IoU 写入 TensorBoard
+                        if self.config.enable_verbose_legacy_probes:
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_HybridText", val_metrics["semantic_miou_hybrid_text"], epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_CLIPText",   val_metrics["semantic_miou_clip_text"],   epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_FinalPC",    val_metrics["semantic_miou_final"],       epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mAcc_HybridText", val_metrics["semantic_macc_hybrid_text"], epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mAcc_CLIPText",   val_metrics["semantic_macc_clip_text"],   epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mAcc_FinalPC",    val_metrics["semantic_macc_final"],       epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceFixed",      val_metrics["semantic_miou_dual_space_fixed"],      epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceConfidence", val_metrics["semantic_miou_dual_space_confidence"], epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_DualSpaceGate",       val_metrics["semantic_miou_dual_space_gate"],       epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mAcc_DualSpaceGate",       val_metrics["semantic_macc_dual_space_gate"],       epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_ODISEOnlyText256",    val_metrics["semantic_miou_odise_only_text256"],    epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_LSegOnlyText512",     val_metrics["semantic_miou_lseg_only_text512"],     epoch)
+                            self.writer.add_scalar("Metrics/Semantic_mIoU_CurrentFusedText256", val_metrics["semantic_miou_current_fused_text256"], epoch)
+                            self.writer.add_scalar("SourceGate/val_mean", val_metrics["source_gate_val_mean"], epoch)
+                            self.writer.add_scalar("SourceGate/val_std",  val_metrics["source_gate_val_std"],  epoch)
+                            self.writer.add_scalar("SourceGate/val_min",  val_metrics["source_gate_val_min"],  epoch)
+                            self.writer.add_scalar("SourceGate/val_max",  val_metrics["source_gate_val_max"],  epoch)
                         per_class_groups = {
-                            "PerClass_IoU_HybridText": val_metrics.get("per_class_iou_hybrid_text", {}),
-                            "PerClass_IoU_CLIPText": val_metrics.get("per_class_iou_clip_text", {}),
-                            "PerClass_IoU_FinalPC": val_metrics.get("per_class_iou_final", {}),
-                            "PerClass_Acc_HybridText": val_metrics.get("per_class_acc_hybrid_text", {}),
-                            "PerClass_Acc_CLIPText": val_metrics.get("per_class_acc_clip_text", {}),
-                            "PerClass_Acc_FinalPC": val_metrics.get("per_class_acc_final", {}),
-                            "PerClass_IoU_DualSpaceFixed": val_metrics.get("per_class_iou_dual_space_fixed", {}),
-                            "PerClass_IoU_DualSpaceConfidence": val_metrics.get("per_class_iou_dual_space_confidence", {}),
-                            "PerClass_IoU_DualSpaceGate": val_metrics.get("per_class_iou_dual_space_gate", {}),
+                            "PerClass_IoU_Readout_LSegOnly": val_metrics.get("per_class_iou_lseg_only", {}),
+                            "PerClass_IoU_Readout_ODISEOnly": val_metrics.get("per_class_iou_odise_only", {}),
+                            "PerClass_IoU_Readout_LSeg07": val_metrics.get("per_class_iou_lseg_07", {}),
+                            "PerClass_IoU_Readout_SizeAware": val_metrics.get("per_class_iou_size_aware", {}),
+                            "PerClass_IoU_Readout_ProjectedSizeGate": val_metrics.get("per_class_iou_projected_size_gate", {}),
+                            "PerClass_IoU_Readout_ProjectedGate": val_metrics.get("per_class_iou_projected_gate", {}),
                         }
                         for tag_prefix, per_class in per_class_groups.items():
                             for cls_name, iou_val in per_class.items():
                                 self.writer.add_scalar(
                                     f"{tag_prefix}/{cls_name}", iou_val, epoch
                                 )
+                        for group_name in self._semantic_size_group_names():
+                            for metric_name in self._semantic_ablation_names():
+                                metric_key = f"semantic_miou_{group_name}_{metric_name}"
+                                if metric_key in val_metrics:
+                                    self.writer.add_scalar(
+                                        f"SemanticReadout_{group_name}/{metric_name}",
+                                        val_metrics[metric_key],
+                                        epoch,
+                                    )
 
-                    sem_miou_h = val_metrics["semantic_miou_hybrid_text"]
-                    sem_miou_c = val_metrics["semantic_miou_clip_text"]
-                    sem_miou_final = val_metrics["semantic_miou_final"]
-                    sem_macc_h = val_metrics["semantic_macc_hybrid_text"]
-                    sem_macc_c = val_metrics["semantic_macc_clip_text"]
-                    sem_macc_final = val_metrics["semantic_macc_final"]
-                    mask_miou  = val_metrics["mask_miou"]
-                    n_cls      = val_metrics["n_valid_classes_final"]
                     print(
-                        f"  Val Loss: {val_metrics['loss']:.4f} "
-                        f"(distill={val_metrics['loss_mask_distill']:.4f})  "
-                        f"[Hybrid/Text] mIoU={sem_miou_h:.4f} mAcc={sem_macc_h:.4f}  "
-                        f"[CLIP/Text] mIoU={sem_miou_c:.4f} mAcc={sem_macc_c:.4f}  "
-                        f"[Final-PC] mIoU={sem_miou_final:.4f} mAcc={sem_macc_final:.4f} ({n_cls} classes)  "
-                        f"[MaskIoU] {mask_miou:.4f} ({val_metrics['n_masks']} masks)"
+                        "  [Main Metrics] "
+                        f"val_loss={val_metrics['loss']:.4f}  "
+                        f"alignment_loss={val_metrics['loss_mask_distill']:.4f}  "
+                        f"mask_iou={val_metrics['mask_miou']:.4f}  "
+                        f"semantic_miou_projected_gate={val_metrics.get('semantic_miou_projected_gate', 0.0):.4f}  "
+                        f"semantic_macc_projected_gate={val_metrics.get('semantic_macc_projected_gate', 0.0):.4f}  "
+                        f"semantic_miou_fixed_05={val_metrics.get('semantic_miou_fixed_05', 0.0):.4f}  "
+                        f"semantic_miou_lseg_only={val_metrics.get('semantic_miou_lseg_only', 0.0):.4f}  "
+                        f"semantic_miou_odise_only={val_metrics.get('semantic_miou_odise_only', 0.0):.4f}"
                     )
-                    if "semantic_miou_dual_space_fixed" in val_metrics:
+                    if self.config.enable_verbose_legacy_probes and "semantic_miou_dual_space_fixed" in val_metrics:
                         print(
                             "  [Dual-Space] "
                             f"odise={val_metrics['semantic_miou_odise_only_text256']:.4f}  "
@@ -2039,14 +2886,46 @@ class MaskDistillTrainer:
                             f"conf={val_metrics['semantic_miou_dual_space_confidence']:.4f}  "
                             f"gate={val_metrics['semantic_miou_dual_space_gate']:.4f}"
                         )
+                        if self.config.source_gate_train:
+                            print(
+                                "  [SourceGate] "
+                                f"mean={val_metrics['source_gate_val_mean']:.4f}  "
+                                f"std={val_metrics['source_gate_val_std']:.4f}  "
+                                f"min={val_metrics['source_gate_val_min']:.4f}  "
+                                f"max={val_metrics['source_gate_val_max']:.4f}"
+                            )
+                    print(
+                        "  [Alignment Query Mode] "
+                        f"mode={self.config.alignment_query_mode}  "
+                        f"val_loss={val_metrics['loss']:.4f}  "
+                        f"mask_iou={val_metrics['mask_miou']:.4f}  "
+                        f"semantic_miou_projected_gate={val_metrics.get('semantic_miou_projected_gate', 0.0):.4f}  "
+                        f"semantic_miou_fixed_05={val_metrics.get('semantic_miou_fixed_05', 0.0):.4f}  "
+                        f"semantic_miou_lseg_only={val_metrics.get('semantic_miou_lseg_only', 0.0):.4f}  "
+                        f"semantic_miou_odise_only={val_metrics.get('semantic_miou_odise_only', 0.0):.4f}"
+                    )
+                    if self.config.semantic_readout_ablation:
                         print(
-                            "  [SourceGate] "
-                            f"mean={val_metrics['source_gate_val_mean']:.4f}  "
-                            f"std={val_metrics['source_gate_val_std']:.4f}  "
-                            f"min={val_metrics['source_gate_val_min']:.4f}  "
-                            f"max={val_metrics['source_gate_val_max']:.4f}"
+                            "  [Semantic Readout Ablation] "
+                            f"odise_only={val_metrics['semantic_miou_odise_only']:.4f}  "
+                            f"lseg_only={val_metrics['semantic_miou_lseg_only']:.4f}  "
+                            f"fixed_0.5={val_metrics['semantic_miou_fixed_05']:.4f}  "
+                            f"lseg_0.6={val_metrics['semantic_miou_lseg_06']:.4f}  "
+                            f"lseg_0.7={val_metrics['semantic_miou_lseg_07']:.4f}  "
+                            f"lseg_0.8={val_metrics['semantic_miou_lseg_08']:.4f}  "
+                            f"size_aware={val_metrics['semantic_miou_size_aware']:.4f}  "
+                            f"projected_gate={val_metrics['semantic_miou_projected_gate']:.4f}  "
+                            f"projected_size_gate={val_metrics['semantic_miou_projected_size_gate']:.4f}"
                         )
-                    if "semantic_miou_hybrid_odise256" in val_metrics:
+                        print("  [Region Size Ablation]")
+                        for group_name in self._semantic_size_group_names():
+                            print(
+                                f"    {group_name}: "
+                                f"odise={val_metrics.get(f'semantic_miou_{group_name}_odise_only', 0.0):.4f}  "
+                                f"lseg={val_metrics.get(f'semantic_miou_{group_name}_lseg_only', 0.0):.4f}  "
+                                f"projected={val_metrics.get(f'semantic_miou_{group_name}_projected_gate', 0.0):.4f}"
+                            )
+                    if self.config.enable_verbose_legacy_probes and "semantic_miou_hybrid_odise256" in val_metrics:
                         print(
                             "  [ODISE-256 probes] "
                             f"hybrid={val_metrics['semantic_miou_hybrid_odise256']:.4f}  "
@@ -2057,7 +2936,7 @@ class MaskDistillTrainer:
                             f"lseg_semproj={val_metrics.get('semantic_miou_lseg_semproj_odise256', 0.0):.4f}  "
                             f"semantic_query={val_metrics.get('semantic_miou_semantic_query_odise256', 0.0):.4f}"
                         )
-                    if self.is_main:
+                    if self.is_main and self.config.enable_verbose_legacy_probes:
                         for name, key in (
                             ("Hybrid/Text", "per_class_iou_hybrid_text"),
                             ("CLIP/Text", "per_class_iou_clip_text"),
@@ -2081,6 +2960,30 @@ class MaskDistillTrainer:
                                 sorted(per_cls.items(), key=lambda x: -x[1])[:10]
                             )
                             print(f"  Top-10 classes ({name}): {top10}")
+                        if self.config.semantic_readout_ablation:
+                            print("  [Top-K Per-Class Comparison]")
+                            baseline = val_metrics.get("per_class_iou_lseg_only", {})
+                            for compare_name, metric_key in (
+                                ("ODISEOnly", "per_class_iou_odise_only"),
+                                ("LSeg07", "per_class_iou_lseg_07"),
+                                ("SizeAware", "per_class_iou_size_aware"),
+                                ("ProjectedSizeGate", "per_class_iou_projected_size_gate"),
+                            ):
+                                per_cls = val_metrics.get(metric_key, {})
+                                if not baseline or not per_cls:
+                                    continue
+                                deltas = [
+                                    (cls_name, float(per_cls.get(cls_name, 0.0) - baseline.get(cls_name, 0.0)))
+                                    for cls_name in baseline.keys()
+                                ]
+                                gains = "  ".join(
+                                    f"{k}:{v:+.3f}" for k, v in sorted(deltas, key=lambda x: -x[1])[:5]
+                                )
+                                drops = "  ".join(
+                                    f"{k}:{v:+.3f}" for k, v in sorted(deltas, key=lambda x: x[1])[:5]
+                                )
+                                print(f"    {compare_name} gains: {gains}")
+                                print(f"    {compare_name} drops: {drops}")
 
             is_best = False
             if val_metrics is not None:

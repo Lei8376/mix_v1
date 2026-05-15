@@ -1,0 +1,88 @@
+gpu_ids: [0]
+
+dataloader:
+  batch_size: 4
+  num_workers: 0
+  val_batch_size: 2
+  val_num_workers: 0
+  multiview_batch: true
+  scenes_per_batch: 1
+  views_per_scene: 4
+  drop_last: true
+
+dataset:
+  data_config_path: config/data_scannet_3d.yaml
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
+  projection_dir: /home/sunl/work/mix/data/scannet_projections
+  split: train
+  aug: true
+  max_samples_ratio: 1
+  val_max_samples: 8
+  val_max_samples_ratio: null
+
+model:
+  pc_arch: MinkUNet34C
+  pixel_embedding_dim: 512
+  mask_embedding_dim: 256
+  fused_embedding_dim: 256
+  pc_last_dim: 256
+  alpha_mode: fixed
+  alpha_init: 1.25
+  alpha_max: 2.0
+  use_semantic_query: false
+  semantic_fusion_mode: fixed
+  semantic_odise_weight: 0.5
+  semantic_lseg_weight: 0.5
+  semantic_init_odise_weight: 0.3
+  semantic_init_lseg_weight: 0.7
+  semantic_proj_path: null
+  freeze_semantic_proj: true
+  use_source_reliability_gate: true
+  source_gate_input_dim: 6
+  source_gate_hidden_dim: 64
+  source_gate_dropout: 0.1
+  source_gate_init_bias: -0.85
+  dual_branch_probe: true
+  dual_branch_lseg_match_dim: 512
+  dual_branch_odise_match_dim: 256
+
+trainer:
+  use_mask_distill: true
+  base_lr: 0.00005
+  warmup_epochs: 1
+  scheduler_type: cosine
+  weight_decay: 0.0004
+  num_epochs: 1
+  val_every_epochs: 999
+  save_every_epochs: 999
+  checkpoint_dir: checkpoints/dual_branch_probe
+  log_dir: runs/dual_branch_probe
+  log_every_steps: 1
+  grad_clip_norm: 1.0
+  early_stopping_patience: 20
+  use_amp: true
+  use_model_half: false
+  gradient_accumulation_steps: 1
+  max_batches_per_epoch: 100
+
+  mask_distill_weight: 1.0
+  bce_weight: 0.0
+  dice_weight: 0.0
+  min_points_per_mask: 6
+
+  dual_space_eval: true
+  dual_space_odise_weight: 0.5
+  dual_space_lseg_weight: 0.5
+  dual_space_tau_odise: 0.07
+  dual_space_tau_lseg: 0.07
+  dual_space_use_confidence: false
+  dual_space_conf_min: 0.2
+  dual_space_conf_max: 0.7
+
+  source_gate_train: false
+  dual_branch_probe: true
+  dual_branch_probe_weight: 0.0
+  dual_branch_oracle_margin: 0.02
+  dual_branch_probe_log_every: 20
+
+seed: 1342

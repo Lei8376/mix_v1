@@ -268,6 +268,7 @@ def main() -> None:
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
     parser.add_argument("--model-half", action="store_true", help="Store model in float16 to reduce VRAM (use with AMP)")
     parser.add_argument("--early-stopping-patience", type=int, default=10, help="Early stopping patience")
+    parser.add_argument("--eval-only", action="store_true", help="Run validation only after loading checkpoint")
 
     # Misc
     parser.add_argument("--seed", type=int, default=1342, help="Random seed")
@@ -415,10 +416,15 @@ def main() -> None:
         source_gate_hidden_dim=int(_model.get("source_gate_hidden_dim", 64)),
         source_gate_dropout=float(_model.get("source_gate_dropout", 0.1)),
         source_gate_init_bias=float(_model.get("source_gate_init_bias", -0.85)),
+        dual_branch_probe=bool(_model.get("dual_branch_probe", False)),
+        dual_branch_lseg_match_dim=int(_model.get("dual_branch_lseg_match_dim", 512)),
+        dual_branch_odise_match_dim=int(_model.get("dual_branch_odise_match_dim", 256)),
+        alignment_query_mode=str(_model.get("alignment_query_mode", "fused")),
     )
 
     # Trainer config
     _trainer = yaml_config.get("trainer") or {}
+    eval_only = bool(yaml_config.get("eval_only", False) or _trainer.get("eval_only", False) or args.eval_only)
     resume_checkpoint = _trainer.get("resume", args.resume)
     if resume_checkpoint and not os.path.isabs(resume_checkpoint):
         resume_checkpoint = os.path.join(repo_root, resume_checkpoint)
@@ -490,7 +496,7 @@ def main() -> None:
             dual_space_use_confidence=_trainer.get("dual_space_use_confidence", False),
             dual_space_conf_min=_trainer.get("dual_space_conf_min", 0.2),
             dual_space_conf_max=_trainer.get("dual_space_conf_max", 0.7),
-            best_monitor=_trainer.get("best_monitor", "semantic_miou_dual_space_fixed"),
+            best_monitor=_trainer.get("monitor_metric", _trainer.get("best_monitor", "semantic_miou_dual_space_fixed")),
             source_gate_train=_trainer.get("source_gate_train", False),
             source_gate_loss_weight=_trainer.get("source_gate_loss_weight", 0.03),
             source_gate_open_loss_weight=_trainer.get("source_gate_open_loss_weight", 0.03),
@@ -513,13 +519,57 @@ def main() -> None:
             source_gate_mv_min_lifted_points=_trainer.get("source_gate_mv_min_lifted_points", 2),
             source_gate_mv_min_valid_masks=_trainer.get("source_gate_mv_min_valid_masks", 2),
             source_gate_skip_when_no_mv=_trainer.get("source_gate_skip_when_no_mv", True),
+            source_gate_target_gamma=_trainer.get("source_gate_target_gamma", 2.0),
+            source_gate_mv_margin=_trainer.get("source_gate_mv_margin", 0.03),
+            source_gate_use_margin_filter=_trainer.get("source_gate_use_margin_filter", True),
             source_gate_mv_default_stability=_trainer.get("source_gate_mv_default_stability", 0.5),
             source_gate_mask_quality_weight=_trainer.get("source_gate_mask_quality_weight", 1.0),
             source_gate_point_conf_weight=_trainer.get("source_gate_point_conf_weight", 1.0),
             allow_source_gate_gt_ce_upper_bound=_trainer.get("allow_source_gate_gt_ce_upper_bound", False),
             source_gate_train_query_file=_trainer.get("source_gate_train_query_file", None),
             source_gate_num_train_queries=_trainer.get("source_gate_num_train_queries", 64),
+            dual_branch_probe=_trainer.get("dual_branch_probe", False),
+            dual_branch_probe_weight=_trainer.get("dual_branch_probe_weight", 0.0),
+            dual_branch_oracle_margin=_trainer.get("dual_branch_oracle_margin", 0.02),
+            dual_branch_probe_log_every=_trainer.get("dual_branch_probe_log_every", 20),
+            projected_sem_probe=_trainer.get("projected_sem_probe", False),
+            projected_sem_probe_min_views=_trainer.get("projected_sem_probe_min_views", 2),
+            projected_sem_probe_max_points=_trainer.get("projected_sem_probe_max_points", 4096),
+            projected_sem_probe_region_mode=_trainer.get("projected_sem_probe_region_mode", "point"),
+            projected_sem_probe_iou_weighted=_trainer.get("projected_sem_probe_iou_weighted", False),
+            projected_sem_probe_log_every=_trainer.get("projected_sem_probe_log_every", 20),
+            projected_sem_gate_scale=_trainer.get("projected_sem_gate_scale", 10.0),
+            alignment_query_mode=str(_trainer.get("alignment_query_mode", _model.get("alignment_query_mode", "fused"))),
+            semantic_readout_ablation=_trainer.get("semantic_readout_ablation", False),
+            semantic_size_aware=_trainer.get("semantic_size_aware", True),
+            semantic_small_area_thr=_trainer.get("semantic_small_area_thr", 0.01),
+            semantic_medium_area_thr=_trainer.get("semantic_medium_area_thr", 0.10),
+            semantic_small_lseg_weight=_trainer.get("semantic_small_lseg_weight", 0.45),
+            semantic_medium_lseg_weight=_trainer.get("semantic_medium_lseg_weight", 0.65),
+            semantic_large_lseg_weight=_trainer.get("semantic_large_lseg_weight", 0.80),
+            semantic_projected_gate=_trainer.get("semantic_projected_gate", True),
+            semantic_projected_gate_scale=_trainer.get("semantic_projected_gate_scale", 10.0),
+            semantic_projected_gate_min=_trainer.get("semantic_projected_gate_min", 0.45),
+            semantic_projected_gate_max=_trainer.get("semantic_projected_gate_max", 0.85),
+            semantic_projected_gate_default=_trainer.get("semantic_projected_gate_default", 0.70),
+            semantic_projected_size_gate=_trainer.get("semantic_projected_size_gate", True),
+            semantic_projected_size_base=_trainer.get("semantic_projected_size_base", 0.65),
+            semantic_projected_size_beta=_trainer.get("semantic_projected_size_beta", 1.0),
+            semantic_projected_size_gamma=_trainer.get("semantic_projected_size_gamma", 0.20),
+            semantic_projected_size_min=_trainer.get("semantic_projected_size_min", 0.35),
+            semantic_projected_size_max=_trainer.get("semantic_projected_size_max", 0.85),
+            semantic_readout_mode=_trainer.get("semantic_readout_mode", "projected_gate"),
+            eval_only=eval_only,
+            lambda_align=_trainer.get("lambda_align", _trainer.get("mask_distill_weight", 1.0)),
+            use_lseg_semantic_loss=_trainer.get("use_lseg_semantic_loss", False),
+            use_odise_semantic_loss=_trainer.get("use_odise_semantic_loss", False),
+            enable_verbose_legacy_probes=_trainer.get("enable_verbose_legacy_probes", False),
+            enable_legacy_source_gate_logs=_trainer.get("enable_legacy_source_gate_logs", False),
+            enable_size_aware_ablation=_trainer.get("enable_size_aware_ablation", True),
+            enable_projected_size_gate_ablation=_trainer.get("enable_projected_size_gate_ablation", True),
+            allow_gt_ce_upper_bound=_trainer.get("allow_gt_ce_upper_bound", False),
         )
+        model_config.alignment_query_mode = trainer_config.alignment_query_mode
 
     # Validate configuration
     if not os.path.exists(dataset_config.data_config_path):
@@ -592,8 +642,18 @@ def main() -> None:
             val_loader=val_loader,
         )
 
-    results = trainer.train()
-    print(f"Training finished: {results}")
+    if eval_only and use_mask_distill:
+        results = trainer.evaluate_only()
+        print(
+            "[EvalOnly Result] "
+            f"val_loss={results.get('loss', 0.0):.4f} "
+            f"alignment_loss={results.get('loss_mask_distill', 0.0):.4f} "
+            f"mask_iou={results.get('mask_miou', 0.0):.4f} "
+            f"semantic_miou_projected_gate={results.get('semantic_miou_projected_gate', 0.0):.4f}"
+        )
+    else:
+        results = trainer.train()
+        print(f"Training finished: {results}")
 
 
 if __name__ == "__main__":

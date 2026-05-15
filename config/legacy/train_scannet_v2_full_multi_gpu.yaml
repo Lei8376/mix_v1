@@ -207,6 +207,9 @@ trainer:
   source_gate_mv_min_pairs: 1
   source_gate_mv_min_lifted_points: 1
   source_gate_mv_min_valid_masks: 2
+  source_gate_target_gamma: 2.0
+  source_gate_mv_margin: 0.03
+  source_gate_use_margin_filter: true
   source_gate_mv_default_stability: 0.5
   source_gate_mask_quality_weight: 1.0
   source_gate_point_conf_weight: 1.0
@@ -217,7 +220,7 @@ trainer:
   best_monitor: "semantic_miou_dual_space_gate"
   
   # 【可选】恢复训练
-  # resume: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.moe/checkpoint_epoch_5.pth # 只复用几何分支；6D text-free gate 会重新初始化
+  resume: checkpoints/diff2scene_hybrid_lseg_odise256_text_free_source_gate_mv_grouped_v1/checkpoint_epoch_4.pth
 
 # ============================================================
 # 随机种子（确保可复现性）

@@ -46,6 +46,10 @@ class OpenVocabFusionModelV2Config:
     source_gate_hidden_dim: int = 64
     source_gate_dropout: float = 0.1
     source_gate_init_bias: float = -0.85
+    dual_branch_probe: bool = False
+    dual_branch_lseg_match_dim: int = 512
+    dual_branch_odise_match_dim: int = 256
+    alignment_query_mode: str = "fused"
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
     lseg_ckpt_path: Optional[str] = None
@@ -128,6 +132,16 @@ class OpenVocab3DFusionModelV2(nn.Module):
         else:
             self.source_gate = None
 
+        point_head_in_dim = int(config.pc_last_dim or config.fused_embedding_dim)
+        self.point_odise_head = nn.Linear(
+            point_head_in_dim,
+            int(config.dual_branch_odise_match_dim),
+        )
+        self.point_lseg_head = nn.Linear(
+            point_head_in_dim,
+            int(config.dual_branch_lseg_match_dim),
+        )
+
         # Learnable temperature for similarity
         self.logit_scale = nn.Parameter(
             torch.ones([]) * np.log(DEFAULT_LOGIT_SCALE)
@@ -180,6 +194,19 @@ class OpenVocab3DFusionModelV2(nn.Module):
             return
 
         raise RuntimeError(f"Unknown semantic projection checkpoint format: {path}")
+
+    def _select_alignment_tokens(self, fusion_components: Dict[str, torch.Tensor]) -> torch.Tensor:
+        mode = str(self.config.alignment_query_mode).lower()
+        if mode == "fused":
+            return fusion_components["fused"]
+        if mode == "odise_only":
+            return fusion_components["odise_tokens"]
+        if mode == "lseg_only":
+            return fusion_components["clip_tokens"]
+        raise ValueError(
+            "alignment_query_mode must be one of {'fused', 'odise_only', 'lseg_only'}, "
+            f"got {self.config.alignment_query_mode!r}"
+        )
 
     def _get_semantic_fusion_weights(self):
         mode = str(self.config.semantic_fusion_mode).lower()
@@ -351,6 +378,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
             return_components=True,
         )
         fused_embeddings = fusion_components["fused"]
+        alignment_embeddings = self._select_alignment_tokens(fusion_components)
         pixel_pooled_embeddings = self._pool_pixel_embeddings_for_eval(
             pixel_embeddings, mask_tensors, mask_valid
         )
@@ -430,6 +458,8 @@ class OpenVocab3DFusionModelV2(nn.Module):
         
         # 用正确的映射索引体素特征：每个点 → 其体素索引 → 体素特征
         pred_3d = pred_3d_voxel[point_to_voxel_idx, :].float()
+        pred_3d_odise = self.point_odise_head(pred_3d).float()
+        pred_3d_lseg = self.point_lseg_head(pred_3d).float()
 
         # Compute per-point, per-mask similarity
         batch_indices = batch_input["ori_coords_3d"][:, 0].long()
@@ -442,7 +472,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
             if not torch.any(point_mask):
                 continue
 
-            mask_tokens = fused_embeddings[b].float()
+            mask_tokens = alignment_embeddings[b].float()
             if mask_valid is not None:
                 valid_mask = mask_valid[b].to(mask_tokens.device)
                 if not valid_mask.any():
@@ -463,17 +493,41 @@ class OpenVocab3DFusionModelV2(nn.Module):
             mask_tokens_unnorm = mask_tokens 
             logits = point_features @ mask_tokens_unnorm.t()
 
+            branch_logits_odise = None
+            branch_logits_lseg = None
+            if self.config.dual_branch_probe:
+                odise_tokens = batch_input["mask_embeddings"][b][valid_mask].float()
+                lseg_all = batch_input.get("clip_pooled", batch_input.get("pixel_pooled", pixel_pooled_embeddings))
+                lseg_tokens = lseg_all[b][valid_mask].float()
+                branch_logits_odise = pred_3d_odise[point_mask] @ odise_tokens.t()
+                branch_logits_lseg = pred_3d_lseg[point_mask] @ lseg_tokens.t()
+
             # Expand to full mask count
             if mask_valid is not None:
-                num_masks = fused_embeddings.shape[1]
+                num_masks = alignment_embeddings.shape[1]
                 full_logits = pred_3d.new_full(
                     (logits.shape[0], num_masks), float("-inf")
                 )
                 full_logits[:, valid_mask] = logits.to(full_logits.dtype)
                 logits = full_logits
+                if self.config.dual_branch_probe:
+                    full_logits_o = pred_3d.new_full(
+                        (branch_logits_odise.shape[0], num_masks), float("-inf")
+                    )
+                    full_logits_l = pred_3d.new_full(
+                        (branch_logits_lseg.shape[0], num_masks), float("-inf")
+                    )
+                    full_logits_o[:, valid_mask] = branch_logits_odise.to(full_logits_o.dtype)
+                    full_logits_l[:, valid_mask] = branch_logits_lseg.to(full_logits_l.dtype)
+                    branch_logits_odise = full_logits_o
+                    branch_logits_lseg = full_logits_l
 
             # 传 logits 给 criterion，便于 AMP 下用 BCEWithLogitsLoss（autocast 安全）
-            outputs[b].append({"pred_mask_logits": logits})
+            output_item = {"pred_mask_logits": logits}
+            if self.config.dual_branch_probe:
+                output_item["pred_mask_logits_odise_branch"] = branch_logits_odise
+                output_item["pred_mask_logits_lseg_branch"] = branch_logits_lseg
+            outputs[b].append(output_item)
 
         return {
             "outputs": outputs,
@@ -481,6 +535,8 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "mask_masks": mask_tensors,
             "batch_indices": batch_indices,
             "fused_embeddings": fused_embeddings,
+            "alignment_embeddings": alignment_embeddings,
+            "alignment_query_mode": str(self.config.alignment_query_mode).lower(),
             "semantic_embeddings": semantic_embeddings if semantic_embeddings is not None else fused_embeddings,
             "odise_projected_embeddings": fusion_components["odise_tokens"],
             "clip_projected_embeddings": fusion_components["clip_tokens"],
@@ -491,6 +547,8 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "semantic_weight_lseg": semantic_weight_lseg.detach() if semantic_weight_lseg is not None else None,
             "pixel_pooled_embeddings": pixel_for_sem,
             "pred_3d": pred_3d,
+            "pred_3d_odise": pred_3d_odise,
+            "pred_3d_lseg": pred_3d_lseg,
         }
 
     def _pool_pixel_embeddings_for_eval(

@@ -99,6 +99,9 @@ trainer:
   source_gate_mv_min_lifted_points: 1
   source_gate_mv_min_valid_masks: 2
   source_gate_skip_when_no_mv: true
+  source_gate_target_gamma: 2.0
+  source_gate_mv_margin: 0.03
+  source_gate_use_margin_filter: true
   source_gate_mv_default_stability: 0.5
   source_gate_mask_quality_weight: 1.0
   source_gate_point_conf_weight: 1.0
