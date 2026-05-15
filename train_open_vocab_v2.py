@@ -40,6 +40,7 @@ import yaml
 from dataset.open_vocab_dataset_v2 import (
     OpenVocabDatasetV2Config,
     OpenVocabScannetDatasetV2,
+    SceneGroupedBatchSampler,
     open_vocab_collate_v2,
 )
 from model.open_vocab_fusion_v2 import (
@@ -70,6 +71,10 @@ class DataLoaderConfig:
     val_num_workers: Optional[int] = None
     pin_memory: bool = True
     drop_last: bool = True
+    multiview_batch: bool = False
+    scenes_per_batch: int = 1
+    views_per_scene: int = 4
+    seed: int = 0
 
 
 def load_yaml_config(config_path: str) -> Dict[str, Any]:
@@ -109,15 +114,32 @@ def create_data_loaders(
 ) -> tuple:
     """Create train and validation data loaders."""
     train_dataset = OpenVocabScannetDatasetV2(dataset_config)
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=dataloader_config.batch_size,
-        shuffle=True,
+    train_loader_kwargs = dict(
+        dataset=train_dataset,
         num_workers=dataloader_config.num_workers,
         pin_memory=dataloader_config.pin_memory,
-        drop_last=dataloader_config.drop_last,
         collate_fn=open_vocab_collate_v2,
     )
+    if dataloader_config.multiview_batch:
+        train_batch_sampler = SceneGroupedBatchSampler(
+            train_dataset,
+            scenes_per_batch=dataloader_config.scenes_per_batch,
+            views_per_scene=dataloader_config.views_per_scene,
+            drop_last=dataloader_config.drop_last,
+            shuffle=True,
+            seed=dataloader_config.seed,
+        )
+        train_loader = torch.utils.data.DataLoader(
+            batch_sampler=train_batch_sampler,
+            **train_loader_kwargs,
+        )
+    else:
+        train_loader = torch.utils.data.DataLoader(
+            batch_size=dataloader_config.batch_size,
+            shuffle=True,
+            drop_last=dataloader_config.drop_last,
+            **train_loader_kwargs,
+        )
 
     # Create validation loader if validation split exists
     val_loader = None
@@ -323,11 +345,28 @@ def main() -> None:
             f"Warning: batch_size={raw_batch_size} is not supported (MinkowskiEngine BatchNorm). Using batch_size=2."
         )
         raw_batch_size = 2
+    multiview_batch = bool(_dataloader.get("multiview_batch", False))
+    scenes_per_batch = int(_dataloader.get("scenes_per_batch", 1))
+    views_per_scene = int(_dataloader.get("views_per_scene", 4))
+    if multiview_batch:
+        expected_batch_size = scenes_per_batch * views_per_scene
+        if raw_batch_size != expected_batch_size:
+            print(
+                f"Warning: batch_size={raw_batch_size} does not match "
+                f"scenes_per_batch*views_per_scene={expected_batch_size}. "
+                f"Using batch_size={expected_batch_size}."
+            )
+            raw_batch_size = expected_batch_size
     dataloader_config = DataLoaderConfig(
         batch_size=raw_batch_size,
         num_workers=_dataloader.get("num_workers", args.num_workers),
         val_batch_size=_dataloader.get("val_batch_size"),
         val_num_workers=_dataloader.get("val_num_workers"),
+        drop_last=bool(_dataloader.get("drop_last", True)),
+        multiview_batch=multiview_batch,
+        scenes_per_batch=scenes_per_batch,
+        views_per_scene=views_per_scene,
+        seed=seed,
     )
 
     # Model config
@@ -436,6 +475,7 @@ def main() -> None:
                 "early_stopping_patience", args.early_stopping_patience
             ),
             resume_checkpoint=resume_checkpoint,
+            max_batches_per_epoch=_trainer.get("max_batches_per_epoch", None),
             use_model_half=_trainer.get("use_model_half", args.model_half),
             gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),
             semantic_clip_model=_trainer.get("semantic_clip_model", "ODISE-256"),
@@ -471,6 +511,8 @@ def main() -> None:
             source_gate_mv_topk=_trainer.get("source_gate_mv_topk", 5),
             source_gate_mv_min_pairs=_trainer.get("source_gate_mv_min_pairs", 1),
             source_gate_mv_min_lifted_points=_trainer.get("source_gate_mv_min_lifted_points", 2),
+            source_gate_mv_min_valid_masks=_trainer.get("source_gate_mv_min_valid_masks", 2),
+            source_gate_skip_when_no_mv=_trainer.get("source_gate_skip_when_no_mv", True),
             source_gate_mv_default_stability=_trainer.get("source_gate_mv_default_stability", 0.5),
             source_gate_mask_quality_weight=_trainer.get("source_gate_mask_quality_weight", 1.0),
             source_gate_point_conf_weight=_trainer.get("source_gate_point_conf_weight", 1.0),

@@ -1,0 +1,111 @@
+# Short probe config for TextFreeMV SourceGate diagnostics.
+# Purpose: quickly collect mv_valid_ratio / valid_count / skipped_no_mv metrics
+# without running a full training job.
+
+gpu_ids: [0]
+
+dataloader:
+  batch_size: 4
+  num_workers: 0
+  val_batch_size: 2
+  val_num_workers: 0
+  multiview_batch: true
+  scenes_per_batch: 1
+  views_per_scene: 4
+  drop_last: true
+
+dataset:
+  data_config_path: config/data_scannet_3d.yaml
+  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
+  projection_dir: /home/sunl/work/mix/data/scannet_projections
+  split: train
+  aug: true
+  max_samples_ratio: 1
+  val_max_samples: 8
+  val_max_samples_ratio: null
+
+model:
+  pc_arch: MinkUNet34C
+  pixel_embedding_dim: 512
+  mask_embedding_dim: 256
+  fused_embedding_dim: 256
+  pc_last_dim: 256
+  alpha_mode: fixed
+  alpha_init: 1.25
+  alpha_max: 2.0
+  use_semantic_query: false
+  semantic_fusion_mode: fixed
+  semantic_odise_weight: 0.5
+  semantic_lseg_weight: 0.5
+  semantic_init_odise_weight: 0.3
+  semantic_init_lseg_weight: 0.7
+  semantic_proj_path: null
+  freeze_semantic_proj: true
+  use_source_reliability_gate: true
+  source_gate_input_dim: 6
+  source_gate_hidden_dim: 64
+  source_gate_dropout: 0.1
+  source_gate_init_bias: -0.85
+
+trainer:
+  use_mask_distill: true
+  base_lr: 0.00005
+  warmup_epochs: 1
+  scheduler_type: cosine
+  weight_decay: 0.0004
+  num_epochs: 1
+  val_every_epochs: 999
+  save_every_epochs: 999
+  checkpoint_dir: checkpoints/text_free_mv_probe_scene_grouped
+  log_dir: runs/text_free_mv_probe_scene_grouped
+  log_every_steps: 1
+  grad_clip_norm: 1.0
+  early_stopping_patience: 20
+  use_amp: true
+  use_model_half: false
+  gradient_accumulation_steps: 1
+  max_batches_per_epoch: 20
+
+  mask_distill_weight: 1.0
+  bce_weight: 0.0
+  dice_weight: 0.0
+  min_points_per_mask: 10
+
+  dual_space_eval: true
+  dual_space_odise_weight: 0.5
+  dual_space_lseg_weight: 0.5
+  dual_space_tau_odise: 0.07
+  dual_space_tau_lseg: 0.07
+  dual_space_use_confidence: false
+  dual_space_conf_min: 0.2
+  dual_space_conf_max: 0.7
+
+  source_gate_train: true
+  source_gate_training_target: text_free_mv_stability
+  source_gate_loss_weight: 0.03
+  source_gate_open_loss_weight: 0.03
+  source_gate_start_epoch: 0
+  source_gate_detach_teacher_probs: true
+  source_gate_detach_pred_logits: true
+  source_gate_single_weight: 1.0
+  source_gate_multiview_weight: 1.0
+  source_gate_conflict_weight: 0.5
+  source_gate_odise_prior: 1.2
+  source_gate_lseg_prior: 1.0
+  source_gate_conflict_safe_min: 0.25
+  source_gate_mv_iou_threshold: 0.03
+  source_gate_mv_topk: 5
+  source_gate_mv_min_pairs: 1
+  source_gate_mv_min_lifted_points: 1
+  source_gate_mv_min_valid_masks: 2
+  source_gate_skip_when_no_mv: true
+  source_gate_mv_default_stability: 0.5
+  source_gate_mask_quality_weight: 1.0
+  source_gate_point_conf_weight: 1.0
+  source_gate_balance_reg: 0.0
+  source_gate_entropy_reg: 0.0
+  source_gate_monitor: semantic_miou_dual_space_gate
+  allow_source_gate_gt_ce_upper_bound: false
+  best_monitor: semantic_miou_dual_space_gate
+
+seed: 1342

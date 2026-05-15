@@ -16,7 +16,7 @@ gpu_ids: [0]  # 单卡模式使用的 GPU 编号（0=第一张卡）
 # 数据加载配置
 # ============================================================
 dataloader:
-  batch_size: 32  # 🔥 单卡训练建议值（显存足够可用 16）
+  batch_size: 4   # scene-grouped multi-view batch: 1 scene x 4 views
                   # - 多卡时: 每个 GPU 的批大小
                   # - 单卡时: 总批大小
                   # - 显存不足时可减小到 4 或 2
@@ -28,6 +28,10 @@ dataloader:
   # 验证阶段单独控制，避免 epoch 末验证 OOM。
   val_batch_size: 12
   val_num_workers: 8
+  multiview_batch: true
+  scenes_per_batch: 1
+  views_per_scene: 4
+  drop_last: true
 
 # ============================================================
 # 数据集配置
@@ -133,9 +137,9 @@ trainer:
                          # - 推荐: 5-10
                          # - 每个检查点约 458 MB
   
-  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.moe.2
+  checkpoint_dir: checkpoints/diff2scene_hybrid_lseg_odise256_text_free_source_gate_mv_grouped_v1
   
-  log_dir: runs/diff2scene_hybrid_lseg_odise256_semantic_query.moe.2
+  log_dir: runs/diff2scene_hybrid_lseg_odise256_text_free_source_gate_mv_grouped_v1
   
   # ----- Diff2Scene Eq.1/Eq.2 Mask Distillation Loss -----
   use_mask_distill: true
@@ -198,10 +202,11 @@ trainer:
   source_gate_odise_prior: 1.2
   source_gate_lseg_prior: 1.0
   source_gate_conflict_safe_min: 0.25
-  source_gate_mv_iou_threshold: 0.15
+  source_gate_mv_iou_threshold: 0.03
   source_gate_mv_topk: 5
   source_gate_mv_min_pairs: 1
-  source_gate_mv_min_lifted_points: 2
+  source_gate_mv_min_lifted_points: 1
+  source_gate_mv_min_valid_masks: 2
   source_gate_mv_default_stability: 0.5
   source_gate_mask_quality_weight: 1.0
   source_gate_point_conf_weight: 1.0
@@ -212,7 +217,7 @@ trainer:
   best_monitor: "semantic_miou_dual_space_gate"
   
   # 【可选】恢复训练
-  resume: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.moe/checkpoint_epoch_5.pth # 续训使用最新 256D epoch checkpoint
+  # resume: checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query.moe/checkpoint_epoch_5.pth # 只复用几何分支；6D text-free gate 会重新初始化
 
 # ============================================================
 # 随机种子（确保可复现性）

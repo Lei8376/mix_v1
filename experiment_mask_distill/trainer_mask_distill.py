@@ -1,6 +1,7 @@
 
 
 import contextlib
+import collections
 import math
 import os
 import time
@@ -103,6 +104,8 @@ class MaskDistillTrainerConfig:
     source_gate_mv_topk: int = 5
     source_gate_mv_min_pairs: int = 1
     source_gate_mv_min_lifted_points: int = 2
+    source_gate_mv_min_valid_masks: int = 2
+    source_gate_skip_when_no_mv: bool = True
     source_gate_mv_default_stability: float = 0.5
     source_gate_mask_quality_weight: float = 1.0
     source_gate_point_conf_weight: float = 1.0
@@ -168,6 +171,26 @@ def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1e-6)
 
 
+def _compute_batch_multiview_probe_logs(batch: Dict[str, Any]) -> Dict[str, float]:
+    scene_names = batch.get("scene_name") or []
+    frame_stems = batch.get("frame_stem") or []
+    if not scene_names:
+        return {
+            "batch_unique_scenes": 0.0,
+            "batch_frames_per_scene_mean": 0.0,
+            "batch_same_scene_pair_count": 0.0,
+        }
+    scene_counter = collections.Counter(str(scene) for scene in scene_names)
+    same_scene_pair_count = sum(count * (count - 1) // 2 for count in scene_counter.values())
+    unique_pairs = {(str(scene), str(frame)) for scene, frame in zip(scene_names, frame_stems)}
+    return {
+        "batch_unique_scenes": float(len(scene_counter)),
+        "batch_frames_per_scene_mean": float(sum(scene_counter.values()) / max(len(scene_counter), 1)),
+        "batch_same_scene_pair_count": float(same_scene_pair_count),
+        "batch_unique_scene_frame_pairs": float(len(unique_pairs)),
+    }
+
+
 def compute_multiview_mask_stability(
     mask_point_indices,
     odise_feats: torch.Tensor,
@@ -179,7 +202,7 @@ def compute_multiview_mask_stability(
     min_pairs: int = 1,
     default_stability: float = 0.5,
     min_lifted_points: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Estimate per-mask same-teacher embedding stability across overlapping views."""
     device = odise_feats.device
     dtype = odise_feats.dtype
@@ -188,8 +211,9 @@ def compute_multiview_mask_stability(
     mv_odise = default.clone()
     mv_lseg = default.clone()
     mv_valid = torch.zeros(k, device=device, dtype=dtype)
+    mv_pair_count = torch.zeros(k, device=device, dtype=dtype)
     if k == 0 or scene_ids is None or view_ids is None:
-        return mv_odise, mv_lseg, mv_valid
+        return mv_odise, mv_lseg, mv_valid, mv_pair_count
 
     point_sets = []
     for idx in mask_point_indices:
@@ -228,7 +252,8 @@ def compute_multiview_mask_stability(
         mv_odise[i] = _weighted_mean(sim_o, weights).to(dtype)
         mv_lseg[i] = _weighted_mean(sim_l, weights).to(dtype)
         mv_valid[i] = 1.0
-    return mv_odise.clamp(0.0, 1.0), mv_lseg.clamp(0.0, 1.0), mv_valid
+        mv_pair_count[i] = float(len(matches))
+    return mv_odise.clamp(0.0, 1.0), mv_lseg.clamp(0.0, 1.0), mv_valid, mv_pair_count
 
 
 def compute_text_free_mv_mask_stability(
@@ -241,7 +266,7 @@ def compute_text_free_mv_mask_stability(
     topk: int = 5,
     default_stability: float = 0.5,
     min_lifted_points: int = 2,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return compute_multiview_mask_stability(
         mask_point_indices=mask_point_indices,
         odise_feats=odise_feats,
@@ -417,6 +442,8 @@ class MaskDistillTrainer:
         self._warned_pixel_text_dim_mismatch = False
         self._warned_source_gate_gt_ce = False
         self._warned_source_gate_query_fallback = False
+        self._source_gate_zero_mv_steps = 0
+        self._warned_source_gate_zero_mv = False
 
         if self.config.resume_checkpoint:
             self._load_checkpoint(self.config.resume_checkpoint)
@@ -543,10 +570,20 @@ class MaskDistillTrainer:
             "source_gate_target_mean": 0.0,
             "source_gate_target_std": 0.0,
             "source_gate_mv_valid_ratio": 0.0,
+            "source_gate_mv_valid_count": 0.0,
+            "source_gate_mv_pair_count": 0.0,
+            "source_gate_skipped_no_mv": 0.0,
             "source_gate_mv_odise_mean": 0.0,
             "source_gate_mv_lseg_mean": 0.0,
+            "source_gate_gate_mean_valid": 0.0,
+            "source_gate_target_mean_valid": 0.0,
+            "source_gate_mv_odise_mean_valid": 0.0,
+            "source_gate_mv_lseg_mean_valid": 0.0,
             "source_gate_conflict_mean": 0.0,
             "source_gate_mask_quality_mean": 0.0,
+            "batch_unique_scenes": 0.0,
+            "batch_frames_per_scene_mean": 0.0,
+            "batch_same_scene_pair_count": 0.0,
         }
 
     def _source_gate_regularizers(
@@ -619,7 +656,7 @@ class MaskDistillTrainer:
             return None
         global_odise_t = torch.cat(global_odise, dim=0)
         global_lseg_t = torch.cat(global_lseg, dim=0)
-        mv_odise_all, mv_lseg_all, mv_valid_all = compute_text_free_mv_mask_stability(
+        mv_odise_all, mv_lseg_all, mv_valid_all, mv_pair_count_all = compute_text_free_mv_mask_stability(
             global_mask_points,
             global_odise_t,
             global_lseg_t,
@@ -630,7 +667,7 @@ class MaskDistillTrainer:
             default_stability=self.config.source_gate_mv_default_stability,
             min_lifted_points=self.config.source_gate_mv_min_lifted_points,
         )
-        return lseg_all, item_records, mv_odise_all, mv_lseg_all, mv_valid_all
+        return lseg_all, item_records, mv_odise_all, mv_lseg_all, mv_valid_all, mv_pair_count_all
 
     def _compute_source_gate_text_free_mv_loss(
         self,
@@ -644,9 +681,11 @@ class MaskDistillTrainer:
             return None, empty_logs
 
         collected = self._collect_text_free_gate_items(results, batch)
+        batch_probe_logs = _compute_batch_multiview_probe_logs(batch)
         if collected is None:
+            empty_logs.update(batch_probe_logs)
             return None, empty_logs
-        lseg_all, item_records, mv_odise_all, mv_lseg_all, mv_valid_all = collected
+        lseg_all, item_records, mv_odise_all, mv_lseg_all, mv_valid_all, mv_pair_count_all = collected
 
         loss_gate_total = None
         num_gate_items = 0
@@ -656,6 +695,13 @@ class MaskDistillTrainer:
         mv_odise_values = []
         mv_lseg_values = []
         mask_quality_values = []
+        gate_valid_values = []
+        target_valid_values = []
+        mv_odise_valid_values = []
+        mv_lseg_valid_values = []
+        total_valid_count = 0
+        total_pair_count = 0
+        skipped_no_mv = 0
 
         for b, valid_k, start, count, mask_points in item_records:
             pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
@@ -671,6 +717,7 @@ class MaskDistillTrainer:
             mv_odise = mv_odise_all[mv_slice].to(pred_logits.device)
             mv_lseg = mv_lseg_all[mv_slice].to(pred_logits.device)
             mv_valid = mv_valid_all[mv_slice].to(pred_logits.device)
+            mv_pair_count = mv_pair_count_all[mv_slice].to(pred_logits.device)
 
             target_g, loss_weight, target_logs = build_text_free_mv_gate_target(
                 mv_odise,
@@ -693,7 +740,19 @@ class MaskDistillTrainer:
                 point_mask_conf,
             )
             gate = source_gate(evidence)
-            loss_gate = ((gate - target_g) ** 2 * loss_weight).sum() / loss_weight.sum().clamp_min(1.0)
+            valid = mv_valid.bool()
+            valid_count = int(valid.sum().item())
+            total_valid_count += valid_count
+            total_pair_count += int(mv_pair_count[valid].sum().item())
+            if valid_count == 0:
+                skipped_no_mv += 1
+                continue
+            if self.config.source_gate_skip_when_no_mv and valid_count < int(self.config.source_gate_mv_min_valid_masks):
+                skipped_no_mv += 1
+                continue
+            loss_gate = (
+                ((gate[valid] - target_g[valid].detach()) ** 2) * loss_weight[valid].detach()
+            ).sum() / loss_weight[valid].sum().clamp_min(1.0)
             if torch.isnan(loss_gate) or torch.isinf(loss_gate):
                 continue
             loss_gate_total = loss_gate if loss_gate_total is None else loss_gate_total + loss_gate
@@ -704,13 +763,25 @@ class MaskDistillTrainer:
             mv_odise_values.append(mv_odise.detach())
             mv_lseg_values.append(mv_lseg.detach())
             mask_quality_values.append(torch.tensor(target_logs["source_gate_mask_quality_mean"], device=gate.device))
+            gate_valid_values.append(gate[valid].detach())
+            target_valid_values.append(target_g[valid].detach())
+            mv_odise_valid_values.append(mv_odise[valid].detach())
+            mv_lseg_valid_values.append(mv_lseg[valid].detach())
 
         if num_gate_items == 0 or loss_gate_total is None:
+            empty_logs["source_gate_mv_valid_count"] = float(total_valid_count)
+            empty_logs["source_gate_mv_pair_count"] = float(total_pair_count)
+            empty_logs["source_gate_skipped_no_mv"] = float(skipped_no_mv)
+            empty_logs.update(batch_probe_logs)
             return None, empty_logs
 
         loss_gate_total = loss_gate_total / num_gate_items
         loss_extra = self.config.source_gate_open_loss_weight * loss_gate_total
         gate_cat = torch.cat([g.reshape(-1) for g in gate_values_for_log])
+        gate_valid_cat = torch.cat([g.reshape(-1) for g in gate_valid_values])
+        target_valid_cat = torch.cat([t.reshape(-1) for t in target_valid_values])
+        mv_odise_valid_cat = torch.cat([v.reshape(-1) for v in mv_odise_valid_values])
+        mv_lseg_valid_cat = torch.cat([v.reshape(-1) for v in mv_lseg_valid_values])
         logs = {
             "loss_source_gate": float(loss_gate_total.detach().cpu()),
             "loss_source_gate_open": float(loss_gate_total.detach().cpu()),
@@ -722,10 +793,18 @@ class MaskDistillTrainer:
             "source_gate_target_mean": float(torch.cat(target_values_for_log).mean().detach().cpu()),
             "source_gate_target_std": float(torch.cat(target_values_for_log).std(unbiased=False).detach().cpu()),
             "source_gate_mv_valid_ratio": float(torch.cat(mv_valid_values).float().mean().detach().cpu()),
+            "source_gate_mv_valid_count": float(total_valid_count),
+            "source_gate_mv_pair_count": float(total_pair_count),
+            "source_gate_skipped_no_mv": float(skipped_no_mv),
             "source_gate_mv_odise_mean": float(torch.cat(mv_odise_values).mean().detach().cpu()),
             "source_gate_mv_lseg_mean": float(torch.cat(mv_lseg_values).mean().detach().cpu()),
+            "source_gate_gate_mean_valid": float(gate_valid_cat.mean().detach().cpu()),
+            "source_gate_target_mean_valid": float(target_valid_cat.mean().detach().cpu()),
+            "source_gate_mv_odise_mean_valid": float(mv_odise_valid_cat.mean().detach().cpu()),
+            "source_gate_mv_lseg_mean_valid": float(mv_lseg_valid_cat.mean().detach().cpu()),
             "source_gate_mask_quality_mean": float(torch.stack(mask_quality_values).mean().detach().cpu()),
         }
+        logs.update(batch_probe_logs)
         loss_extra = self._source_gate_regularizers(loss_extra, gate_cat, logs)
         return loss_extra, logs
 
@@ -796,7 +875,7 @@ class MaskDistillTrainer:
 
         global_odise_t = torch.cat(global_odise, dim=0)
         global_lseg_t = torch.cat(global_lseg, dim=0)
-        mv_odise_all, mv_lseg_all, mv_valid_all = compute_multiview_mask_stability(
+        mv_odise_all, mv_lseg_all, mv_valid_all, _mv_pair_count_all = compute_multiview_mask_stability(
             global_mask_points,
             global_odise_t,
             global_lseg_t,
@@ -1074,6 +1153,24 @@ class MaskDistillTrainer:
                         if gate_extra is not None:
                             loss = loss + gate_extra
                         loss_dict.update(gate_logs)
+                        if gate_train_enabled and gate_target == "text_free_mv_stability":
+                            mv_valid_ratio = float(loss_dict.get("source_gate_mv_valid_ratio", 0.0))
+                            if mv_valid_ratio <= 0.0:
+                                self._source_gate_zero_mv_steps += 1
+                            else:
+                                self._source_gate_zero_mv_steps = 0
+                                self._warned_source_gate_zero_mv = False
+                            if (
+                                self.is_main
+                                and self._source_gate_zero_mv_steps >= 100
+                                and not self._warned_source_gate_zero_mv
+                            ):
+                                print(
+                                    "[SourceGate/TextFreeMV] mv_valid_ratio is 0 for many steps. "
+                                    "Check whether batch contains same-scene multi-view samples, "
+                                    "scene_name/frame_stem metadata, lifted mask point sets, and iou_threshold."
+                                )
+                                self._warned_source_gate_zero_mv = True
                         if torch.isnan(loss) or torch.isinf(loss):
                             raise ValueError(f"Invalid loss: {loss}")
                     except Exception as e:
@@ -1148,8 +1245,18 @@ class MaskDistillTrainer:
                     self.writer.add_scalar("SourceGate/target_mean",  loss_dict.get("source_gate_target_mean", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/target_std",   loss_dict.get("source_gate_target_std", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/mv_valid_ratio", loss_dict.get("source_gate_mv_valid_ratio", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/mv_valid_count", loss_dict.get("source_gate_mv_valid_count", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/mv_pair_count", loss_dict.get("source_gate_mv_pair_count", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/skipped_no_mv", loss_dict.get("source_gate_skipped_no_mv", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/mv_odise_mean", loss_dict.get("source_gate_mv_odise_mean", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/mv_lseg_mean", loss_dict.get("source_gate_mv_lseg_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/gate_mean_valid", loss_dict.get("source_gate_gate_mean_valid", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/target_mean_valid", loss_dict.get("source_gate_target_mean_valid", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/mv_odise_mean_valid", loss_dict.get("source_gate_mv_odise_mean_valid", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/mv_lseg_mean_valid", loss_dict.get("source_gate_mv_lseg_mean_valid", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/batch_unique_scenes", loss_dict.get("batch_unique_scenes", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/batch_frames_per_scene_mean", loss_dict.get("batch_frames_per_scene_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("SourceGate/batch_same_scene_pair_count", loss_dict.get("batch_same_scene_pair_count", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/conflict_mean", loss_dict.get("source_gate_conflict_mean", 0.0), self.global_step)
                     self.writer.add_scalar("SourceGate/mask_quality_mean", loss_dict.get("source_gate_mask_quality_mean", 0.0), self.global_step)
                     self.writer.add_scalar("LR", self.optimizer.param_groups[0]["lr"], self.global_step)
@@ -1197,8 +1304,16 @@ class MaskDistillTrainer:
                         f"source_gate_target={self.config.source_gate_training_target} "
                         f"loss_open={loss_dict.get('loss_source_gate_open', 0.0):.4f} "
                         f"mv_valid={loss_dict.get('source_gate_mv_valid_ratio', 0.0):.3f} "
+                        f"batch_unique_scenes={loss_dict.get('batch_unique_scenes', 0.0):.0f} "
+                        f"batch_frames_per_scene_mean={loss_dict.get('batch_frames_per_scene_mean', 0.0):.2f} "
+                        f"batch_same_scene_pair_count={loss_dict.get('batch_same_scene_pair_count', 0.0):.0f} "
+                        f"mv_valid_count={loss_dict.get('source_gate_mv_valid_count', 0.0):.0f} "
+                        f"mv_pair_count={loss_dict.get('source_gate_mv_pair_count', 0.0):.0f} "
+                        f"skipped_no_mv={loss_dict.get('source_gate_skipped_no_mv', 0.0):.0f} "
                         f"mv_odise={loss_dict.get('source_gate_mv_odise_mean', 0.0):.3f} "
                         f"mv_lseg={loss_dict.get('source_gate_mv_lseg_mean', 0.0):.3f} "
+                        f"gate_valid={loss_dict.get('source_gate_gate_mean_valid', 0.0):.4f} "
+                        f"target_valid={loss_dict.get('source_gate_target_mean_valid', 0.0):.4f} "
                         f"mask_quality={loss_dict.get('source_gate_mask_quality_mean', 0.0):.3f} "
                         f"gate_mean={loss_dict.get('source_gate_mean', 0.0):.4f} "
                         f"gate_std={loss_dict.get('source_gate_std', 0.0):.4f}"

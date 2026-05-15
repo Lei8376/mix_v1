@@ -16,7 +16,7 @@ python train_open_vocab_v2.py --config config/train_scannet_v2_full_multi_gpu.ya
 cd /home/sunl/work/mix_v1
 conda activate mix
 python evaluate/eval_mask_distill_checkpoint.py \
-  --checkpoint checkpoints/diff2scene_hybrid_lseg_odise256_fusion/checkpoint_epoch_15.pth \
+  --checkpoint checkpoints/diff2scene_hybrid_lseg_odise256_semantic_query/checkpoint_epoch_23.pth \
   --config config/train_scannet_v2_full_multi_gpu.yaml \
   --split val \
   --batch-size 12 \

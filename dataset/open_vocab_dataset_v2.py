@@ -1,5 +1,6 @@
 
 import os
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 import yaml
 from PIL import Image
+from torch.utils.data import Sampler
 
 
 @dataclass
@@ -27,6 +29,118 @@ class OpenVocabDatasetV2Config:
     input_color: bool = False
     max_samples: Optional[int] = None  # 若 >0 则只用前 max_samples 个样本；0/None 不按数量截断
     max_samples_ratio: Optional[float] = None  # 若 (0,1) 则只用前 ratio 比例，如 0.25=1/4；单卡测试可设 0.25
+
+
+class SceneGroupedBatchSampler(Sampler[List[int]]):
+    """Sample multi-view batches by grouping frames from the same scene."""
+
+    def __init__(
+        self,
+        dataset,
+        scenes_per_batch: int = 1,
+        views_per_scene: int = 4,
+        drop_last: bool = True,
+        shuffle: bool = True,
+        seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.dataset = dataset
+        self.scenes_per_batch = int(scenes_per_batch)
+        self.views_per_scene = int(views_per_scene)
+        self.drop_last = bool(drop_last)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.epoch = 0
+
+        if self.scenes_per_batch <= 0 or self.views_per_scene <= 0:
+            raise ValueError(
+                "scenes_per_batch and views_per_scene must be positive, "
+                f"got {self.scenes_per_batch} and {self.views_per_scene}"
+            )
+        if not hasattr(dataset, "samples"):
+            raise AttributeError("SceneGroupedBatchSampler requires dataset.samples")
+
+        scene_to_indices: Dict[str, List[int]] = {}
+        for idx, sample in enumerate(dataset.samples):
+            if not isinstance(sample, (list, tuple)) or len(sample) < 2:
+                raise ValueError(
+                    "dataset.samples must contain (scene_name, frame_stem) tuples"
+                )
+            scene_name = str(sample[0])
+            scene_to_indices.setdefault(scene_name, []).append(idx)
+
+        self.scene_to_indices = {
+            scene_name: indices
+            for scene_name, indices in scene_to_indices.items()
+            if len(indices) >= self.views_per_scene
+        }
+        if not self.scene_to_indices:
+            raise RuntimeError(
+                "No scenes have enough frames for SceneGroupedBatchSampler: "
+                f"views_per_scene={self.views_per_scene}"
+            )
+
+        self.scene_names = sorted(self.scene_to_indices.keys())
+        self.batch_size = self.scenes_per_batch * self.views_per_scene
+        dataset_size = len(self.dataset.samples)
+        if self.drop_last:
+            self.num_global_batches = dataset_size // self.batch_size
+        else:
+            self.num_global_batches = math.ceil(dataset_size / self.batch_size)
+
+    def __len__(self) -> int:
+        return (self.num_global_batches + self.world_size - 1 - self.rank) // self.world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _draw_scene_batch(self, generator: torch.Generator, cursor: int, perm: torch.Tensor):
+        selected = []
+        num_scenes = len(self.scene_names)
+        while len(selected) < self.scenes_per_batch:
+            remaining = self.scenes_per_batch - len(selected)
+            available = num_scenes - cursor
+            take = min(remaining, available)
+            if take > 0:
+                selected.extend(int(v) for v in perm[cursor: cursor + take].tolist())
+                cursor += take
+            if len(selected) < self.scenes_per_batch:
+                perm = torch.randperm(num_scenes, generator=generator)
+                cursor = 0
+        return selected, cursor, perm
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        num_scenes = len(self.scene_names)
+        scene_perm = torch.randperm(num_scenes, generator=generator) if self.shuffle else torch.arange(num_scenes)
+        scene_cursor = 0
+        global_batches: List[List[int]] = []
+
+        for _ in range(self.num_global_batches):
+            scene_ids, scene_cursor, scene_perm = self._draw_scene_batch(
+                generator, scene_cursor, scene_perm
+            )
+            batch_indices: List[int] = []
+            for scene_idx in scene_ids:
+                scene_name = self.scene_names[scene_idx]
+                indices = self.scene_to_indices[scene_name]
+                if self.shuffle:
+                    view_perm = torch.randperm(len(indices), generator=generator)
+                    chosen = [indices[int(i)] for i in view_perm[: self.views_per_scene].tolist()]
+                else:
+                    chosen = indices[: self.views_per_scene]
+                batch_indices.extend(chosen)
+            if self.shuffle:
+                order = torch.randperm(len(batch_indices), generator=generator).tolist()
+                batch_indices = [batch_indices[i] for i in order]
+            global_batches.append(batch_indices)
+
+        for batch_idx in range(self.rank, len(global_batches), self.world_size):
+            yield global_batches[batch_idx]
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
