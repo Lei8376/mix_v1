@@ -1,12 +1,12 @@
 gpu_ids: [0]
 
 dataloader:
-  batch_size: 4
+  batch_size: 32
   num_workers: 16
   val_batch_size: 12
   val_num_workers: 8
   multiview_batch: true
-  scenes_per_batch: 1
+  scenes_per_batch: 8
   views_per_scene: 4
   drop_last: true
 
