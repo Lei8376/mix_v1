@@ -109,6 +109,7 @@ def _safe_stats(values: List[float]) -> Dict[str, float]:
         "min": float(arr.min()),
         "max": float(arr.max()),
         "abs_mean": float(np.abs(arr).mean()),
+        "clear_ratio_001": float((np.abs(arr) > 0.01).mean()),
         "clear_ratio_003": float((np.abs(arr) > 0.03).mean()),
         "clear_ratio_005": float((np.abs(arr) > 0.05).mean()),
     }
@@ -413,6 +414,9 @@ def _compute_scene_region_signals(
         item["mv_den_lseg"] = item["odise_q"].new_zeros(k)
         item["mv_num_odise"] = item["odise_q"].new_zeros(k)
         item["mv_den_odise"] = item["odise_q"].new_zeros(k)
+        item["mv_pair_count"] = item["odise_q"].new_zeros(k)
+        item["mv_iou_sum"] = item["odise_q"].new_zeros(k)
+        item["mv_iou_max"] = item["odise_q"].new_zeros(k)
 
     for i in range(num_items):
         item_i = scene_items[i]
@@ -455,6 +459,12 @@ def _compute_scene_region_signals(
                 item_i["mv_den_lseg"][local_i] += weights.sum()
                 item_i["mv_num_odise"][local_i] += (sim_odise[local_i, nbrs] * weights).sum()
                 item_i["mv_den_odise"][local_i] += weights.sum()
+                item_i["mv_pair_count"][local_i] += float(keep.sum().item())
+                item_i["mv_iou_sum"][local_i] += weights.sum()
+                item_i["mv_iou_max"][local_i] = torch.maximum(
+                    item_i["mv_iou_max"][local_i],
+                    weights.max(),
+                )
                 valid_pairs += int(keep.sum().item())
 
     for item in scene_items:
@@ -462,20 +472,228 @@ def _compute_scene_region_signals(
         item["c_valid"] = den > 0
         item["C_lseg"] = torch.where(item["c_valid"], item["mv_num_lseg"] / den.clamp_min(1e-6), torch.zeros_like(den))
         item["C_odise"] = torch.where(item["c_valid"], item["mv_num_odise"] / den.clamp_min(1e-6), torch.zeros_like(den))
+        item["overlap_iou_mean"] = torch.where(
+            item["mv_pair_count"] > 0,
+            item["mv_iou_sum"] / item["mv_pair_count"].clamp_min(1.0),
+            torch.zeros_like(den),
+        )
+        item["overlap_iou_max"] = item["mv_iou_max"]
+        item["view_pair_count"] = item["mv_pair_count"]
 
     total_regions = sum(item["num_masks"] for item in scene_items)
     return valid_pairs, total_regions
+
+
+def _normalize_robust(arr: np.ndarray) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    lo = float(np.percentile(arr, 10.0))
+    hi = float(np.percentile(arr, 90.0))
+    if hi - lo < 1e-6:
+        return np.full_like(arr, 0.5, dtype=np.float64)
+    return np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _g_stats_from_array(arr: np.ndarray) -> Dict[str, float]:
+    if arr.size == 0:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "mid_ratio": 0.0,
+            "lseg_ratio_06": 0.0,
+            "odise_ratio_04": 0.0,
+            "entropy": 0.0,
+        }
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mid_ratio": float(((arr >= 0.45) & (arr <= 0.55)).mean()),
+        "lseg_ratio_06": float((arr > 0.6).mean()),
+        "odise_ratio_04": float((arr < 0.4).mean()),
+        "entropy": _binary_entropy(arr),
+    }
+
+
+def _corr_summary(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+    if x.size == 0 or y.size == 0:
+        return {"pearson": 0.0, "spearman": 0.0}
+    return {
+        "pearson": _pearson(x, y),
+        "spearman": _spearman(x, y),
+    }
+
+
+def _size_bucket(mask_area_ratio: float) -> str:
+    if mask_area_ratio < 0.01:
+        return "small"
+    if mask_area_ratio < 0.10:
+        return "medium"
+    return "large"
+
+
+def _rows_to_arrays(rows: List[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+    if not rows:
+        return {}
+    scalar_keys = [
+        "C_lseg",
+        "C_odise",
+        "C_diff",
+        "sharp_lseg",
+        "sharp_odise",
+        "sharp_diff",
+        "purity_lseg",
+        "response_margin",
+        "response_conf",
+        "inside_mean",
+        "outside_mean",
+        "lifted_point_count",
+        "lifted_point_ratio",
+        "mask_area_ratio",
+        "view_pair_count",
+        "overlap_iou_mean",
+        "overlap_iou_max",
+        "pred_conf_mean",
+        "pred_conf_std",
+    ]
+    arrays: Dict[str, np.ndarray] = {
+        key: np.asarray([row[key] for row in rows], dtype=np.float64)
+        for key in scalar_keys
+    }
+    arrays["fused_query"] = np.stack([row["fused_query"] for row in rows], axis=0).astype(np.float32)
+    arrays["size_bucket"] = np.asarray([row["size_bucket"] for row in rows], dtype=object)
+    return arrays
+
+
+def _build_target_specs(
+    arrays: Dict[str, np.ndarray],
+    scale: float,
+    target_min: float,
+    target_max: float,
+    sharp_weight: float,
+) -> Dict[str, Dict[str, Any]]:
+    if not arrays:
+        return {}
+    diff_mv = arrays["C_diff"]
+    diff_sharp = arrays["sharp_diff"]
+    diff_mv_sharp = diff_mv + sharp_weight * diff_sharp
+    quality_weight = _normalize_robust(arrays["response_margin"]) * _normalize_robust(arrays["overlap_iou_mean"])
+    raw_defs = {
+        "mv": diff_mv,
+        "sharp": diff_sharp,
+        "mv+sharp": diff_mv_sharp,
+        "mv+sharp+quality_input": diff_mv_sharp,
+        "quality_weighted": quality_weight * diff_mv_sharp,
+    }
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, r_diff in raw_defs.items():
+        g_target = 1.0 / (1.0 + np.exp(-scale * r_diff))
+        g_target = np.clip(g_target, target_min, target_max)
+        out[name] = {
+            "R_diff": r_diff,
+            "g_target": g_target,
+            "R_stats": _safe_stats(r_diff.tolist()),
+            "g_stats": _g_stats_from_array(g_target),
+        }
+    return out
+
+
+def _build_feature_matrix(arrays: Dict[str, np.ndarray], feature_set: str) -> np.ndarray:
+    fused = arrays["fused_query"]
+    if feature_set == "fused":
+        return fused
+    if feature_set == "fused+mv":
+        scalars = np.stack(
+            [
+                arrays["C_lseg"],
+                arrays["C_odise"],
+                arrays["C_diff"],
+            ],
+            axis=1,
+        ).astype(np.float32)
+        return np.concatenate([fused, scalars], axis=1)
+    if feature_set == "fused+all":
+        purity = np.nan_to_num(arrays["purity_lseg"], nan=0.0)
+        scalars = np.stack(
+            [
+                arrays["C_lseg"],
+                arrays["C_odise"],
+                arrays["C_diff"],
+                arrays["sharp_lseg"],
+                arrays["sharp_odise"],
+                arrays["sharp_diff"],
+                purity,
+                arrays["response_margin"],
+                arrays["response_conf"],
+                arrays["mask_area_ratio"],
+                np.log1p(np.clip(arrays["lifted_point_count"], a_min=0.0, a_max=None)),
+                arrays["lifted_point_ratio"],
+                arrays["view_pair_count"],
+                arrays["overlap_iou_mean"],
+                arrays["overlap_iou_max"],
+                arrays["pred_conf_mean"],
+                arrays["pred_conf_std"],
+            ],
+            axis=1,
+        ).astype(np.float32)
+        return np.concatenate([fused, scalars], axis=1)
+    raise ValueError(f"Unknown feature_set: {feature_set}")
+
+
+def _signal_stats_by_size(arrays: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+    if not arrays:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for size_name in ("small", "medium", "large"):
+        keep = arrays["size_bucket"] == size_name
+        if not bool(np.any(keep)):
+            rows.append(
+                {
+                    "size_group": size_name,
+                    "count": 0,
+                    "C_diff_std": 0.0,
+                    "C_diff_lseg_win_ratio": 0.0,
+                    "C_diff_odise_win_ratio": 0.0,
+                    "sharp_diff_std": 0.0,
+                    "sharp_lseg_win_ratio": 0.0,
+                    "sharp_odise_win_ratio": 0.0,
+                }
+            )
+            continue
+        c_diff = arrays["C_diff"][keep]
+        sharp_diff = arrays["sharp_diff"][keep]
+        rows.append(
+            {
+                "size_group": size_name,
+                "count": int(keep.sum()),
+                "C_diff_std": float(c_diff.std()),
+                "C_diff_lseg_win_ratio": float((c_diff > 0.03).mean()),
+                "C_diff_odise_win_ratio": float((c_diff < -0.03).mean()),
+                "sharp_diff_std": float(sharp_diff.std()),
+                "sharp_lseg_win_ratio": float((sharp_diff > 0.03).mean()),
+                "sharp_odise_win_ratio": float((sharp_diff < -0.03).mean()),
+            }
+        )
+    return rows
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="No-text region-level gate probe")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--max-batches", type=int, default=100)
+    parser.add_argument("--max-batches", type=int, default=300)
+    parser.add_argument("--max-regions", type=int, default=20000)
     parser.add_argument("--output", type=str, required=True)
-    parser.add_argument("--region-probe-mv-iou-thr", type=float, default=0.05)
-    parser.add_argument("--region-probe-max-pairs-per-mask", type=int, default=5)
+    parser.add_argument("--save-per-region", action="store_true")
+    parser.add_argument("--ablate-signals", action="store_true")
+    parser.add_argument("--probe-learnability", action="store_true")
+    parser.add_argument("--region-probe-mv-iou-thr", type=float, nargs="+", default=[0.03, 0.05, 0.10])
+    parser.add_argument("--region-probe-max-pairs-per-mask", type=int, default=10)
     parser.add_argument("--region-probe-min-lifted-points", type=int, default=5)
+    parser.add_argument("--region-probe-max-pairs", type=int, default=50000)
     parser.add_argument("--region-probe-mv-weight", type=float, default=1.0)
     parser.add_argument("--region-probe-sharp-weight", type=float, default=0.5)
     parser.add_argument("--region-probe-purity-weight", type=float, default=0.5)
@@ -510,40 +728,22 @@ def main() -> None:
     )
     model.eval()
 
-    point_level_present = False
+    iou_thresholds = sorted({round(float(v), 4) for v in args.region_probe_mv_iou_thr})
+    base_thr = 0.05 if 0.05 in iou_thresholds else iou_thresholds[0]
+    threshold_rows: Dict[float, List[Dict[str, Any]]] = {thr: [] for thr in iou_thresholds}
+    threshold_pair_count: Dict[float, int] = {thr: 0 for thr in iou_thresholds}
+    threshold_total_regions: Dict[float, int] = {thr: 0 for thr in iou_thresholds}
     purity_lseg_available = False
-    valid_region_count = 0
-    total_region_count = 0
-    valid_pair_count = 0
 
-    c_lseg_values: List[float] = []
-    c_odise_values: List[float] = []
-    c_diff_values: List[float] = []
-    sharp_lseg_values: List[float] = []
-    sharp_odise_values: List[float] = []
-    sharp_diff_values: List[float] = []
-    purity_lseg_values: List[float] = []
-    response_margin_values: List[float] = []
-    inside_mean_values: List[float] = []
-    outside_mean_values: List[float] = []
-    lifted_point_count_values: List[float] = []
-    mask_area_ratio_values: List[float] = []
-    r_lseg_values: List[float] = []
-    r_odise_values: List[float] = []
-    r_diff_values: List[float] = []
-    g_target_values: List[float] = []
-    region_rows: List[Dict[str, Any]] = []
-    feature_rows_a: List[np.ndarray] = []
-    feature_rows_b: List[np.ndarray] = []
-    target_rows: List[float] = []
-
-    time_per_batch = []
-    time_lift_masks = []
-    time_region_pairing = []
-    time_signal_compute = []
+    time_per_batch: List[float] = []
+    time_lift_masks: List[float] = []
+    time_region_pairing: List[float] = []
+    time_signal_compute: List[float] = []
 
     for batch_idx, batch in enumerate(train_loader):
         if batch_idx >= args.max_batches:
+            break
+        if all(len(rows) >= args.max_regions for rows in threshold_rows.values()):
             break
         t0 = time.perf_counter()
         batch = trainer._move_batch_to_device(batch)
@@ -587,10 +787,10 @@ def main() -> None:
             odise_q = batch["mask_embeddings"][b][valid_k].float()
             lseg_q = lseg_all[b][valid_k].float()
             fused_q = results["fused_embeddings"][b][valid_k].float()
-            coords_xyz = batch["ori_coords_3d"][pt_mask][:, 1:4].long()
-            coords_xyz = coords_xyz[lifted_valid_b]
+            coords_xyz = batch["ori_coords_3d"][pt_mask][:, 1:4].long()[lifted_valid_b]
             coord_hash = _row_hash(coords_xyz)
             lifted_bool = (lifted_b[lifted_valid_b] > 0.5)
+            visible_point_count = max(int(lifted_bool.shape[0]), 1)
             lifted_point_count = lifted_bool.float().sum(dim=0)
             keep = lifted_point_count >= float(args.region_probe_min_lifted_points)
             if not bool(keep.any()):
@@ -605,6 +805,17 @@ def main() -> None:
             mask_area = masks_b[valid_k][keep].sum(dim=(1, 2))
             image_area = float(masks_b.shape[-1] * masks_b.shape[-2])
             mask_area_ratio = (mask_area / max(image_area, 1.0)).clamp(0.0, 1.0)
+            pred = torch.sigmoid(pred_logits)
+            target = lifted_bool.float()
+            inside_count = target.sum(dim=0)
+            outside_count = (1.0 - target).sum(dim=0)
+            inside_mean = (pred * target).sum(dim=0) / inside_count.clamp_min(1.0)
+            outside_mean = (pred * (1.0 - target)).sum(dim=0) / outside_count.clamp_min(1.0)
+            response_margin = inside_mean - outside_mean
+            response_conf = (pred - 0.5).abs().mean(dim=0) * 2.0
+            pred_conf_mean = pred.mean(dim=0)
+            pred_conf_std = pred.std(dim=0, unbiased=False)
+            lifted_point_ratio = lifted_point_count / float(visible_point_count)
 
             purity_lseg = None
             if pixel_embeddings_full is not None:
@@ -618,284 +829,269 @@ def main() -> None:
                     purity_lseg = purity_lseg[keep]
                     purity_lseg_available = True
 
+            k = int(keep.sum().item())
+            if k < 2:
+                sharp_lseg = odise_q.new_zeros(k)
+                sharp_odise = odise_q.new_zeros(k)
+            else:
+                lseg_sim = F.normalize(lseg_q, dim=-1) @ F.normalize(lseg_q, dim=-1).t()
+                odise_sim = F.normalize(odise_q, dim=-1) @ F.normalize(odise_q, dim=-1).t()
+                lseg_sim.fill_diagonal_(-1.0)
+                odise_sim.fill_diagonal_(-1.0)
+                top_k = min(2, k - 1)
+                top_l = torch.topk(lseg_sim, k=top_k, dim=1).values
+                top_o = torch.topk(odise_sim, k=top_k, dim=1).values
+                if top_k == 1:
+                    sharp_lseg = top_l[:, 0]
+                    sharp_odise = top_o[:, 0]
+                else:
+                    sharp_lseg = top_l[:, 0] - top_l[:, 1]
+                    sharp_odise = top_o[:, 0] - top_o[:, 1]
+
             scene_name = str(scene_names[b]) if isinstance(scene_names, (list, tuple)) and b < len(scene_names) else str(b)
             view_id = str(frame_stems[b]) if isinstance(frame_stems, (list, tuple)) and b < len(frame_stems) else str(b)
             scene_groups[scene_name].append(
                 {
-                    "batch_index": b,
                     "scene_name": scene_name,
                     "view_id": view_id,
                     "num_masks": int(keep.sum().item()),
-                    "pred_logits": pred_logits,
                     "odise_q": odise_q,
                     "lseg_q": lseg_q,
                     "fused_q": fused_q,
                     "lifted_bool": lifted_bool,
                     "lifted_point_count": lifted_point_count,
+                    "lifted_point_ratio": lifted_point_ratio,
                     "mask_area_ratio": mask_area_ratio,
                     "coord_hash": coord_hash,
                     "purity_lseg": purity_lseg,
+                    "inside_mean": inside_mean,
+                    "outside_mean": outside_mean,
+                    "response_margin": response_margin,
+                    "response_conf": response_conf,
+                    "pred_conf_mean": pred_conf_mean,
+                    "pred_conf_std": pred_conf_std,
+                    "sharp_lseg": sharp_lseg,
+                    "sharp_odise": sharp_odise,
                 }
             )
 
         t2 = time.perf_counter()
-        batch_pairs = 0
-        batch_regions = 0
-        for scene_name, items in scene_groups.items():
-            vp, tr = _compute_scene_region_signals(
-                items,
-                iou_thr=float(args.region_probe_mv_iou_thr),
-                max_pairs=int(args.region_probe_max_pairs_per_mask),
-            )
-            batch_pairs += vp
-            batch_regions += tr
-            for item in items:
-                k = item["num_masks"]
-                if k < 2:
-                    item["sharp_lseg"] = item["odise_q"].new_zeros(k)
-                    item["sharp_odise"] = item["odise_q"].new_zeros(k)
-                    continue
-                lseg_sim = F.normalize(item["lseg_q"], dim=-1) @ F.normalize(item["lseg_q"], dim=-1).t()
-                odise_sim = F.normalize(item["odise_q"], dim=-1) @ F.normalize(item["odise_q"], dim=-1).t()
-                lseg_sim.fill_diagonal_(-1.0)
-                odise_sim.fill_diagonal_(-1.0)
-                k2 = min(2, k - 1)
-                top_l = torch.topk(lseg_sim, k=k2, dim=1).values
-                top_o = torch.topk(odise_sim, k=k2, dim=1).values
-                if k2 == 1:
-                    item["sharp_lseg"] = top_l[:, 0]
-                    item["sharp_odise"] = top_o[:, 0]
-                else:
-                    item["sharp_lseg"] = top_l[:, 0] - top_l[:, 1]
-                    item["sharp_odise"] = top_o[:, 0] - top_o[:, 1]
-        valid_pair_count += batch_pairs
-        total_region_count += batch_regions
+        per_thr_items: Dict[float, Dict[str, List[Dict[str, Any]]]] = {}
+        for thr in iou_thresholds:
+            cloned_groups: Dict[str, List[Dict[str, Any]]] = {}
+            for scene_name, items in scene_groups.items():
+                cloned_groups[scene_name] = [dict(item) for item in items]
+            per_thr_items[thr] = cloned_groups
+            for scene_name, items in cloned_groups.items():
+                valid_pairs, total_regions = _compute_scene_region_signals(
+                    items,
+                    iou_thr=float(thr),
+                    max_pairs=int(args.region_probe_max_pairs_per_mask),
+                )
+                threshold_pair_count[thr] += valid_pairs
+                threshold_total_regions[thr] += total_regions
         time_region_pairing.append(time.perf_counter() - t2)
 
         t3 = time.perf_counter()
-        for scene_name, items in scene_groups.items():
-            for item in items:
-                pred = torch.sigmoid(item["pred_logits"])
-                target = item["lifted_bool"].float()
-                inside_count = target.sum(dim=0)
-                outside_count = (1.0 - target).sum(dim=0)
-                inside_mean = (pred * target).sum(dim=0) / inside_count.clamp_min(1.0)
-                outside_mean = (pred * (1.0 - target)).sum(dim=0) / outside_count.clamp_min(1.0)
-                response_margin = inside_mean - outside_mean
-                pred_conf_mean = pred.mean(dim=0)
-                pred_conf_std = pred.std(dim=0, unbiased=False)
-
-                purity_lseg = item["purity_lseg"]
-                if purity_lseg is None:
-                    r_lseg = (
-                        float(args.region_probe_mv_weight) * item["C_lseg"]
-                        + float(args.region_probe_sharp_weight) * item["sharp_lseg"]
-                    )
-                else:
-                    r_lseg = (
-                        float(args.region_probe_mv_weight) * item["C_lseg"]
-                        + float(args.region_probe_sharp_weight) * item["sharp_lseg"]
-                        + float(args.region_probe_purity_weight) * purity_lseg
-                    )
-                r_odise = (
-                    float(args.region_probe_mv_weight) * item["C_odise"]
-                    + float(args.region_probe_sharp_weight) * item["sharp_odise"]
-                )
-                r_diff = r_lseg - r_odise
-                g_target = torch.sigmoid(float(args.region_probe_target_scale) * r_diff)
-                g_target = g_target.clamp(
-                    float(args.region_probe_target_min),
-                    float(args.region_probe_target_max),
-                )
-                valid_mask = item["c_valid"]
-                valid_region_count += int(valid_mask.sum().item())
-
-                for idx in range(item["num_masks"]):
-                    if not bool(valid_mask[idx]):
-                        continue
-                    c_lseg = float(item["C_lseg"][idx].detach().cpu())
-                    c_odise = float(item["C_odise"][idx].detach().cpu())
-                    c_diff = c_lseg - c_odise
-                    sharp_lseg = float(item["sharp_lseg"][idx].detach().cpu())
-                    sharp_odise = float(item["sharp_odise"][idx].detach().cpu())
-                    sharp_diff = sharp_lseg - sharp_odise
-                    purity_val = float(purity_lseg[idx].detach().cpu()) if purity_lseg is not None else float("nan")
-                    response_margin_val = float(response_margin[idx].detach().cpu())
-                    inside_mean_val = float(inside_mean[idx].detach().cpu())
-                    outside_mean_val = float(outside_mean[idx].detach().cpu())
-                    lifted_count_val = float(item["lifted_point_count"][idx].detach().cpu())
-                    mask_area_ratio_val = float(item["mask_area_ratio"][idx].detach().cpu())
-                    r_lseg_val = float(r_lseg[idx].detach().cpu())
-                    r_odise_val = float(r_odise[idx].detach().cpu())
-                    r_diff_val = float(r_diff[idx].detach().cpu())
-                    g_target_val = float(g_target[idx].detach().cpu())
-                    pred_conf_mean_val = float(pred_conf_mean[idx].detach().cpu())
-                    pred_conf_std_val = float(pred_conf_std[idx].detach().cpu())
-
-                    c_lseg_values.append(c_lseg)
-                    c_odise_values.append(c_odise)
-                    c_diff_values.append(c_diff)
-                    sharp_lseg_values.append(sharp_lseg)
-                    sharp_odise_values.append(sharp_odise)
-                    sharp_diff_values.append(sharp_diff)
-                    if purity_lseg is not None:
-                        purity_lseg_values.append(purity_val)
-                    response_margin_values.append(response_margin_val)
-                    inside_mean_values.append(inside_mean_val)
-                    outside_mean_values.append(outside_mean_val)
-                    lifted_point_count_values.append(lifted_count_val)
-                    mask_area_ratio_values.append(mask_area_ratio_val)
-                    r_lseg_values.append(r_lseg_val)
-                    r_odise_values.append(r_odise_val)
-                    r_diff_values.append(r_diff_val)
-                    g_target_values.append(g_target_val)
-
-                    region_rows.append(
-                        {
+        for thr, scene_groups_thr in per_thr_items.items():
+            for scene_name, items in scene_groups_thr.items():
+                for item in items:
+                    valid_mask = item["c_valid"]
+                    for idx in range(item["num_masks"]):
+                        if len(threshold_rows[thr]) >= args.max_regions:
+                            break
+                        if not bool(valid_mask[idx]):
+                            continue
+                        purity_val = float(item["purity_lseg"][idx].detach().cpu()) if item["purity_lseg"] is not None else float("nan")
+                        row = {
+                            "threshold": float(thr),
                             "scene_name": scene_name,
                             "view_id": item["view_id"],
                             "region_index": idx,
-                            "C_lseg": c_lseg,
-                            "C_odise": c_odise,
-                            "C_diff": c_diff,
-                            "sharp_lseg": sharp_lseg,
-                            "sharp_odise": sharp_odise,
-                            "sharp_diff": sharp_diff,
+                            "size_bucket": _size_bucket(float(item["mask_area_ratio"][idx].detach().cpu())),
+                            "C_lseg": float(item["C_lseg"][idx].detach().cpu()),
+                            "C_odise": float(item["C_odise"][idx].detach().cpu()),
+                            "C_diff": float((item["C_lseg"][idx] - item["C_odise"][idx]).detach().cpu()),
+                            "sharp_lseg": float(item["sharp_lseg"][idx].detach().cpu()),
+                            "sharp_odise": float(item["sharp_odise"][idx].detach().cpu()),
+                            "sharp_diff": float((item["sharp_lseg"][idx] - item["sharp_odise"][idx]).detach().cpu()),
                             "purity_lseg": purity_val,
-                            "response_margin": response_margin_val,
-                            "inside_mean": inside_mean_val,
-                            "outside_mean": outside_mean_val,
-                            "lifted_point_count": lifted_count_val,
-                            "mask_area_ratio": mask_area_ratio_val,
-                            "R_lseg": r_lseg_val,
-                            "R_odise": r_odise_val,
-                            "R_diff": r_diff_val,
-                            "g_target": g_target_val,
-                            "pred_conf_mean": pred_conf_mean_val,
-                            "pred_conf_std": pred_conf_std_val,
+                            "response_margin": float(item["response_margin"][idx].detach().cpu()),
+                            "response_conf": float(item["response_conf"][idx].detach().cpu()),
+                            "inside_mean": float(item["inside_mean"][idx].detach().cpu()),
+                            "outside_mean": float(item["outside_mean"][idx].detach().cpu()),
+                            "lifted_point_count": float(item["lifted_point_count"][idx].detach().cpu()),
+                            "lifted_point_ratio": float(item["lifted_point_ratio"][idx].detach().cpu()),
+                            "mask_area_ratio": float(item["mask_area_ratio"][idx].detach().cpu()),
+                            "view_pair_count": float(item["view_pair_count"][idx].detach().cpu()),
+                            "overlap_iou_mean": float(item["overlap_iou_mean"][idx].detach().cpu()),
+                            "overlap_iou_max": float(item["overlap_iou_max"][idx].detach().cpu()),
+                            "pred_conf_mean": float(item["pred_conf_mean"][idx].detach().cpu()),
+                            "pred_conf_std": float(item["pred_conf_std"][idx].detach().cpu()),
+                            "fused_query": item["fused_q"][idx].detach().cpu().numpy().astype(np.float32),
                         }
-                    )
-                    feature_a = item["fused_q"][idx].detach().cpu().numpy().astype(np.float32)
-                    signal_scalars = np.asarray(
-                        [
-                            c_lseg,
-                            c_odise,
-                            sharp_lseg,
-                            sharp_odise,
-                            0.0 if math.isnan(purity_val) else purity_val,
-                            response_margin_val,
-                            mask_area_ratio_val,
-                            math.log1p(max(lifted_count_val, 0.0)),
-                            pred_conf_mean_val,
-                            pred_conf_std_val,
-                        ],
-                        dtype=np.float32,
-                    )
-                    feature_rows_a.append(feature_a)
-                    feature_rows_b.append(np.concatenate([feature_a, signal_scalars], axis=0))
-                    target_rows.append(g_target_val)
+                        threshold_rows[thr].append(row)
         time_signal_compute.append(time.perf_counter() - t3)
         time_per_batch.append(time.perf_counter() - t0)
 
-    c_stats = _safe_stats(c_diff_values)
-    sharp_stats = _safe_stats(sharp_diff_values)
-    r_stats = _safe_stats(r_diff_values)
-    g_arr = np.asarray(g_target_values, dtype=np.float64)
-    learnability = {}
-    if target_rows:
-        y = np.asarray(target_rows, dtype=np.float32)
-        learnability["fused_query"] = _train_probe_mlp(np.stack(feature_rows_a, axis=0), y, seed)
-        learnability["fused_query+signals"] = _train_probe_mlp(np.stack(feature_rows_b, axis=0), y, seed)
+    threshold_summaries: Dict[str, Any] = {}
+    signal_rows_all: List[Dict[str, Any]] = []
+    learn_rows_all: List[Dict[str, Any]] = []
+    size_rows_all: List[Dict[str, Any]] = []
 
-    if g_arr.size == 0:
-        g_stats = {
-            "mean": 0.0,
-            "std": 0.0,
-            "min": 0.0,
-            "max": 0.0,
-            "mid_ratio": 0.0,
-            "lseg_ratio_06": 0.0,
-            "odise_ratio_04": 0.0,
-            "entropy": 0.0,
+    for thr in iou_thresholds:
+        rows = threshold_rows[thr]
+        arrays = _rows_to_arrays(rows)
+        c_stats = _safe_stats([row["C_diff"] for row in rows])
+        sharp_stats = _safe_stats([row["sharp_diff"] for row in rows])
+        purity_vals = [row["purity_lseg"] for row in rows if not math.isnan(row["purity_lseg"])]
+        purity_stats = _safe_stats(purity_vals)
+        response_margin = arrays.get("response_margin", np.asarray([], dtype=np.float64))
+        response_conf = arrays.get("response_conf", np.asarray([], dtype=np.float64))
+        c_diff = arrays.get("C_diff", np.asarray([], dtype=np.float64))
+        mv_sharp_proxy = c_diff + float(args.region_probe_sharp_weight) * arrays.get("sharp_diff", np.asarray([], dtype=np.float64))
+        g_proxy = np.clip(
+            1.0 / (1.0 + np.exp(-float(args.region_probe_target_scale) * mv_sharp_proxy)),
+            float(args.region_probe_target_min),
+            float(args.region_probe_target_max),
+        ) if rows else np.asarray([], dtype=np.float64)
+        target_specs = _build_target_specs(
+            arrays,
+            scale=float(args.region_probe_target_scale),
+            target_min=float(args.region_probe_target_min),
+            target_max=float(args.region_probe_target_max),
+            sharp_weight=float(args.region_probe_sharp_weight),
+        )
+
+        learnability_rows_thr: List[Dict[str, Any]] = []
+        if args.probe_learnability and rows:
+            feature_sets = ["fused", "fused+mv", "fused+all"]
+            feature_cache = {name: _build_feature_matrix(arrays, name) for name in feature_sets}
+            target_names = list(target_specs.keys()) if args.ablate_signals else ["mv+sharp"]
+            for target_name in target_names:
+                targets = target_specs[target_name]["g_target"].astype(np.float32)
+                for feature_name in feature_sets:
+                    metrics = _train_probe_mlp(feature_cache[feature_name], targets, seed)
+                    row = {"threshold": thr, "target_name": target_name, "feature_set": feature_name}
+                    row.update(metrics)
+                    learnability_rows_thr.append(row)
+                    learn_rows_all.append(dict(row))
+
+        target_names = list(target_specs.keys()) if args.ablate_signals else ["mv+sharp"]
+        signal_rows_thr = []
+        for target_name in target_names:
+            spec = target_specs[target_name]
+            row = {
+                "threshold": thr,
+                "target_name": target_name,
+                "R_diff_mean": spec["R_stats"]["mean"],
+                "R_diff_std": spec["R_stats"]["std"],
+                "R_diff_abs_mean": spec["R_stats"]["abs_mean"],
+                "R_diff_clear_003": spec["R_stats"]["clear_ratio_003"],
+                "R_diff_clear_005": spec["R_stats"]["clear_ratio_005"],
+                "g_target_mean": spec["g_stats"]["mean"],
+                "g_target_std": spec["g_stats"]["std"],
+                "g_target_mid_045_055": spec["g_stats"]["mid_ratio"],
+                "g_target_lseg_ratio_06": spec["g_stats"]["lseg_ratio_06"],
+                "g_target_odise_ratio_04": spec["g_stats"]["odise_ratio_04"],
+            }
+            signal_rows_thr.append(row)
+            signal_rows_all.append(dict(row))
+
+        size_rows_thr = _signal_stats_by_size(arrays)
+        for row in size_rows_thr:
+            out = {"threshold": thr}
+            out.update(row)
+            size_rows_all.append(out)
+
+        threshold_summaries[str(thr)] = {
+            "valid_region_count": len(rows),
+            "valid_region_ratio": float(len(rows) / max(threshold_total_regions[thr], 1)),
+            "valid_pair_count": threshold_pair_count[thr],
+            "C_lseg_mean": float(np.mean([row["C_lseg"] for row in rows])) if rows else 0.0,
+            "C_lseg_std": float(np.std([row["C_lseg"] for row in rows])) if rows else 0.0,
+            "C_odise_mean": float(np.mean([row["C_odise"] for row in rows])) if rows else 0.0,
+            "C_odise_std": float(np.std([row["C_odise"] for row in rows])) if rows else 0.0,
+            "C_diff_mean": c_stats["mean"],
+            "C_diff_std": c_stats["std"],
+            "C_diff_clear_003": c_stats["clear_ratio_003"],
+            "C_diff_clear_005": c_stats["clear_ratio_005"],
+            "C_diff_lseg_win_ratio": float((c_diff > 0.03).mean()) if c_diff.size else 0.0,
+            "C_diff_odise_win_ratio": float((c_diff < -0.03).mean()) if c_diff.size else 0.0,
+            "sharp_lseg_mean": float(np.mean([row["sharp_lseg"] for row in rows])) if rows else 0.0,
+            "sharp_lseg_std": float(np.std([row["sharp_lseg"] for row in rows])) if rows else 0.0,
+            "sharp_odise_mean": float(np.mean([row["sharp_odise"] for row in rows])) if rows else 0.0,
+            "sharp_odise_std": float(np.std([row["sharp_odise"] for row in rows])) if rows else 0.0,
+            "sharp_diff_std": sharp_stats["std"],
+            "sharp_diff_clear_003": sharp_stats["clear_ratio_003"],
+            "purity_lseg_mean": purity_stats["mean"],
+            "purity_lseg_std": purity_stats["std"],
+            "purity_lseg_available": bool(purity_vals),
+            "purity_lseg_clear_low_ratio": float((np.asarray(purity_vals) < 0.5).mean()) if purity_vals else 0.0,
+            "response_margin_mean": float(response_margin.mean()) if response_margin.size else 0.0,
+            "response_margin_std": float(response_margin.std()) if response_margin.size else 0.0,
+            "response_margin_clear_01": float((np.abs(response_margin) > 0.1).mean()) if response_margin.size else 0.0,
+            "response_conf_mean": float(response_conf.mean()) if response_conf.size else 0.0,
+            "response_conf_std": float(response_conf.std()) if response_conf.size else 0.0,
+            "inside_mean_mean": float(np.mean([row["inside_mean"] for row in rows])) if rows else 0.0,
+            "inside_mean_std": float(np.std([row["inside_mean"] for row in rows])) if rows else 0.0,
+            "outside_mean_mean": float(np.mean([row["outside_mean"] for row in rows])) if rows else 0.0,
+            "outside_mean_std": float(np.std([row["outside_mean"] for row in rows])) if rows else 0.0,
+            "mask_area_ratio_mean": float(np.mean([row["mask_area_ratio"] for row in rows])) if rows else 0.0,
+            "mask_area_ratio_std": float(np.std([row["mask_area_ratio"] for row in rows])) if rows else 0.0,
+            "lifted_point_count_mean": float(np.mean([row["lifted_point_count"] for row in rows])) if rows else 0.0,
+            "lifted_point_count_std": float(np.std([row["lifted_point_count"] for row in rows])) if rows else 0.0,
+            "view_pair_count_mean": float(np.mean([row["view_pair_count"] for row in rows])) if rows else 0.0,
+            "view_pair_count_std": float(np.std([row["view_pair_count"] for row in rows])) if rows else 0.0,
+            "overlap_iou_mean": float(np.mean([row["overlap_iou_mean"] for row in rows])) if rows else 0.0,
+            "overlap_iou_std": float(np.std([row["overlap_iou_mean"] for row in rows])) if rows else 0.0,
+            "corr_response_margin_C_diff": _pearson(response_margin, c_diff) if response_margin.size else 0.0,
+            "corr_response_conf_abs_C_diff": _pearson(response_conf, np.abs(c_diff)) if response_conf.size else 0.0,
+            "corr_response_margin_g_target": _pearson(response_margin, g_proxy) if response_margin.size else 0.0,
+            "corr_mask_area_ratio_C_diff": _pearson(arrays.get("mask_area_ratio", np.asarray([], dtype=np.float64)), c_diff) if rows else 0.0,
+            "corr_lifted_point_count_C_diff": _pearson(arrays.get("lifted_point_count", np.asarray([], dtype=np.float64)), c_diff) if rows else 0.0,
+            "corr_view_pair_count_abs_C_diff": _pearson(arrays.get("view_pair_count", np.asarray([], dtype=np.float64)), np.abs(c_diff)) if rows else 0.0,
+            "corr_overlap_iou_mean_abs_C_diff": _pearson(arrays.get("overlap_iou_mean", np.asarray([], dtype=np.float64)), np.abs(c_diff)) if rows else 0.0,
+            "target_ablation": signal_rows_thr,
+            "learnability_corr": max([row["pearson_corr"] for row in learnability_rows_thr], default=0.0),
+            "region_size_breakdown": size_rows_thr,
         }
-    else:
-        g_stats = {
-            "mean": float(g_arr.mean()),
-            "std": float(g_arr.std()),
-            "min": float(g_arr.min()),
-            "max": float(g_arr.max()),
-            "mid_ratio": float(((g_arr >= 0.45) & (g_arr <= 0.55)).mean()),
-            "lseg_ratio_06": float((g_arr > 0.6).mean()),
-            "odise_ratio_04": float((g_arr < 0.4).mean()),
-            "entropy": _binary_entropy(g_arr),
-        }
+
+    base_summary = threshold_summaries[str(base_thr)]
+    base_targets = threshold_summaries[str(base_thr)]["target_ablation"]
+    base_learn = [row for row in learn_rows_all if abs(float(row["threshold"]) - float(base_thr)) < 1e-6]
+    best_target = max(base_targets, key=lambda row: (row["g_target_std"], row["R_diff_clear_003"])) if base_targets else {}
+    best_feature = max(base_learn, key=lambda row: (row["pearson_corr"], row["r2_score"])) if base_learn else {}
+    signal_ranking = []
+    for row in base_targets:
+        signal_ranking.append(
+            {
+                "name": row["target_name"],
+                "diff_std": row["R_diff_std"],
+                "clear_003": row["R_diff_clear_003"],
+                "learn_corr": max([x["pearson_corr"] for x in base_learn if x["target_name"] == row["target_name"]], default=0.0),
+            }
+        )
+    signal_ranking.sort(key=lambda x: (x["learn_corr"], x["diff_std"], x["clear_003"]), reverse=True)
 
     recommendation = "keep_rule_based_projected_gate"
-    if g_stats["std"] < 0.03 or r_stats["clear_ratio_003"] < 0.2:
-        recommendation = "keep_rule_based_projected_gate"
-    elif not learnability:
-        recommendation = "add_more_region_features_or_keep_rule_gate"
-    else:
-        probe_b = learnability.get("fused_query+signals", {})
-        if probe_b.get("pearson_corr", 0.0) > 0.4 and probe_b.get("r2_score", 0.0) > 0.1 and g_stats["std"] >= 0.05:
-            recommendation = "train_learned_region_gate"
-        elif probe_b.get("pearson_corr", 0.0) < 0.2 or probe_b.get("r2_score", 0.0) <= 0.0:
-            recommendation = "add_more_region_features_or_keep_rule_gate"
+    if best_target:
+        if best_target["g_target_std"] >= 0.08 and best_target["R_diff_clear_003"] >= 0.5:
+            if best_feature and best_feature.get("pearson_corr", 0.0) >= 0.4 and best_feature.get("r2_score", 0.0) > 0.1:
+                recommendation = "train_learned_region_gate"
+            else:
+                recommendation = "add_more_region_features_or_keep_rule_gate"
+        elif best_feature and (best_feature.get("pearson_corr", 0.0) < 0.2 or best_feature.get("r2_score", 0.0) <= 0.0):
+            recommendation = "keep_rule_based_projected_gate"
 
     summary = {
         "purity_lseg_available": purity_lseg_available,
-        "valid_region_count": valid_region_count,
-        "valid_region_ratio": float(valid_region_count / max(total_region_count, 1)),
-        "valid_pair_count": valid_pair_count,
-        "C_lseg_mean": float(np.mean(c_lseg_values)) if c_lseg_values else 0.0,
-        "C_lseg_std": float(np.std(c_lseg_values)) if c_lseg_values else 0.0,
-        "C_odise_mean": float(np.mean(c_odise_values)) if c_odise_values else 0.0,
-        "C_odise_std": float(np.std(c_odise_values)) if c_odise_values else 0.0,
-        "C_diff_mean": c_stats["mean"],
-        "C_diff_std": c_stats["std"],
-        "C_diff_min": c_stats["min"],
-        "C_diff_max": c_stats["max"],
-        "C_diff_abs_mean": c_stats["abs_mean"],
-        "C_diff_clear_003": c_stats["clear_ratio_003"],
-        "C_diff_clear_005": c_stats["clear_ratio_005"],
-        "sharp_lseg_mean": float(np.mean(sharp_lseg_values)) if sharp_lseg_values else 0.0,
-        "sharp_lseg_std": float(np.std(sharp_lseg_values)) if sharp_lseg_values else 0.0,
-        "sharp_odise_mean": float(np.mean(sharp_odise_values)) if sharp_odise_values else 0.0,
-        "sharp_odise_std": float(np.std(sharp_odise_values)) if sharp_odise_values else 0.0,
-        "sharp_diff_mean": sharp_stats["mean"],
-        "sharp_diff_std": sharp_stats["std"],
-        "sharp_diff_clear_003": sharp_stats["clear_ratio_003"],
-        "purity_lseg_mean": float(np.mean(purity_lseg_values)) if purity_lseg_values else 0.0,
-        "purity_lseg_std": float(np.std(purity_lseg_values)) if purity_lseg_values else 0.0,
-        "purity_lseg_low_ratio": float((np.asarray(purity_lseg_values) < 0.5).mean()) if purity_lseg_values else 0.0,
-        "response_margin_mean": float(np.mean(response_margin_values)) if response_margin_values else 0.0,
-        "response_margin_std": float(np.std(response_margin_values)) if response_margin_values else 0.0,
-        "inside_mean_mean": float(np.mean(inside_mean_values)) if inside_mean_values else 0.0,
-        "outside_mean_mean": float(np.mean(outside_mean_values)) if outside_mean_values else 0.0,
-        "lifted_point_count_mean": float(np.mean(lifted_point_count_values)) if lifted_point_count_values else 0.0,
-        "lifted_point_count_std": float(np.std(lifted_point_count_values)) if lifted_point_count_values else 0.0,
-        "mask_area_ratio_mean": float(np.mean(mask_area_ratio_values)) if mask_area_ratio_values else 0.0,
-        "mask_area_ratio_std": float(np.std(mask_area_ratio_values)) if mask_area_ratio_values else 0.0,
-        "R_lseg_mean": float(np.mean(r_lseg_values)) if r_lseg_values else 0.0,
-        "R_lseg_std": float(np.std(r_lseg_values)) if r_lseg_values else 0.0,
-        "R_odise_mean": float(np.mean(r_odise_values)) if r_odise_values else 0.0,
-        "R_odise_std": float(np.std(r_odise_values)) if r_odise_values else 0.0,
-        "R_diff_mean": r_stats["mean"],
-        "R_diff_std": r_stats["std"],
-        "R_diff_min": r_stats["min"],
-        "R_diff_max": r_stats["max"],
-        "R_diff_abs_mean": r_stats["abs_mean"],
-        "R_diff_clear_003": r_stats["clear_ratio_003"],
-        "R_diff_clear_005": r_stats["clear_ratio_005"],
-        "g_target_mean": g_stats["mean"],
-        "g_target_std": g_stats["std"],
-        "g_target_min": g_stats["min"],
-        "g_target_max": g_stats["max"],
-        "g_target_entropy": g_stats["entropy"],
-        "g_target_lseg_ratio_06": g_stats["lseg_ratio_06"],
-        "g_target_odise_ratio_04": g_stats["odise_ratio_04"],
-        "g_target_mid_ratio_045_055": g_stats["mid_ratio"],
-        "learnability": learnability,
+        "iou_thresholds": iou_thresholds,
+        "base_threshold": base_thr,
+        "threshold_summaries": threshold_summaries,
+        "signal_ranking": signal_ranking,
+        "best_target": best_target,
+        "best_feature_set": best_feature,
         "speed": {
             "time_per_batch": float(np.mean(time_per_batch)) if time_per_batch else 0.0,
             "time_lift_masks": float(np.mean(time_lift_masks)) if time_lift_masks else 0.0,
@@ -905,86 +1101,113 @@ def main() -> None:
         },
         "recommendation": recommendation,
     }
-
     with open(out_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    with open(out_dir / "region_signal_stats.csv", "w", newline="") as f:
+    if args.save_per_region:
+        with open(out_dir / "region_signal_stats.csv", "w", newline="") as f:
+            fieldnames = [
+                "threshold", "scene_name", "view_id", "region_index", "size_bucket",
+                "C_lseg", "C_odise", "C_diff", "sharp_lseg", "sharp_odise", "sharp_diff",
+                "purity_lseg", "response_margin", "response_conf", "inside_mean", "outside_mean",
+                "lifted_point_count", "lifted_point_ratio", "mask_area_ratio", "view_pair_count",
+                "overlap_iou_mean", "overlap_iou_max", "pred_conf_mean", "pred_conf_std",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for thr in iou_thresholds:
+                for row in threshold_rows[thr]:
+                    writer.writerow({k: row[k] for k in fieldnames})
+
+    with open(out_dir / "signal_ablation.csv", "w", newline="") as f:
         fieldnames = [
-            "scene_name",
-            "view_id",
-            "region_index",
-            "C_lseg",
-            "C_odise",
-            "C_diff",
-            "sharp_lseg",
-            "sharp_odise",
-            "sharp_diff",
-            "purity_lseg",
-            "response_margin",
-            "inside_mean",
-            "outside_mean",
-            "lifted_point_count",
-            "mask_area_ratio",
-            "R_lseg",
-            "R_odise",
-            "R_diff",
-            "g_target",
-            "pred_conf_mean",
-            "pred_conf_std",
+            "threshold", "target_name", "R_diff_mean", "R_diff_std", "R_diff_abs_mean",
+            "R_diff_clear_003", "R_diff_clear_005", "g_target_mean", "g_target_std",
+            "g_target_mid_045_055", "g_target_lseg_ratio_06", "g_target_odise_ratio_04",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row in region_rows:
+        for row in signal_rows_all:
             writer.writerow(row)
 
-    with open(out_dir / "learnability.csv", "w", newline="") as f:
+    with open(out_dir / "learnability_ablation.csv", "w", newline="") as f:
         fieldnames = [
-            "feature",
-            "train_mse",
-            "val_mse",
-            "pearson_corr",
-            "spearman_corr",
-            "r2_score",
-            "pred_mean",
-            "pred_std",
-            "target_mean",
-            "target_std",
+            "threshold", "target_name", "feature_set", "train_mse", "val_mse", "pearson_corr",
+            "spearman_corr", "r2_score", "pred_mean", "pred_std", "target_mean", "target_std",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for feature_name, metrics in learnability.items():
-            row = {"feature": feature_name}
-            row.update(metrics)
+        for row in learn_rows_all:
             writer.writerow(row)
 
-    _save_histogram(out_dir / "g_target_hist.png", g_target_values, "g_target histogram", "g_target")
-    _save_histogram(out_dir / "R_diff_hist.png", r_diff_values, "R_diff histogram", "R_diff")
+    with open(out_dir / "region_size_breakdown.csv", "w", newline="") as f:
+        fieldnames = [
+            "threshold", "size_group", "count", "C_diff_std", "C_diff_lseg_win_ratio",
+            "C_diff_odise_win_ratio", "sharp_diff_std", "sharp_lseg_win_ratio", "sharp_odise_win_ratio",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in size_rows_all:
+            writer.writerow(row)
 
-    print("[NoText Region Gate Probe]")
-    print(
-        f"valid_region_count={valid_region_count}  "
-        f"valid_pair_count={valid_pair_count}  "
-        f"C_lseg_mean/std={summary['C_lseg_mean']:.4f}/{summary['C_lseg_std']:.4f}  "
-        f"C_odise_mean/std={summary['C_odise_mean']:.4f}/{summary['C_odise_std']:.4f}  "
-        f"C_diff_std={summary['C_diff_std']:.4f}  "
-        f"C_diff_clear@0.03={summary['C_diff_clear_003']:.4f}  "
-        f"sharp_lseg_mean/std={summary['sharp_lseg_mean']:.4f}/{summary['sharp_lseg_std']:.4f}  "
-        f"sharp_odise_mean/std={summary['sharp_odise_mean']:.4f}/{summary['sharp_odise_std']:.4f}  "
-        f"R_diff_std={summary['R_diff_std']:.4f}  "
-        f"R_diff_clear@0.03={summary['R_diff_clear_003']:.4f}  "
-        f"g_target_mean/std={summary['g_target_mean']:.4f}/{summary['g_target_std']:.4f}  "
-        f"g_target_mid_045_055={summary['g_target_mid_ratio_045_055']:.4f}"
-    )
-    print("[Learnability Probe]")
-    for feature_name, metrics in learnability.items():
+    base_rows = threshold_rows[base_thr]
+    base_arrays = _rows_to_arrays(base_rows)
+    base_target_specs = _build_target_specs(
+        base_arrays,
+        scale=float(args.region_probe_target_scale),
+        target_min=float(args.region_probe_target_min),
+        target_max=float(args.region_probe_target_max),
+        sharp_weight=float(args.region_probe_sharp_weight),
+    ) if base_rows else {}
+    _save_histogram(out_dir / "C_diff_hist.png", [row["C_diff"] for row in base_rows], "C_diff histogram", "C_diff")
+    _save_histogram(out_dir / "sharp_diff_hist.png", [row["sharp_diff"] for row in base_rows], "sharp_diff histogram", "sharp_diff")
+    _save_histogram(out_dir / "g_target_hist_mv.png", base_target_specs.get("mv", {}).get("g_target", np.asarray([], dtype=np.float64)).tolist(), "g_target mv histogram", "g_target_mv")
+    _save_histogram(out_dir / "g_target_hist_mv_sharp.png", base_target_specs.get("mv+sharp", {}).get("g_target", np.asarray([], dtype=np.float64)).tolist(), "g_target mv+sharp histogram", "g_target_mv_sharp")
+
+    print("[NoText Region Gate Probe V2]")
+    for thr in iou_thresholds:
+        thr_summary = threshold_summaries[str(thr)]
         print(
-            f"feature={feature_name} "
-            f"corr={metrics['pearson_corr']:.4f} "
-            f"r2={metrics['r2_score']:.4f}"
+            f"iou_thr={thr:.2f}  valid_region_count={thr_summary['valid_region_count']}  "
+            f"valid_pair_count={thr_summary['valid_pair_count']}  C_diff_std={thr_summary['C_diff_std']:.4f}  "
+            f"C_diff_clear@0.03={thr_summary['C_diff_clear_003']:.4f}  "
+            f"g_target_std={max((row['g_target_std'] for row in thr_summary['target_ablation']), default=0.0):.4f}  "
+            f"learnability_corr={thr_summary['learnability_corr']:.4f}"
         )
+    print("[Signal 2: MV Consistency]")
+    print(
+        f"C_lseg={base_summary['C_lseg_mean']:.4f}/{base_summary['C_lseg_std']:.4f}  "
+        f"C_odise={base_summary['C_odise_mean']:.4f}/{base_summary['C_odise_std']:.4f}  "
+        f"C_diff_std={base_summary['C_diff_std']:.4f}  C_diff_clear@0.03={base_summary['C_diff_clear_003']:.4f}  "
+        f"lseg_win={base_summary['C_diff_lseg_win_ratio']:.4f}  odise_win={base_summary['C_diff_odise_win_ratio']:.4f}"
+    )
+    print("[Signal 5: Sharpness]")
+    print(
+        f"sharp_lseg={base_summary['sharp_lseg_mean']:.4f}/{base_summary['sharp_lseg_std']:.4f}  "
+        f"sharp_odise={base_summary['sharp_odise_mean']:.4f}/{base_summary['sharp_odise_std']:.4f}  "
+        f"sharp_diff_std={base_summary['sharp_diff_std']:.4f}  sharp_diff_clear@0.03={base_summary['sharp_diff_clear_003']:.4f}"
+    )
+    print("[Signal 3/4: Quality Correlation]")
+    print(
+        f"corr(response_margin, C_diff)={base_summary['corr_response_margin_C_diff']:.4f}  "
+        f"corr(mask_area_ratio, C_diff)={base_summary['corr_mask_area_ratio_C_diff']:.4f}  "
+        f"corr(lifted_point_count, C_diff)={base_summary['corr_lifted_point_count_C_diff']:.4f}  "
+        f"corr(overlap_iou_mean, abs(C_diff))={base_summary['corr_overlap_iou_mean_abs_C_diff']:.4f}"
+    )
+    print("[Target Ablation]")
+    for row in base_targets:
+        print(
+            f"target={row['target_name']} R_diff_std={row['R_diff_std']:.4f} clear@0.03={row['R_diff_clear_003']:.4f} "
+            f"g_target_std={row['g_target_std']:.4f} g_mid={row['g_target_mid_045_055']:.4f}"
+        )
+    print("[Learnability Ablation]")
+    for row in base_learn:
+        print(f"target={row['target_name']} feature={row['feature_set']} corr={row['pearson_corr']:.4f} r2={row['r2_score']:.4f}")
     print("[Decision]")
-    print(f"recommendation = {recommendation}")
+    print(
+        f"best_target={best_target.get('target_name', 'none')}  "
+        f"best_feature_set={best_feature.get('feature_set', 'none')}  recommendation={recommendation}"
+    )
     print("[Speed]")
     print(
         f"time_per_batch={summary['speed']['time_per_batch']:.4f}s  "
