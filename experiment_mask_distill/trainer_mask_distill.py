@@ -1166,6 +1166,8 @@ class MaskDistillTrainer:
                     "min_lifted_valid": min_lifted_valid,
                     "mask_area_ratio": mask_area_ratio,
                     "coord_hash": coord_hash,
+                    "sharp_lseg": sharp_lseg.detach(),
+                    "sharp_odise": sharp_odise.detach(),
                     "response_margin": response_margin.detach(),
                     "response_conf": response_conf.detach(),
                 }
