@@ -422,6 +422,10 @@ def main() -> None:
         use_point_semantic_gate=bool(_model.get("use_point_semantic_gate", False)),
         point_sem_gate_hidden_dim=int(_model.get("point_sem_gate_hidden_dim", 128)),
         point_sem_gate_init_bias=float(_model.get("point_sem_gate_init_bias", 0.85)),
+        use_region_reliability_gate=bool(_model.get("use_region_reliability_gate", False)),
+        region_gate_hidden_dim=int(_model.get("region_gate_hidden_dim", 128)),
+        region_gate_init_bias=float(_model.get("region_gate_init_bias", 0.85)),
+        region_gate_signal_dim=int(_model.get("region_gate_signal_dim", 11)),
         alignment_query_mode=str(_model.get("alignment_query_mode", "fused")),
     )
 
@@ -499,7 +503,7 @@ def main() -> None:
             dual_space_use_confidence=_trainer.get("dual_space_use_confidence", False),
             dual_space_conf_min=_trainer.get("dual_space_conf_min", 0.2),
             dual_space_conf_max=_trainer.get("dual_space_conf_max", 0.7),
-            best_monitor=_trainer.get("monitor_metric", _trainer.get("best_monitor", "semantic_miou_learned_point_gate")),
+            best_monitor=_trainer.get("monitor_metric", _trainer.get("best_monitor", "semantic_miou_learned_region_gate")),
             source_gate_train=_trainer.get("source_gate_train", False),
             source_gate_loss_weight=_trainer.get("source_gate_loss_weight", 0.03),
             source_gate_open_loss_weight=_trainer.get("source_gate_open_loss_weight", 0.03),
@@ -571,6 +575,21 @@ def main() -> None:
             point_gate_max_points=_trainer.get("point_gate_max_points", 20000),
             point_gate_loss_type=_trainer.get("point_gate_loss_type", "mse"),
             point_gate_detach_target=_trainer.get("point_gate_detach_target", True),
+            use_region_gate_loss=_trainer.get("use_region_gate_loss", False),
+            lambda_region_gate=_trainer.get("lambda_region_gate", 0.05),
+            region_gate_input_mode=_trainer.get("region_gate_input_mode", "fused_plus_all_no_text_signals"),
+            region_gate_target_mode=_trainer.get("region_gate_target_mode", "mv_plus_sharp"),
+            region_gate_mv_weight=_trainer.get("region_gate_mv_weight", 1.0),
+            region_gate_sharp_weight=_trainer.get("region_gate_sharp_weight", 0.5),
+            region_gate_target_scale=_trainer.get("region_gate_target_scale", 5.0),
+            region_gate_target_min=_trainer.get("region_gate_target_min", 0.35),
+            region_gate_target_max=_trainer.get("region_gate_target_max", 0.85),
+            region_gate_target_default=_trainer.get("region_gate_target_default", 0.70),
+            region_gate_mv_iou_thr=_trainer.get("region_gate_mv_iou_thr", 0.05),
+            region_gate_max_pairs_per_mask=_trainer.get("region_gate_max_pairs_per_mask", 10),
+            region_gate_min_lifted_points=_trainer.get("region_gate_min_lifted_points", 5),
+            region_gate_loss_type=_trainer.get("region_gate_loss_type", "mse"),
+            region_gate_detach_target=_trainer.get("region_gate_detach_target", True),
             multiview_batch=multiview_batch,
             scenes_per_batch=scenes_per_batch,
             views_per_scene=views_per_scene,
@@ -665,7 +684,7 @@ def main() -> None:
             f"val_loss={results.get('loss', 0.0):.4f} "
             f"alignment_loss={results.get('loss_mask_distill', 0.0):.4f} "
             f"mask_iou={results.get('mask_miou', 0.0):.4f} "
-            f"semantic_miou_learned_point_gate={results.get('semantic_miou_learned_point_gate', 0.0):.4f}  "
+            f"semantic_miou_learned_region_gate={results.get('semantic_miou_learned_region_gate', 0.0):.4f}  "
             f"semantic_miou_projected_gate={results.get('semantic_miou_projected_gate', 0.0):.4f}"
         )
     else:

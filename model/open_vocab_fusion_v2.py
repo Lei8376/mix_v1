@@ -52,6 +52,10 @@ class OpenVocabFusionModelV2Config:
     use_point_semantic_gate: bool = False
     point_sem_gate_hidden_dim: int = 128
     point_sem_gate_init_bias: float = 0.85
+    use_region_reliability_gate: bool = False
+    region_gate_hidden_dim: int = 128
+    region_gate_init_bias: float = 0.85
+    region_gate_signal_dim: int = 11
     alignment_query_mode: str = "fused"
     # Optional paths for online extraction (only needed if not using precomputed)
     label_path: Optional[str] = None
@@ -161,6 +165,19 @@ class OpenVocab3DFusionModelV2(nn.Module):
             if hasattr(final_linear, "bias") and final_linear.bias is not None:
                 nn.init.constant_(final_linear.bias, float(config.point_sem_gate_init_bias))
 
+        self.region_gate_head = None
+        if config.use_region_reliability_gate:
+            region_in_dim = int(config.fused_embedding_dim) + int(config.region_gate_signal_dim)
+            hidden_dim = int(config.region_gate_hidden_dim)
+            self.region_gate_head = nn.Sequential(
+                nn.Linear(region_in_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, 1),
+            )
+            final_linear = self.region_gate_head[-1]
+            if hasattr(final_linear, "bias") and final_linear.bias is not None:
+                nn.init.constant_(final_linear.bias, float(config.region_gate_init_bias))
+
         # Learnable temperature for similarity
         self.logit_scale = nn.Parameter(
             torch.ones([]) * np.log(DEFAULT_LOGIT_SCALE)
@@ -226,6 +243,21 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "alignment_query_mode must be one of {'fused', 'odise_only', 'lseg_only'}, "
             f"got {self.config.alignment_query_mode!r}"
         )
+
+    def predict_region_reliability_gate(
+        self,
+        region_gate_inputs: torch.Tensor,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        if self.region_gate_head is None:
+            return {
+                "region_gate_logits": None,
+                "region_gate": None,
+            }
+        region_gate_logits = self.region_gate_head(region_gate_inputs).squeeze(-1).float()
+        return {
+            "region_gate_logits": region_gate_logits,
+            "region_gate": torch.sigmoid(region_gate_logits),
+        }
 
     def _get_semantic_fusion_weights(self):
         mode = str(self.config.semantic_fusion_mode).lower()

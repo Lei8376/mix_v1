@@ -82,9 +82,9 @@ class MaskDistillTrainerConfig:
     dual_space_use_confidence:   bool  = False
     dual_space_conf_min:         float = 0.2
     dual_space_conf_max:         float = 0.7
-    best_monitor:                str   = "semantic_miou_learned_point_gate"
+    best_monitor:                str   = "semantic_miou_learned_region_gate"
     lambda_align:                float = 1.0
-    semantic_readout_mode:       str   = "learned_point_gate"
+    semantic_readout_mode:       str   = "learned_region_gate"
     eval_only:                   bool  = False
     use_lseg_semantic_loss:      bool  = False
     use_odise_semantic_loss:     bool  = False
@@ -165,6 +165,21 @@ class MaskDistillTrainerConfig:
     point_gate_max_points:       int   = 20000
     point_gate_loss_type:        str   = "mse"
     point_gate_detach_target:    bool  = True
+    use_region_gate_loss:        bool  = False
+    lambda_region_gate:          float = 0.05
+    region_gate_input_mode:      str   = "fused_plus_all_no_text_signals"
+    region_gate_target_mode:     str   = "mv_plus_sharp"
+    region_gate_mv_weight:       float = 1.0
+    region_gate_sharp_weight:    float = 0.5
+    region_gate_target_scale:    float = 5.0
+    region_gate_target_min:      float = 0.35
+    region_gate_target_max:      float = 0.85
+    region_gate_target_default:  float = 0.70
+    region_gate_mv_iou_thr:      float = 0.05
+    region_gate_max_pairs_per_mask: int = 10
+    region_gate_min_lifted_points: int = 5
+    region_gate_loss_type:       str   = "mse"
+    region_gate_detach_target:   bool  = True
     multiview_batch:             bool  = False
     scenes_per_batch:            int   = 1
     views_per_scene:             int   = 4
@@ -540,16 +555,16 @@ class MaskDistillTrainer:
             print(f"  mask_distill_weight={self.config.mask_distill_weight}  "
                   f"bce_weight={self.config.bce_weight}  "
                   f"dice_weight={self.config.dice_weight}")
-            if self.config.use_point_gate_loss and not self.config.multiview_batch:
+            if self.config.use_region_gate_loss and not self.config.multiview_batch:
                 print(
-                    "[Warning] use_point_gate_loss=true but multiview_batch=false. "
-                    "point_gate_valid_count may stay near zero without same-scene multi-view batches."
+                    "[Warning] use_region_gate_loss=true but multiview_batch=false. "
+                    "region_gate_valid_region_count may stay near zero without same-scene multi-view batches."
                 )
             model_ref = self.model.module if hasattr(self.model, "module") else self.model
-            if self.config.use_point_gate_loss and getattr(model_ref, "point_sem_gate_head", None) is None:
+            if self.config.use_region_gate_loss and getattr(model_ref, "region_gate_head", None) is None:
                 print(
-                    "[Warning] use_point_gate_loss=true but model has no point_sem_gate_head. "
-                    "The loss will stay inactive until use_point_semantic_gate=true."
+                    "[Warning] use_region_gate_loss=true but model has no region_gate_head. "
+                    "The loss will stay inactive until use_region_reliability_gate=true."
                 )
 
     # ----------------------------------------------------------
@@ -738,7 +753,7 @@ class MaskDistillTrainer:
             "size_aware",
             "projected_gate",
             "projected_size_gate",
-            "learned_point_gate",
+            "learned_region_gate",
         )
 
     def _semantic_size_group_names(self) -> Tuple[str, ...]:
@@ -772,15 +787,11 @@ class MaskDistillTrainer:
         point_groups = [None] * batch_size
         projected_mask_diff = {}
         projected_mask_valid = {}
-        learned_mask_gate = {}
-        learned_mask_gate_valid = {}
         if lseg_all is None:
             return {
                 "point_groups": point_groups,
                 "projected_mask_diff": projected_mask_diff,
                 "projected_mask_valid": projected_mask_valid,
-                "learned_mask_gate": learned_mask_gate,
-                "learned_mask_gate_valid": learned_mask_gate_valid,
             }
 
         scene_names = batch.get("scene_name") or []
@@ -814,9 +825,6 @@ class MaskDistillTrainer:
                 dtype=torch.long,
                 device=point_coords.device,
             )
-            point_gate_b = results.get("point_sem_gate")
-            if point_gate_b is not None:
-                point_gate_b = point_gate_b[pt_mask].float()
             scene_name = (
                 str(scene_names[b])
                 if isinstance(scene_names, (list, tuple)) and b < len(scene_names)
@@ -848,23 +856,6 @@ class MaskDistillTrainer:
                 point_to_views[key].add(b)
 
             point_groups[b] = point_group
-            if point_gate_b is not None:
-                weights = torch.sigmoid(pred_logits) * lifted_valid_b.float().unsqueeze(-1)
-                gate_default = torch.full(
-                    (weights.shape[1],),
-                    float(self.config.point_gate_target_default),
-                    device=weights.device,
-                    dtype=torch.float32,
-                )
-                gate_valid = weights.sum(dim=0) > 0
-                gate_value = gate_default.clone()
-                if bool(gate_valid.any()):
-                    gate_value[gate_valid] = (
-                        (weights[:, gate_valid] * point_gate_b[:, None]).sum(dim=0)
-                        / weights[:, gate_valid].sum(dim=0).clamp_min(1e-6)
-                    )
-                learned_mask_gate[b] = gate_value
-                learned_mask_gate_valid[b] = gate_valid
 
         def _avg_pairwise_cos(x: torch.Tensor) -> torch.Tensor:
             if x.shape[0] < 2:
@@ -907,8 +898,6 @@ class MaskDistillTrainer:
             "point_groups": point_groups,
             "projected_mask_diff": projected_mask_diff,
             "projected_mask_valid": projected_mask_valid,
-            "learned_mask_gate": learned_mask_gate,
-            "learned_mask_gate_valid": learned_mask_gate_valid,
         }
 
     def _compute_semantic_readout_probs(
@@ -967,7 +956,7 @@ class MaskDistillTrainer:
         if learned_gate is None:
             learned_weight = probs["projected_gate"].new_full(
                 (mask_area_ratio.shape[0],),
-                float(self.config.point_gate_target_default),
+                float(self.config.region_gate_target_default),
             )
             learned_valid = torch.zeros_like(learned_weight, dtype=torch.bool)
         else:
@@ -978,10 +967,308 @@ class MaskDistillTrainer:
                 else torch.ones_like(learned_weight, dtype=torch.bool)
             )
         learned_weight = torch.where(learned_valid, learned_weight, proj_weight)
-        probs["learned_point_gate"] = (
+        probs["learned_region_gate"] = (
             learned_weight[:, None] * p_lseg + (1.0 - learned_weight[:, None]) * p_odise
         )
         return probs
+
+    def _compute_scene_region_gate_multiview(
+        self,
+        scene_items,
+        iou_thr: float,
+        max_pairs: int,
+    ) -> Tuple[int, int]:
+        valid_pairs = 0
+        num_items = len(scene_items)
+        for item in scene_items:
+            k = item["num_masks"]
+            item["mv_num_lseg"] = item["odise_q"].new_zeros(k)
+            item["mv_den_lseg"] = item["odise_q"].new_zeros(k)
+            item["mv_num_odise"] = item["odise_q"].new_zeros(k)
+            item["mv_den_odise"] = item["odise_q"].new_zeros(k)
+            item["mv_pair_count"] = item["odise_q"].new_zeros(k)
+            item["mv_iou_sum"] = item["odise_q"].new_zeros(k)
+            item["mv_iou_max"] = item["odise_q"].new_zeros(k)
+
+        for i in range(num_items):
+            item_i = scene_items[i]
+            hash_i = item_i["coord_hash"]
+            sort_j_cache = {}
+            for j in range(num_items):
+                if i == j:
+                    continue
+                item_j = scene_items[j]
+                if item_i["view_id"] == item_j["view_id"]:
+                    continue
+                if j not in sort_j_cache:
+                    sort_j_cache[j] = torch.sort(item_j["coord_hash"])
+                sorted_hash_j, order_j = sort_j_cache[j]
+                pos = torch.searchsorted(sorted_hash_j, hash_i)
+                valid = pos < sorted_hash_j.shape[0]
+                pos = pos.clamp_max(sorted_hash_j.shape[0] - 1)
+                valid = valid & (sorted_hash_j[pos] == hash_i)
+                if not bool(valid.any()):
+                    continue
+                idx_i = torch.nonzero(valid, as_tuple=True)[0]
+                idx_j = order_j[pos[valid]]
+                a = item_i["lifted_bool"][idx_i].float()
+                b = item_j["lifted_bool"][idx_j].float()
+                inter = a.t() @ b
+                cnt_i = a.sum(dim=0)
+                cnt_j = b.sum(dim=0)
+                union = cnt_i[:, None] + cnt_j[None, :] - inter
+                iou = inter / union.clamp_min(1.0)
+                sim_lseg = F.normalize(item_i["lseg_q"], dim=-1) @ F.normalize(item_j["lseg_q"], dim=-1).t()
+                sim_odise = F.normalize(item_i["odise_q"], dim=-1) @ F.normalize(item_j["odise_q"], dim=-1).t()
+                topv, topidx = torch.topk(iou, k=min(max_pairs, iou.shape[1]), dim=1)
+                for local_i in range(iou.shape[0]):
+                    keep = topv[local_i] > iou_thr
+                    if not bool(keep.any()):
+                        continue
+                    weights = topv[local_i, keep]
+                    nbrs = topidx[local_i, keep]
+                    item_i["mv_num_lseg"][local_i] += (sim_lseg[local_i, nbrs] * weights).sum()
+                    item_i["mv_den_lseg"][local_i] += weights.sum()
+                    item_i["mv_num_odise"][local_i] += (sim_odise[local_i, nbrs] * weights).sum()
+                    item_i["mv_den_odise"][local_i] += weights.sum()
+                    item_i["mv_pair_count"][local_i] += float(keep.sum().item())
+                    item_i["mv_iou_sum"][local_i] += weights.sum()
+                    item_i["mv_iou_max"][local_i] = torch.maximum(item_i["mv_iou_max"][local_i], weights.max())
+                    valid_pairs += int(keep.sum().item())
+
+        for item in scene_items:
+            den = item["mv_den_lseg"]
+            item["c_valid"] = den > 0
+            item["C_lseg"] = torch.where(item["c_valid"], item["mv_num_lseg"] / den.clamp_min(1e-6), torch.zeros_like(den))
+            item["C_odise"] = torch.where(item["c_valid"], item["mv_num_odise"] / den.clamp_min(1e-6), torch.zeros_like(den))
+            item["overlap_iou_mean"] = torch.where(
+                item["mv_pair_count"] > 0,
+                item["mv_iou_sum"] / item["mv_pair_count"].clamp_min(1.0),
+                torch.zeros_like(den),
+            )
+        total_regions = sum(item["num_masks"] for item in scene_items)
+        return valid_pairs, total_regions
+
+    def _build_region_reliability_gate_targets(
+        self,
+        results: Dict,
+        batch: Dict,
+    ) -> Dict[str, Any]:
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        region_gate_head = getattr(model_ref, "region_gate_head", None)
+        lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
+        empty = {
+            "region_gate_pred_by_batch": {},
+            "region_gate_valid_by_batch": {},
+            "loss_valid_mask_by_batch": {},
+            "gate_target_by_batch": {},
+            "region_gate_logits_by_batch": {},
+            "loss_region_gate": 0.0,
+            "region_gate_valid_region_count": 0.0,
+            "region_gate_valid_region_ratio": 0.0,
+            "region_gate_target_mean": 0.0,
+            "region_gate_target_std": 0.0,
+            "region_gate_pred_mean": 0.0,
+            "region_gate_pred_std": 0.0,
+            "region_gate_c_diff_mean": 0.0,
+            "region_gate_c_diff_clear_003": 0.0,
+            "region_gate_sharp_diff_mean": 0.0,
+            "region_gate_sharp_diff_clear_003": 0.0,
+        }
+        if lseg_all is None or region_gate_head is None:
+            return empty
+
+        with torch.no_grad():
+            lifted, lifted_valid = build_lifted_3d_masks(
+                batch["masks"],
+                batch["mask_valid"],
+                batch["x_label"],
+                batch["y_label"],
+                results["batch_indices"],
+            )
+
+        scene_names = batch.get("scene_name") or []
+        frame_stems = batch.get("frame_stem") or []
+        scene_groups = collections.defaultdict(list)
+        total_valid_masks = 0
+        for b in range(len(results["outputs"])):
+            if len(results["outputs"][b]) == 0:
+                continue
+            valid_k = results["mask_valid_from_masks"][b]
+            if not valid_k.any():
+                continue
+            pt_mask = results["batch_indices"] == b
+            if not pt_mask.any():
+                continue
+            pred_logits = results["outputs"][b][0]["pred_mask_logits"][:, valid_k].float()
+            lifted_b = lifted[pt_mask][:, valid_k]
+            lifted_valid_b = lifted_valid[pt_mask]
+            if not bool(lifted_valid_b.any()):
+                continue
+            odise_q = batch["mask_embeddings"][b][valid_k].float()
+            lseg_q = lseg_all[b][valid_k].float()
+            fused_q = results["fused_embeddings"][b][valid_k]
+            coords_xyz = batch["ori_coords_3d"][pt_mask][:, 1:4].long()[lifted_valid_b]
+            coords_shift = coords_xyz + 20000
+            coord_hash = (
+                coords_shift[:, 0] * (40001 ** 2)
+                + coords_shift[:, 1] * 40001
+                + coords_shift[:, 2]
+            )
+            lifted_bool = (lifted_b[lifted_valid_b] > 0.5)
+            lifted_point_count = lifted_bool.float().sum(dim=0)
+            min_lifted_valid = lifted_point_count >= float(self.config.region_gate_min_lifted_points)
+            if odise_q.shape[0] == 0:
+                continue
+            masks_b = batch["masks"][b].float()
+            mask_area = masks_b[valid_k].sum(dim=(1, 2))
+            image_area = float(masks_b.shape[-1] * masks_b.shape[-2])
+            mask_area_ratio = (mask_area / max(image_area, 1.0)).clamp(0.0, 1.0)
+            pred = torch.sigmoid(pred_logits)
+            target = lifted_bool.float()
+            inside_count = target.sum(dim=0)
+            outside_count = (1.0 - target).sum(dim=0)
+            inside_mean = (pred * target).sum(dim=0) / inside_count.clamp_min(1.0)
+            outside_mean = (pred * (1.0 - target)).sum(dim=0) / outside_count.clamp_min(1.0)
+            response_margin = inside_mean - outside_mean
+            response_conf = (pred - 0.5).abs().mean(dim=0) * 2.0
+            k = int(valid_k.sum().item())
+            if k < 2:
+                sharp_lseg = odise_q.new_zeros(k)
+                sharp_odise = odise_q.new_zeros(k)
+            else:
+                lseg_sim = F.normalize(lseg_q, dim=-1) @ F.normalize(lseg_q, dim=-1).t()
+                odise_sim = F.normalize(odise_q, dim=-1) @ F.normalize(odise_q, dim=-1).t()
+                lseg_sim.fill_diagonal_(-1.0)
+                odise_sim.fill_diagonal_(-1.0)
+                top_k = min(2, k - 1)
+                top_l = torch.topk(lseg_sim, k=top_k, dim=1).values
+                top_o = torch.topk(odise_sim, k=top_k, dim=1).values
+                if top_k == 1:
+                    sharp_lseg = top_l[:, 0]
+                    sharp_odise = top_o[:, 0]
+                else:
+                    sharp_lseg = top_l[:, 0] - top_l[:, 1]
+                    sharp_odise = top_o[:, 0] - top_o[:, 1]
+
+            scene_name = str(scene_names[b]) if isinstance(scene_names, (list, tuple)) and b < len(scene_names) else str(b)
+            view_id = str(frame_stems[b]) if isinstance(frame_stems, (list, tuple)) and b < len(frame_stems) else str(b)
+            scene_groups[scene_name].append(
+                {
+                    "batch_index": b,
+                    "view_id": view_id,
+                    "num_masks": int(k),
+                    "odise_q": odise_q,
+                    "lseg_q": lseg_q,
+                    "fused_q": fused_q,
+                    "lifted_bool": lifted_bool,
+                    "lifted_point_count": lifted_point_count,
+                    "min_lifted_valid": min_lifted_valid,
+                    "mask_area_ratio": mask_area_ratio,
+                    "coord_hash": coord_hash,
+                    "response_margin": response_margin.detach(),
+                    "response_conf": response_conf.detach(),
+                }
+            )
+            total_valid_masks += int(k)
+
+        region_gate_pred_by_batch = {}
+        region_gate_valid_by_batch = {}
+        loss_valid_mask_by_batch = {}
+        gate_target_by_batch = {}
+        region_gate_logits_by_batch = {}
+        valid_targets = []
+        valid_preds = []
+        c_diff_values = []
+        sharp_diff_values = []
+
+        for _, items in scene_groups.items():
+            self._compute_scene_region_gate_multiview(
+                items,
+                iou_thr=float(self.config.region_gate_mv_iou_thr),
+                max_pairs=int(self.config.region_gate_max_pairs_per_mask),
+            )
+            for item in items:
+                c_lseg = item["C_lseg"]
+                c_odise = item["C_odise"]
+                c_diff = c_lseg - c_odise
+                sharp_diff = item["sharp_lseg"] - item["sharp_odise"]
+                scalar_features = torch.stack(
+                    [
+                        c_lseg.detach(),
+                        c_odise.detach(),
+                        c_diff.detach(),
+                        item["sharp_lseg"].detach(),
+                        item["sharp_odise"].detach(),
+                        sharp_diff.detach(),
+                        item["response_margin"],
+                        item["response_conf"],
+                        item["mask_area_ratio"].detach(),
+                        item["lifted_point_count"].detach(),
+                        item["overlap_iou_mean"].detach(),
+                    ],
+                    dim=1,
+                ).float()
+                gate_inputs = torch.cat([item["fused_q"].float(), scalar_features], dim=1)
+                pred_out = model_ref.predict_region_reliability_gate(gate_inputs)
+                gate_logits = pred_out["region_gate_logits"]
+                gate_pred = pred_out["region_gate"]
+                if gate_logits is None or gate_pred is None:
+                    continue
+                r_diff = (
+                    float(self.config.region_gate_mv_weight) * c_diff
+                    + float(self.config.region_gate_sharp_weight) * sharp_diff
+                )
+                gate_target = torch.sigmoid(float(self.config.region_gate_target_scale) * r_diff)
+                gate_target = gate_target.clamp(
+                    float(self.config.region_gate_target_min),
+                    float(self.config.region_gate_target_max),
+                )
+                loss_valid = item["c_valid"] & item["min_lifted_valid"]
+                b = int(item["batch_index"])
+                region_gate_pred_by_batch[b] = gate_pred
+                region_gate_valid_by_batch[b] = torch.ones_like(gate_pred, dtype=torch.bool)
+                loss_valid_mask_by_batch[b] = loss_valid
+                gate_target_by_batch[b] = gate_target
+                region_gate_logits_by_batch[b] = gate_logits
+                if bool(loss_valid.any()):
+                    valid_targets.append(gate_target[loss_valid].detach())
+                    valid_preds.append(gate_pred[loss_valid].float())
+                    c_diff_values.append(c_diff[loss_valid].detach())
+                    sharp_diff_values.append(sharp_diff[loss_valid].detach())
+
+        if not valid_targets:
+            return {
+                **empty,
+                "region_gate_pred_by_batch": region_gate_pred_by_batch,
+                "region_gate_valid_by_batch": region_gate_valid_by_batch,
+                "loss_valid_mask_by_batch": loss_valid_mask_by_batch,
+                "gate_target_by_batch": gate_target_by_batch,
+                "region_gate_logits_by_batch": region_gate_logits_by_batch,
+            }
+
+        target_cat = torch.cat(valid_targets, dim=0).float()
+        pred_cat = torch.cat(valid_preds, dim=0).float()
+        c_diff_cat = torch.cat(c_diff_values, dim=0).float()
+        sharp_diff_cat = torch.cat(sharp_diff_values, dim=0).float()
+        return {
+            "region_gate_pred_by_batch": region_gate_pred_by_batch,
+            "region_gate_valid_by_batch": region_gate_valid_by_batch,
+            "loss_valid_mask_by_batch": loss_valid_mask_by_batch,
+            "gate_target_by_batch": gate_target_by_batch,
+            "region_gate_logits_by_batch": region_gate_logits_by_batch,
+            "loss_region_gate": 0.0,
+            "region_gate_valid_region_count": float(target_cat.numel()),
+            "region_gate_valid_region_ratio": float(target_cat.numel() / max(total_valid_masks, 1)),
+            "region_gate_target_mean": float(target_cat.mean().detach().cpu()),
+            "region_gate_target_std": float(target_cat.std(unbiased=False).detach().cpu()),
+            "region_gate_pred_mean": float(pred_cat.mean().detach().cpu()),
+            "region_gate_pred_std": float(pred_cat.std(unbiased=False).detach().cpu()),
+            "region_gate_c_diff_mean": float(c_diff_cat.mean().detach().cpu()),
+            "region_gate_c_diff_clear_003": float((c_diff_cat.abs() > 0.03).float().mean().detach().cpu()),
+            "region_gate_sharp_diff_mean": float(sharp_diff_cat.mean().detach().cpu()),
+            "region_gate_sharp_diff_clear_003": float((sharp_diff_cat.abs() > 0.03).float().mean().detach().cpu()),
+        }
 
     def _build_point_projected_gate_targets(
         self,
@@ -1926,54 +2213,64 @@ class MaskDistillTrainer:
                         results  = self.model(batch)
                         criteria = self._make_criteria(results, batch)
                         loss, loss_dict = criteria.compute_loss()
-                        point_gate_logs = {
-                            "loss_point_gate": 0.0,
-                            "point_gate_valid_count": 0.0,
-                            "point_gate_valid_ratio": 0.0,
-                            "point_gate_target_mean": 0.0,
-                            "point_gate_target_std": 0.0,
-                            "point_gate_pred_mean": 0.0,
-                            "point_gate_pred_std": 0.0,
-                            "point_gate_diff_mean": 0.0,
-                            "point_gate_c_lseg_mean": 0.0,
-                            "point_gate_c_odise_mean": 0.0,
+                        region_gate_logs = {
+                            "loss_region_gate": 0.0,
+                            "region_gate_valid_region_count": 0.0,
+                            "region_gate_valid_region_ratio": 0.0,
+                            "region_gate_target_mean": 0.0,
+                            "region_gate_target_std": 0.0,
+                            "region_gate_pred_mean": 0.0,
+                            "region_gate_pred_std": 0.0,
+                            "region_gate_c_diff_mean": 0.0,
+                            "region_gate_c_diff_clear_003": 0.0,
+                            "region_gate_sharp_diff_mean": 0.0,
+                            "region_gate_sharp_diff_clear_003": 0.0,
                         }
-                        if self.config.use_point_gate_loss:
-                            point_gate_targets = self._build_point_projected_gate_targets(results, batch)
-                            gate_valid_mask = point_gate_targets.get("gate_valid_mask")
-                            gate_target = point_gate_targets.get("gate_target")
-                            gate_logits = point_gate_targets.get("gate_logits")
-                            gate_pred = point_gate_targets.get("gate_pred")
-                            if (
-                                gate_valid_mask is not None
-                                and gate_target is not None
-                                and gate_logits is not None
-                                and gate_pred is not None
-                                and bool(gate_valid_mask.any())
-                            ):
-                                gate_target_valid = gate_target[gate_valid_mask].float()
-                                if self.config.point_gate_detach_target:
+                        if self.config.use_region_gate_loss:
+                            region_gate_targets = self._build_region_reliability_gate_targets(results, batch)
+                            gate_target_by_batch = region_gate_targets.get("gate_target_by_batch", {})
+                            gate_logits_by_batch = region_gate_targets.get("region_gate_logits_by_batch", {})
+                            gate_pred_by_batch = region_gate_targets.get("region_gate_pred_by_batch", {})
+                            loss_valid_by_batch = region_gate_targets.get("loss_valid_mask_by_batch", {})
+                            gate_loss_terms = []
+                            for b_key, valid_mask in loss_valid_by_batch.items():
+                                gate_target = gate_target_by_batch.get(b_key)
+                                gate_logits = gate_logits_by_batch.get(b_key)
+                                gate_pred = gate_pred_by_batch.get(b_key)
+                                if (
+                                    gate_target is None
+                                    or gate_logits is None
+                                    or gate_pred is None
+                                    or valid_mask is None
+                                    or not bool(valid_mask.any())
+                                ):
+                                    continue
+                                gate_target_valid = gate_target[valid_mask].float()
+                                if self.config.region_gate_detach_target:
                                     gate_target_valid = gate_target_valid.detach()
-                                if str(self.config.point_gate_loss_type).lower() == "bce":
-                                    point_gate_loss_raw = F.binary_cross_entropy_with_logits(
-                                        gate_logits[gate_valid_mask].float(),
+                                if str(self.config.region_gate_loss_type).lower() == "bce":
+                                    gate_loss_raw = F.binary_cross_entropy_with_logits(
+                                        gate_logits[valid_mask].float(),
                                         gate_target_valid,
                                     )
                                 else:
-                                    point_gate_loss_raw = F.mse_loss(
-                                        gate_pred[gate_valid_mask].float(),
+                                    gate_loss_raw = F.mse_loss(
+                                        gate_pred[valid_mask].float(),
                                         gate_target_valid,
                                     )
-                                point_gate_loss = float(self.config.lambda_point_gate) * point_gate_loss_raw
-                                loss = loss + point_gate_loss
-                                point_gate_logs["loss_point_gate"] = float(point_gate_loss.detach().cpu())
-                            point_gate_logs.update(
+                                gate_loss_terms.append(gate_loss_raw)
+                            if gate_loss_terms:
+                                region_gate_loss_raw = torch.stack(gate_loss_terms).mean()
+                                region_gate_loss = float(self.config.lambda_region_gate) * region_gate_loss_raw
+                                loss = loss + region_gate_loss
+                                region_gate_logs["loss_region_gate"] = float(region_gate_loss.detach().cpu())
+                            region_gate_logs.update(
                                 {
-                                    k: v for k, v in point_gate_targets.items()
-                                    if k.startswith("point_gate_")
+                                    k: v for k, v in region_gate_targets.items()
+                                    if k.startswith("region_gate_")
                                 }
                             )
-                        loss_dict.update(point_gate_logs)
+                        loss_dict.update(region_gate_logs)
                         gate_extra, gate_logs = (
                             self._compute_source_gate_loss(
                                 results,
@@ -2086,17 +2383,18 @@ class MaskDistillTrainer:
                     self.writer.add_scalar("Loss/Train_Step",         loss.item(),                        self.global_step)
                     self.writer.add_scalar("Loss/Train_Alignment",    loss_dict["loss_mask_distill"],     self.global_step)
                     self.writer.add_scalar("Loss/Train_MaskDistill",  loss_dict["loss_mask_distill"],     self.global_step)
-                    self.writer.add_scalar("Loss/Train_PointGate",    loss_dict.get("loss_point_gate", 0.0), self.global_step)
+                    self.writer.add_scalar("Loss/Train_RegionGate",   loss_dict.get("loss_region_gate", 0.0), self.global_step)
                     self.writer.add_scalar("Loss/Train_Aux",          loss_dict["loss_aux"],              self.global_step)
-                    self.writer.add_scalar("Train/point_gate_valid_count", loss_dict.get("point_gate_valid_count", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_valid_ratio", loss_dict.get("point_gate_valid_ratio", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_target_mean", loss_dict.get("point_gate_target_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_target_std", loss_dict.get("point_gate_target_std", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_pred_mean", loss_dict.get("point_gate_pred_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_pred_std", loss_dict.get("point_gate_pred_std", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_diff_mean", loss_dict.get("point_gate_diff_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_c_lseg_mean", loss_dict.get("point_gate_c_lseg_mean", 0.0), self.global_step)
-                    self.writer.add_scalar("Train/point_gate_c_odise_mean", loss_dict.get("point_gate_c_odise_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/valid_region_count", loss_dict.get("region_gate_valid_region_count", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/valid_region_ratio", loss_dict.get("region_gate_valid_region_ratio", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/target_mean", loss_dict.get("region_gate_target_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/target_std", loss_dict.get("region_gate_target_std", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/pred_mean", loss_dict.get("region_gate_pred_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/pred_std", loss_dict.get("region_gate_pred_std", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/C_diff_mean", loss_dict.get("region_gate_c_diff_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/C_diff_clear_003", loss_dict.get("region_gate_c_diff_clear_003", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/sharp_diff_mean", loss_dict.get("region_gate_sharp_diff_mean", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/sharp_diff_clear_003", loss_dict.get("region_gate_sharp_diff_clear_003", 0.0), self.global_step)
                     if legacy_gate_logs:
                         self.writer.add_scalar("Loss/Train_SourceGate",   loss_dict.get("loss_source_gate", 0.0), self.global_step)
                     if verbose_legacy:
@@ -2201,7 +2499,7 @@ class MaskDistillTrainer:
                     f"Step [{step}/{len(self.train_loader)}] "
                     f"Loss: {loss.item():.4f} "
                     f"(alignment={loss_dict['loss_mask_distill']:.4f} "
-                    f"point_gate={loss_dict.get('loss_point_gate', 0.0):.4f} "
+                    f"region_gate={loss_dict.get('loss_region_gate', 0.0):.4f} "
                     f"aux={loss_dict['loss_aux']:.4f}) "
                     f"avg={epoch_loss.avg:.4f}  LR: {lr:.2e}  ETA: {eta:.0f}s"
                 )
@@ -2388,8 +2686,8 @@ class MaskDistillTrainer:
         val_loss      = AverageMeter()
         val_distill   = AverageMeter()
         val_aux       = AverageMeter()
-        val_point_gate = AverageMeter()
-        val_point_gate_ratio = AverageMeter()
+        val_region_gate = AverageMeter()
+        val_region_gate_ratio = AverageMeter()
         verbose_legacy = bool(self.config.enable_verbose_legacy_probes)
 
         text_feats = self._get_text_features()
@@ -2459,37 +2757,48 @@ class MaskDistillTrainer:
                 results          = self.model(batch)
                 criteria         = self._make_criteria(results, batch)
                 loss, loss_dict  = criteria.compute_loss()
-                point_gate_valid_ratio = 0.0
-                if self.config.use_point_gate_loss:
-                    point_gate_targets = self._build_point_projected_gate_targets(results, batch)
-                    point_gate_valid_ratio = float(point_gate_targets.get("point_gate_valid_ratio", 0.0))
-                    val_point_gate_ratio.update(point_gate_valid_ratio)
-                    gate_valid_mask = point_gate_targets.get("gate_valid_mask")
-                    gate_target = point_gate_targets.get("gate_target")
-                    gate_logits = point_gate_targets.get("gate_logits")
-                    gate_pred = point_gate_targets.get("gate_pred")
-                    if (
-                        gate_valid_mask is not None
-                        and gate_target is not None
-                        and gate_logits is not None
-                        and gate_pred is not None
-                        and bool(gate_valid_mask.any())
-                    ):
-                        gate_target_valid = gate_target[gate_valid_mask].float()
-                        if self.config.point_gate_detach_target:
-                            gate_target_valid = gate_target_valid.detach()
-                        if str(self.config.point_gate_loss_type).lower() == "bce":
-                            point_gate_loss_raw = F.binary_cross_entropy_with_logits(
-                                gate_logits[gate_valid_mask].float(),
-                                gate_target_valid,
-                            )
-                        else:
-                            point_gate_loss_raw = F.mse_loss(
-                                gate_pred[gate_valid_mask].float(),
-                                gate_target_valid,
-                            )
-                        loss = loss + float(self.config.lambda_point_gate) * point_gate_loss_raw
-                        val_point_gate.update(float(float(self.config.lambda_point_gate) * point_gate_loss_raw.detach().cpu()))
+                region_gate_targets = None
+                region_gate_valid_ratio = 0.0
+                if self.config.use_region_gate_loss or str(self.config.semantic_readout_mode).lower() == "learned_region_gate":
+                    region_gate_targets = self._build_region_reliability_gate_targets(results, batch)
+                    region_gate_valid_ratio = float(region_gate_targets.get("region_gate_valid_region_ratio", 0.0))
+                    val_region_gate_ratio.update(region_gate_valid_ratio)
+                    if self.config.use_region_gate_loss:
+                        gate_target_by_batch = region_gate_targets.get("gate_target_by_batch", {})
+                        gate_logits_by_batch = region_gate_targets.get("region_gate_logits_by_batch", {})
+                        gate_pred_by_batch = region_gate_targets.get("region_gate_pred_by_batch", {})
+                        loss_valid_by_batch = region_gate_targets.get("loss_valid_mask_by_batch", {})
+                        gate_loss_terms = []
+                        for b_key, valid_mask in loss_valid_by_batch.items():
+                            gate_target = gate_target_by_batch.get(b_key)
+                            gate_logits = gate_logits_by_batch.get(b_key)
+                            gate_pred = gate_pred_by_batch.get(b_key)
+                            if (
+                                gate_target is None
+                                or gate_logits is None
+                                or gate_pred is None
+                                or valid_mask is None
+                                or not bool(valid_mask.any())
+                            ):
+                                continue
+                            gate_target_valid = gate_target[valid_mask].float()
+                            if self.config.region_gate_detach_target:
+                                gate_target_valid = gate_target_valid.detach()
+                            if str(self.config.region_gate_loss_type).lower() == "bce":
+                                gate_loss_raw = F.binary_cross_entropy_with_logits(
+                                    gate_logits[valid_mask].float(),
+                                    gate_target_valid,
+                                )
+                            else:
+                                gate_loss_raw = F.mse_loss(
+                                    gate_pred[valid_mask].float(),
+                                    gate_target_valid,
+                                )
+                            gate_loss_terms.append(gate_loss_raw)
+                        if gate_loss_terms:
+                            region_gate_loss_raw = torch.stack(gate_loss_terms).mean()
+                            loss = loss + float(self.config.lambda_region_gate) * region_gate_loss_raw
+                            val_region_gate.update(float(float(self.config.lambda_region_gate) * region_gate_loss_raw.detach().cpu()))
 
             val_loss.update(loss.item())
             val_distill.update(loss_dict["loss_mask_distill"])
@@ -2624,8 +2933,8 @@ class MaskDistillTrainer:
                     mask_area_ratio = (mask_area / max(image_area, 1.0)).clamp(0.0, 1.0)
                     projected_diff = semantic_eval_aux["projected_mask_diff"].get(b)
                     projected_valid = semantic_eval_aux["projected_mask_valid"].get(b)
-                    learned_gate = semantic_eval_aux["learned_mask_gate"].get(b)
-                    learned_gate_valid = semantic_eval_aux["learned_mask_gate_valid"].get(b)
+                    learned_gate = None if region_gate_targets is None else region_gate_targets.get("region_gate_pred_by_batch", {}).get(b)
+                    learned_gate_valid = None if region_gate_targets is None else region_gate_targets.get("region_gate_valid_by_batch", {}).get(b)
 
                     if odise_q.shape[-1] != text_feats.shape[-1]:
                         raise RuntimeError(
@@ -2834,10 +3143,10 @@ class MaskDistillTrainer:
             "semantic_miou_size_aware": 0.0,
             "semantic_miou_projected_gate": 0.0,
             "semantic_miou_projected_size_gate": 0.0,
-            "semantic_miou_learned_point_gate": 0.0,
-            "semantic_macc_learned_point_gate": 0.0,
-            "loss_point_gate": val_point_gate.avg,
-            "point_gate_valid_ratio": val_point_gate_ratio.avg,
+            "semantic_miou_learned_region_gate": 0.0,
+            "semantic_macc_learned_region_gate": 0.0,
+            "loss_region_gate": val_region_gate.avg,
+            "region_gate_valid_region_ratio": val_region_gate_ratio.avg,
         }
 
         if pc_tracker is not None:
@@ -3045,7 +3354,7 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("Loss/Val",                   val_metrics["loss"],                       epoch)
                         self.writer.add_scalar("Loss/Val_Alignment",         val_metrics["loss_mask_distill"],          epoch)
                         self.writer.add_scalar("Loss/Val_MaskDistill",       val_metrics["loss_mask_distill"],          epoch)
-                        self.writer.add_scalar("Loss/Val_PointGate",         val_metrics.get("loss_point_gate", 0.0),  epoch)
+                        self.writer.add_scalar("Loss/Val_RegionGate",        val_metrics.get("loss_region_gate", 0.0), epoch)
                         self.writer.add_scalar("Loss/Val_Aux",               val_metrics["loss_aux"],                   epoch)
                         self.writer.add_scalar("SemanticReadout/odise_only",          val_metrics["semantic_miou_odise_only"],          epoch)
                         self.writer.add_scalar("SemanticReadout/lseg_only",           val_metrics["semantic_miou_lseg_only"],           epoch)
@@ -3056,7 +3365,7 @@ class MaskDistillTrainer:
                         self.writer.add_scalar("SemanticReadout/size_aware",          val_metrics["semantic_miou_size_aware"],          epoch)
                         self.writer.add_scalar("SemanticReadout/projected_gate",      val_metrics["semantic_miou_projected_gate"],      epoch)
                         self.writer.add_scalar("SemanticReadout/projected_size_gate", val_metrics["semantic_miou_projected_size_gate"], epoch)
-                        self.writer.add_scalar("SemanticReadout/learned_point_gate",  val_metrics["semantic_miou_learned_point_gate"],  epoch)
+                        self.writer.add_scalar("SemanticReadout/learned_region_gate", val_metrics["semantic_miou_learned_region_gate"], epoch)
                         self.writer.add_scalar("Metrics/Mask_mIoU",               val_metrics["mask_miou"],                epoch)
                         self.writer.add_scalar("Metrics/N_Masks",                  val_metrics["n_masks"],                  epoch)
                         if self.config.enable_verbose_legacy_probes:
@@ -3082,7 +3391,7 @@ class MaskDistillTrainer:
                             "PerClass_IoU_Readout_ODISEOnly": val_metrics.get("per_class_iou_odise_only", {}),
                             "PerClass_IoU_Readout_LSeg07": val_metrics.get("per_class_iou_lseg_07", {}),
                             "PerClass_IoU_Readout_SizeAware": val_metrics.get("per_class_iou_size_aware", {}),
-                            "PerClass_IoU_Readout_LearnedPointGate": val_metrics.get("per_class_iou_learned_point_gate", {}),
+                            "PerClass_IoU_Readout_LearnedRegionGate": val_metrics.get("per_class_iou_learned_region_gate", {}),
                             "PerClass_IoU_Readout_ProjectedSizeGate": val_metrics.get("per_class_iou_projected_size_gate", {}),
                             "PerClass_IoU_Readout_ProjectedGate": val_metrics.get("per_class_iou_projected_gate", {}),
                         }
@@ -3106,10 +3415,10 @@ class MaskDistillTrainer:
                         f"val_loss={val_metrics['loss']:.4f}  "
                         f"alignment_loss={val_metrics['loss_mask_distill']:.4f}  "
                         f"mask_iou={val_metrics['mask_miou']:.4f}  "
-                        f"point_gate_valid_ratio={val_metrics.get('point_gate_valid_ratio', 0.0):.4f}  "
-                        f"semantic_miou_learned_point_gate={val_metrics.get('semantic_miou_learned_point_gate', 0.0):.4f}  "
+                        f"region_gate_valid_ratio={val_metrics.get('region_gate_valid_region_ratio', 0.0):.4f}  "
+                        f"semantic_miou_learned_region_gate={val_metrics.get('semantic_miou_learned_region_gate', 0.0):.4f}  "
                         f"semantic_miou_projected_gate={val_metrics.get('semantic_miou_projected_gate', 0.0):.4f}  "
-                        f"semantic_macc_learned_point_gate={val_metrics.get('semantic_macc_learned_point_gate', 0.0):.4f}  "
+                        f"semantic_macc_learned_region_gate={val_metrics.get('semantic_macc_learned_region_gate', 0.0):.4f}  "
                         f"semantic_miou_fixed_05={val_metrics.get('semantic_miou_fixed_05', 0.0):.4f}  "
                         f"semantic_miou_lseg_only={val_metrics.get('semantic_miou_lseg_only', 0.0):.4f}  "
                         f"semantic_miou_odise_only={val_metrics.get('semantic_miou_odise_only', 0.0):.4f}"
@@ -3144,7 +3453,7 @@ class MaskDistillTrainer:
                             f"size_aware={val_metrics['semantic_miou_size_aware']:.4f}  "
                             f"projected_gate={val_metrics['semantic_miou_projected_gate']:.4f}  "
                             f"projected_size_gate={val_metrics['semantic_miou_projected_size_gate']:.4f}  "
-                            f"learned_point_gate={val_metrics['semantic_miou_learned_point_gate']:.4f}"
+                            f"learned_region_gate={val_metrics['semantic_miou_learned_region_gate']:.4f}"
                         )
                         print("  [Region Size Ablation]")
                         for group_name in self._semantic_size_group_names():
@@ -3195,7 +3504,7 @@ class MaskDistillTrainer:
                         for compare_name, metric_key in (
                             ("ODISEOnly", "per_class_iou_odise_only"),
                             ("LSeg07", "per_class_iou_lseg_07"),
-                            ("LearnedPointGate", "per_class_iou_learned_point_gate"),
+                            ("LearnedRegionGate", "per_class_iou_learned_region_gate"),
                             ("ProjectedGate", "per_class_iou_projected_gate"),
                             ("SizeAware", "per_class_iou_size_aware"),
                             ("ProjectedSizeGate", "per_class_iou_projected_size_gate"),
