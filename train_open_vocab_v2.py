@@ -85,6 +85,37 @@ def load_yaml_config(config_path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def expand_data_paths(data_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand DATA paths from a data config YAML.
+
+    If DATA.data_base_dir is set, relative DATA paths are resolved under it.
+    This keeps machine-specific data locations in one file.
+    """
+    data_cfg = dict(data_cfg or {})
+    base_dir = data_cfg.get("data_base_dir") or data_cfg.get("base_dir")
+    if base_dir:
+        base_dir = os.path.expanduser(os.path.expandvars(str(base_dir)))
+        data_cfg["data_base_dir"] = base_dir
+    for key in (
+        "data_root",
+        "data_root_2d",
+        "data_root_lseg_feat",
+        "data_root_odise_feat",
+        "projection_dir",
+        "data_root_projection",
+    ):
+        value = data_cfg.get(key)
+        if not value:
+            continue
+        value = os.path.expanduser(os.path.expandvars(str(value)))
+        if base_dir:
+            value = value.replace("${data_base_dir}", base_dir)
+            if not os.path.isabs(value):
+                value = os.path.join(base_dir, value)
+        data_cfg[key] = value
+    return data_cfg
+
+
 def set_seed(seed: int) -> None:
     """Set random seeds for reproducibility."""
     np.random.seed(seed)
@@ -303,15 +334,6 @@ def main() -> None:
 
     # Dataset config（YAML 中 dataset/model 等可能为 null，用 or {} 避免 .get 得到 None）
     _dataset = yaml_config.get("dataset") or {}
-    precomputed_dir = _dataset.get(
-        "precomputed_dir", args.precomputed_dir
-    )
-    if precomputed_dir and not os.path.isabs(precomputed_dir):
-        precomputed_dir = os.path.join(repo_root, precomputed_dir)
-    if precomputed_dir and not os.path.exists(precomputed_dir):
-        print(f"Warning: precomputed_dir not found: {precomputed_dir}")
-        precomputed_dir = None
-
     data_config_path = _dataset.get(
         "data_config_path", args.data_config_path
     )
@@ -319,8 +341,20 @@ def main() -> None:
         data_config_path = os.path.join(repo_root, data_config_path)
     if not data_config_path or not os.path.exists(data_config_path):
         data_config_path = os.path.join(repo_root, "config/data_scannet_3d.yaml")
+    data_path_cfg = expand_data_paths((load_yaml_config(data_config_path) or {}).get("DATA", {}))
+
+    precomputed_dir = _dataset.get("precomputed_dir", args.precomputed_dir)
+    if not precomputed_dir:
+        precomputed_dir = data_path_cfg.get("data_root_lseg_feat")
+    if precomputed_dir and not os.path.isabs(precomputed_dir):
+        precomputed_dir = os.path.join(repo_root, precomputed_dir)
+    if precomputed_dir and not os.path.exists(precomputed_dir):
+        print(f"Warning: precomputed_dir not found: {precomputed_dir}")
+        precomputed_dir = None
     # 方案 B: 预计算投影目录
     projection_dir = _dataset.get("projection_dir", None)
+    if not projection_dir:
+        projection_dir = data_path_cfg.get("projection_dir") or data_path_cfg.get("data_root_projection")
     if projection_dir and not os.path.isabs(projection_dir):
         projection_dir = os.path.join(repo_root, projection_dir)
 
@@ -594,6 +628,9 @@ def main() -> None:
             scenes_per_batch=scenes_per_batch,
             views_per_scene=views_per_scene,
             semantic_readout_mode=_trainer.get("semantic_readout_mode", "projected_gate"),
+            validation_log_every_batches=_trainer.get("validation_log_every_batches", 25),
+            fast_val=_trainer.get("fast_val", True),
+            fast_val_only_main_metric=_trainer.get("fast_val_only_main_metric", True),
             eval_only=eval_only,
             lambda_align=_trainer.get("lambda_align", _trainer.get("mask_distill_weight", 1.0)),
             use_lseg_semantic_loss=_trainer.get("use_lseg_semantic_loss", False),

@@ -129,7 +129,10 @@ def _resolve_odise_checkpoint(config_name: str = "Panoptic/odise_caption_coco_50
     }
     if config_name not in checkpoint_names:
         raise RuntimeError(f"Unsupported ODISE text-head config: {config_name}")
-    return (
+    filename = checkpoint_names[config_name]
+    candidates = [
+        Path(__file__).resolve().parents[1] / "checkpoints" / "pretrained" / filename,
+        Path(__file__).resolve().parents[1] / "checkpoints" / "pretrained" / "odise" / filename,
         Path.home()
         / ".torch"
         / "iopath_cache"
@@ -138,8 +141,12 @@ def _resolve_odise_checkpoint(config_name: str = "Panoptic/odise_caption_coco_50
         / "releases"
         / "download"
         / "v1.0.0"
-        / checkpoint_names[config_name]
-    )
+        / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def build_odise_256_text_features(

@@ -11,13 +11,13 @@ dataloader:
   drop_last: true
 
 dataset:
-  data_config_path: config/data_scannet_3d.yaml
-  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
-  projection_dir: /home/sunl/work/mix/data/scannet_projections
+  data_config_path: config/local_data_paths.yaml
+  precomputed_dir: null
+  projection_dir: null
   split: train
   aug: true
   max_samples_ratio: 1
-  val_max_samples: null
+  val_max_samples: 128
   val_max_samples_ratio: null
 
 model:
@@ -52,11 +52,12 @@ trainer:
   scheduler_type: cosine
   weight_decay: 0.0004
   num_epochs: 100
-  val_every_epochs: 2
+  val_every_epochs: 5
   save_every_epochs: 1
   checkpoint_dir: checkpoints/diff2scene_fused_query_learned_region_gate_no_text_from_scratch_v1
   log_dir: runs/diff2scene_fused_query_learned_region_gate_no_text_from_scratch_v1
   log_every_steps: 20
+  validation_log_every_batches: 25
   grad_clip_norm: 1.0
   early_stopping_patience: 10000
   use_amp: true
@@ -96,8 +97,10 @@ trainer:
 
   dual_space_eval: true
   semantic_readout_mode: learned_region_gate
-  semantic_readout_ablation: true
+  semantic_readout_ablation: false
   monitor_metric: semantic_miou_learned_region_gate
+  fast_val: true
+  fast_val_only_main_metric: true
 
   semantic_size_aware: true
   semantic_small_area_thr: 0.01
@@ -119,8 +122,8 @@ trainer:
   semantic_projected_size_min: 0.35
   semantic_projected_size_max: 0.85
 
-  enable_size_aware_ablation: true
-  enable_projected_size_gate_ablation: true
+  enable_size_aware_ablation: false
+  enable_projected_size_gate_ablation: false
   enable_verbose_legacy_probes: false
   enable_legacy_source_gate_logs: false
   allow_gt_ce_upper_bound: false

@@ -13,6 +13,10 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from MinkowskiEngine import SparseTensor
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 from experiment_mask_distill.criterion_mask_distill import MaskDistillCriteria, build_lifted_3d_masks
 from experiment_mask_distill.semantic_miou import (
@@ -86,6 +90,8 @@ class MaskDistillTrainerConfig:
     lambda_align:                float = 1.0
     semantic_readout_mode:       str   = "learned_region_gate"
     eval_only:                   bool  = False
+    fast_val:                    bool  = True
+    fast_val_only_main_metric:   bool  = True
     use_lseg_semantic_loss:      bool  = False
     use_odise_semantic_loss:     bool  = False
     enable_verbose_legacy_probes: bool = False
@@ -183,6 +189,7 @@ class MaskDistillTrainerConfig:
     multiview_batch:             bool  = False
     scenes_per_batch:            int   = 1
     views_per_scene:             int   = 4
+    validation_log_every_batches: int   = 25
 
 
 def _mask_feature_class_probs_tau(
@@ -1053,6 +1060,7 @@ class MaskDistillTrainer:
         self,
         results: Dict,
         batch: Dict,
+        compute_target: bool = True,
     ) -> Dict[str, Any]:
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
         region_gate_head = getattr(model_ref, "region_gate_head", None)
@@ -1070,6 +1078,11 @@ class MaskDistillTrainer:
             "region_gate_target_std": 0.0,
             "region_gate_pred_mean": 0.0,
             "region_gate_pred_std": 0.0,
+            "region_gate_pred_lseg_ratio_06": 0.0,
+            "region_gate_pred_odise_ratio_04": 0.0,
+            "region_gate_target_lseg_ratio_06": 0.0,
+            "region_gate_target_odise_ratio_04": 0.0,
+            "region_gate_pred_target_corr": 0.0,
             "region_gate_c_diff_mean": 0.0,
             "region_gate_c_diff_clear_003": 0.0,
             "region_gate_sharp_diff_mean": 0.0,
@@ -1181,6 +1194,7 @@ class MaskDistillTrainer:
         region_gate_logits_by_batch = {}
         valid_targets = []
         valid_preds = []
+        pred_values = []
         c_diff_values = []
         sharp_diff_values = []
 
@@ -1217,6 +1231,13 @@ class MaskDistillTrainer:
                 gate_pred = pred_out["region_gate"]
                 if gate_logits is None or gate_pred is None:
                     continue
+                b = int(item["batch_index"])
+                region_gate_pred_by_batch[b] = gate_pred
+                region_gate_valid_by_batch[b] = torch.ones_like(gate_pred, dtype=torch.bool)
+                region_gate_logits_by_batch[b] = gate_logits
+                pred_values.append(gate_pred.detach().float())
+                if not compute_target:
+                    continue
                 r_diff = (
                     float(self.config.region_gate_mv_weight) * c_diff
                     + float(self.config.region_gate_sharp_weight) * sharp_diff
@@ -1227,17 +1248,35 @@ class MaskDistillTrainer:
                     float(self.config.region_gate_target_max),
                 )
                 loss_valid = item["c_valid"] & item["min_lifted_valid"]
-                b = int(item["batch_index"])
-                region_gate_pred_by_batch[b] = gate_pred
-                region_gate_valid_by_batch[b] = torch.ones_like(gate_pred, dtype=torch.bool)
                 loss_valid_mask_by_batch[b] = loss_valid
                 gate_target_by_batch[b] = gate_target
-                region_gate_logits_by_batch[b] = gate_logits
                 if bool(loss_valid.any()):
                     valid_targets.append(gate_target[loss_valid].detach())
                     valid_preds.append(gate_pred[loss_valid].float())
                     c_diff_values.append(c_diff[loss_valid].detach())
                     sharp_diff_values.append(sharp_diff[loss_valid].detach())
+
+        if not compute_target:
+            if not pred_values:
+                return {
+                    **empty,
+                    "region_gate_pred_by_batch": region_gate_pred_by_batch,
+                    "region_gate_valid_by_batch": region_gate_valid_by_batch,
+                    "region_gate_logits_by_batch": region_gate_logits_by_batch,
+                }
+            pred_cat = torch.cat([p.reshape(-1) for p in pred_values], dim=0).float()
+            return {
+                **empty,
+                "region_gate_pred_by_batch": region_gate_pred_by_batch,
+                "region_gate_valid_by_batch": region_gate_valid_by_batch,
+                "region_gate_logits_by_batch": region_gate_logits_by_batch,
+                "region_gate_valid_region_count": float(pred_cat.numel()),
+                "region_gate_valid_region_ratio": float(pred_cat.numel() / max(total_valid_masks, 1)),
+                "region_gate_pred_mean": float(pred_cat.mean().detach().cpu()),
+                "region_gate_pred_std": float(pred_cat.std(unbiased=False).detach().cpu()),
+                "region_gate_pred_lseg_ratio_06": float((pred_cat > 0.6).float().mean().detach().cpu()),
+                "region_gate_pred_odise_ratio_04": float((pred_cat < 0.4).float().mean().detach().cpu()),
+            }
 
         if not valid_targets:
             return {
@@ -1253,6 +1292,15 @@ class MaskDistillTrainer:
         pred_cat = torch.cat(valid_preds, dim=0).float()
         c_diff_cat = torch.cat(c_diff_values, dim=0).float()
         sharp_diff_cat = torch.cat(sharp_diff_values, dim=0).float()
+        target_std = target_cat.std(unbiased=False)
+        pred_std = pred_cat.std(unbiased=False)
+        if target_cat.numel() > 1 and float(target_std) > 1e-8 and float(pred_std) > 1e-8:
+            pred_target_corr = (
+                ((pred_cat - pred_cat.mean()) * (target_cat - target_cat.mean())).mean()
+                / (pred_std * target_std).clamp_min(1e-8)
+            ).clamp(-1.0, 1.0)
+        else:
+            pred_target_corr = target_cat.new_tensor(0.0)
         return {
             "region_gate_pred_by_batch": region_gate_pred_by_batch,
             "region_gate_valid_by_batch": region_gate_valid_by_batch,
@@ -1263,9 +1311,14 @@ class MaskDistillTrainer:
             "region_gate_valid_region_count": float(target_cat.numel()),
             "region_gate_valid_region_ratio": float(target_cat.numel() / max(total_valid_masks, 1)),
             "region_gate_target_mean": float(target_cat.mean().detach().cpu()),
-            "region_gate_target_std": float(target_cat.std(unbiased=False).detach().cpu()),
+            "region_gate_target_std": float(target_std.detach().cpu()),
             "region_gate_pred_mean": float(pred_cat.mean().detach().cpu()),
-            "region_gate_pred_std": float(pred_cat.std(unbiased=False).detach().cpu()),
+            "region_gate_pred_std": float(pred_std.detach().cpu()),
+            "region_gate_pred_lseg_ratio_06": float((pred_cat > 0.6).float().mean().detach().cpu()),
+            "region_gate_pred_odise_ratio_04": float((pred_cat < 0.4).float().mean().detach().cpu()),
+            "region_gate_target_lseg_ratio_06": float((target_cat > 0.6).float().mean().detach().cpu()),
+            "region_gate_target_odise_ratio_04": float((target_cat < 0.4).float().mean().detach().cpu()),
+            "region_gate_pred_target_corr": float(pred_target_corr.detach().cpu()),
             "region_gate_c_diff_mean": float(c_diff_cat.mean().detach().cpu()),
             "region_gate_c_diff_clear_003": float((c_diff_cat.abs() > 0.03).float().mean().detach().cpu()),
             "region_gate_sharp_diff_mean": float(sharp_diff_cat.mean().detach().cpu()),
@@ -2393,6 +2446,11 @@ class MaskDistillTrainer:
                     self.writer.add_scalar("RegionGate/target_std", loss_dict.get("region_gate_target_std", 0.0), self.global_step)
                     self.writer.add_scalar("RegionGate/pred_mean", loss_dict.get("region_gate_pred_mean", 0.0), self.global_step)
                     self.writer.add_scalar("RegionGate/pred_std", loss_dict.get("region_gate_pred_std", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/pred_lseg_ratio_0p6", loss_dict.get("region_gate_pred_lseg_ratio_06", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/pred_odise_ratio_0p4", loss_dict.get("region_gate_pred_odise_ratio_04", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/target_lseg_ratio_0p6", loss_dict.get("region_gate_target_lseg_ratio_06", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/target_odise_ratio_0p4", loss_dict.get("region_gate_target_odise_ratio_04", 0.0), self.global_step)
+                    self.writer.add_scalar("RegionGate/pred_target_corr", loss_dict.get("region_gate_pred_target_corr", 0.0), self.global_step)
                     self.writer.add_scalar("RegionGate/C_diff_mean", loss_dict.get("region_gate_c_diff_mean", 0.0), self.global_step)
                     self.writer.add_scalar("RegionGate/C_diff_clear_003", loss_dict.get("region_gate_c_diff_clear_003", 0.0), self.global_step)
                     self.writer.add_scalar("RegionGate/sharp_diff_mean", loss_dict.get("region_gate_sharp_diff_mean", 0.0), self.global_step)
@@ -2505,6 +2563,17 @@ class MaskDistillTrainer:
                     f"aux={loss_dict['loss_aux']:.4f}) "
                     f"avg={epoch_loss.avg:.4f}  LR: {lr:.2e}  ETA: {eta:.0f}s"
                 )
+                if self.config.use_region_gate_loss:
+                    print(
+                        "  RegionGate "
+                        f"pred_mean={loss_dict.get('region_gate_pred_mean', 0.0):.3f} "
+                        f"pred_std={loss_dict.get('region_gate_pred_std', 0.0):.3f} "
+                        f"target_mean={loss_dict.get('region_gate_target_mean', 0.0):.3f} "
+                        f"target_std={loss_dict.get('region_gate_target_std', 0.0):.3f} "
+                        f"pred_lseg@0.6={loss_dict.get('region_gate_pred_lseg_ratio_06', 0.0):.3f} "
+                        f"pred_odise@0.4={loss_dict.get('region_gate_pred_odise_ratio_04', 0.0):.3f} "
+                        f"corr={loss_dict.get('region_gate_pred_target_corr', 0.0):.3f}"
+                    )
                 if gate_train_enabled and legacy_gate_logs:
                     print(
                         "  [OpenVocab Gate Training] "
@@ -2691,6 +2760,8 @@ class MaskDistillTrainer:
         val_region_gate = AverageMeter()
         val_region_gate_ratio = AverageMeter()
         verbose_legacy = bool(self.config.enable_verbose_legacy_probes)
+        fast_val = bool(self.config.fast_val) and not bool(self.config.eval_only)
+        fast_main_only = fast_val and bool(self.config.fast_val_only_main_metric)
 
         text_feats = self._get_text_features()
         pixel_text_feats = self._get_pixel_text_features()
@@ -2729,6 +2800,7 @@ class MaskDistillTrainer:
                 "size_aware": _SemanticAccumulator(),
                 "projected_gate": _SemanticAccumulator(),
                 "projected_size_gate": _SemanticAccumulator(),
+                "learned_region_gate": _SemanticAccumulator(),
             }
             if self.config.dual_space_eval and text_feats is not None and pixel_text_feats is not None
             else None
@@ -2751,7 +2823,30 @@ class MaskDistillTrainer:
         # Mask-level mIoU
         mask_tracker  = MaskMIoUTracker(threshold=0.5)
 
-        for batch_idx, batch in enumerate(self.val_loader):
+        total_val_batches = len(self.val_loader)
+        log_every = max(int(getattr(self.config, "validation_log_every_batches", 25)), 1)
+        if self.is_main:
+            print(
+                f"[Validation] epoch={epoch} start: "
+                f"{total_val_batches} batches, log_every={log_every}, "
+                f"dual_space_eval={self.config.dual_space_eval}, "
+                f"readout={self.config.semantic_readout_mode}, "
+                f"fast_val={fast_val}"
+            )
+        val_iter = self.val_loader
+        progress_bar = None
+        if self.is_main and tqdm is not None:
+            progress_bar = tqdm(
+                self.val_loader,
+                total=total_val_batches,
+                desc=f"Val epoch {epoch}",
+                dynamic_ncols=True,
+                leave=True,
+            )
+            val_iter = progress_bar
+
+        val_start_time = time.time()
+        for batch_idx, batch in enumerate(val_iter):
             batch = self._move_batch_to_device(batch)
             batch["sinput"] = self._build_sparse_tensor(batch)
 
@@ -2762,10 +2857,15 @@ class MaskDistillTrainer:
                 region_gate_targets = None
                 region_gate_valid_ratio = 0.0
                 if self.config.use_region_gate_loss or str(self.config.semantic_readout_mode).lower() == "learned_region_gate":
-                    region_gate_targets = self._build_region_reliability_gate_targets(results, batch)
+                    compute_region_target = not fast_val
+                    region_gate_targets = self._build_region_reliability_gate_targets(
+                        results,
+                        batch,
+                        compute_target=compute_region_target,
+                    )
                     region_gate_valid_ratio = float(region_gate_targets.get("region_gate_valid_region_ratio", 0.0))
                     val_region_gate_ratio.update(region_gate_valid_ratio)
-                    if self.config.use_region_gate_loss:
+                    if self.config.use_region_gate_loss and compute_region_target:
                         gate_target_by_batch = region_gate_targets.get("gate_target_by_batch", {})
                         gate_logits_by_batch = region_gate_targets.get("region_gate_logits_by_batch", {})
                         gate_pred_by_batch = region_gate_targets.get("region_gate_pred_by_batch", {})
@@ -2819,13 +2919,20 @@ class MaskDistillTrainer:
             )
             # lifted: (N_total, K_max)
             eval_lseg_all = results.get("pixel_pooled_embeddings", batch.get("pixel_pooled"))
-            semantic_eval_aux = self._build_eval_semantic_aux(
-                results=results,
-                batch=batch,
-                lifted=lifted,
-                lifted_valid=lifted_valid,
-                lseg_all=eval_lseg_all,
-            )
+            if fast_main_only:
+                semantic_eval_aux = {
+                    "point_groups": {},
+                    "projected_mask_diff": {},
+                    "projected_mask_valid": {},
+                }
+            else:
+                semantic_eval_aux = self._build_eval_semantic_aux(
+                    results=results,
+                    batch=batch,
+                    lifted=lifted,
+                    lifted_valid=lifted_valid,
+                    lseg_all=eval_lseg_all,
+                )
 
             # ---- 语义 mIoU：Hybrid / CLIP / Final-PC ----
             if pc_tracker is not None:
@@ -2961,48 +3068,77 @@ class MaskDistillTrainer:
                         pixel_text_feats,
                         self.config.dual_space_tau_lseg,
                     )
-                    p_fixed = dual_w_odise * p_odise + dual_w_lseg * p_lseg
-                    p_conf = _dual_space_confidence_probs(
-                        p_odise,
-                        p_lseg,
-                        self.config.dual_space_conf_min,
-                        self.config.dual_space_conf_max,
-                    )
-                    semantic_probs = self._compute_semantic_readout_probs(
-                        p_odise=p_odise,
-                        p_lseg=p_lseg,
-                        mask_area_ratio=mask_area_ratio,
-                        projected_diff=projected_diff,
-                        projected_valid=projected_valid,
-                        learned_gate=learned_gate,
-                        learned_gate_valid=learned_gate_valid,
-                    )
+                    p_fixed = None
+                    p_conf = None
+                    if self.config.semantic_readout_ablation:
+                        p_fixed = dual_w_odise * p_odise + dual_w_lseg * p_lseg
+                        p_conf = _dual_space_confidence_probs(
+                            p_odise,
+                            p_lseg,
+                            self.config.dual_space_conf_min,
+                            self.config.dual_space_conf_max,
+                        )
+                    if fast_main_only and str(self.config.semantic_readout_mode).lower() == "learned_region_gate":
+                        if learned_gate is None:
+                            learned_weight = p_odise.new_full(
+                                (p_odise.shape[0],),
+                                float(self.config.region_gate_target_default),
+                            )
+                        else:
+                            learned_weight = learned_gate.float().to(p_odise.device).clamp(0.0, 1.0)
+                        semantic_probs = {
+                            "learned_region_gate": (
+                                learned_weight[:, None] * p_lseg
+                                + (1.0 - learned_weight[:, None]) * p_odise
+                            )
+                        }
+                    else:
+                        semantic_probs = self._compute_semantic_readout_probs(
+                            p_odise=p_odise,
+                            p_lseg=p_lseg,
+                            mask_area_ratio=mask_area_ratio,
+                            projected_diff=projected_diff,
+                            projected_valid=projected_valid,
+                            learned_gate=learned_gate,
+                            learned_gate_valid=learned_gate_valid,
+                        )
+                    if not self.config.semantic_readout_ablation:
+                        readout_name = str(self.config.semantic_readout_mode).lower()
+                        semantic_probs = {
+                            name: class_probs
+                            for name, class_probs in semantic_probs.items()
+                            if name == readout_name
+                        }
 
-                    dual_preds = {
-                        "odise_only_text256": diff2scene_mask_feature_predict(
-                            pred_logits,
-                            odise_q,
-                            text_feats,
-                        ),
-                        "lseg_only_text512": diff2scene_mask_feature_predict(
-                            pred_logits,
-                            lseg_q,
-                            pixel_text_feats,
-                        ),
-                        "current_fused_text256": diff2scene_mask_feature_predict(
-                            pred_logits,
-                            fused_q,
-                            text_feats,
-                        ),
-                        "dual_space_fixed": diff2scene_class_probs_predict(
-                            pred_logits,
-                            p_fixed,
-                        ),
-                        "dual_space_confidence": diff2scene_class_probs_predict(
-                            pred_logits,
-                            p_conf,
-                        ),
-                    }
+                    dual_preds = {}
+                    if self.config.semantic_readout_ablation:
+                        dual_preds.update(
+                            {
+                                "odise_only_text256": diff2scene_mask_feature_predict(
+                                    pred_logits,
+                                    odise_q,
+                                    text_feats,
+                                ),
+                                "lseg_only_text512": diff2scene_mask_feature_predict(
+                                    pred_logits,
+                                    lseg_q,
+                                    pixel_text_feats,
+                                ),
+                                "current_fused_text256": diff2scene_mask_feature_predict(
+                                    pred_logits,
+                                    fused_q,
+                                    text_feats,
+                                ),
+                                "dual_space_fixed": diff2scene_class_probs_predict(
+                                    pred_logits,
+                                    p_fixed,
+                                ),
+                                "dual_space_confidence": diff2scene_class_probs_predict(
+                                    pred_logits,
+                                    p_conf,
+                                ),
+                            }
+                        )
                     for name, class_probs in semantic_probs.items():
                         dual_preds[name] = diff2scene_class_probs_predict(
                             pred_logits,
@@ -3106,6 +3242,25 @@ class MaskDistillTrainer:
 
             if (batch_idx + 1) % 50 == 0:
                 torch.cuda.empty_cache()
+            if progress_bar is not None:
+                progress_bar.set_postfix(
+                    loss=f"{val_loss.avg:.4f}",
+                    mask=f"{val_distill.avg:.4f}",
+                    rg=f"{val_region_gate_ratio.avg:.3f}",
+                )
+            elif self.is_main and (
+                (batch_idx + 1) % log_every == 0 or (batch_idx + 1) == total_val_batches
+            ):
+                elapsed = time.time() - val_start_time
+                batches_per_sec = (batch_idx + 1) / max(elapsed, 1e-6)
+                print(
+                    f"[Validation] epoch={epoch} "
+                    f"batch={batch_idx + 1}/{total_val_batches} "
+                    f"loss={val_loss.avg:.4f} "
+                    f"mask={val_distill.avg:.4f} "
+                    f"region_valid={val_region_gate_ratio.avg:.4f} "
+                    f"speed={batches_per_sec:.2f} batch/s"
+                )
 
         val_metrics = {
             "loss":                      val_loss.avg,

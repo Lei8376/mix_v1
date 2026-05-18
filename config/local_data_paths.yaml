@@ -1,0 +1,17 @@
+# Machine-local data path configuration.
+#
+# To move between machines, edit only DATA.data_base_dir when the directory
+# layout under data/ is unchanged.
+
+DATA:
+  data_base_dir: /home/featurize/data
+
+  data_root: scannet_3d
+  data_root_2d: scannet_2d
+  data_root_lseg_feat: pixel_pooled
+  data_root_odise_feat: odise_features
+  projection_dir: scannet_projections
+
+  label_2d: ""
+  category_split: ""
+  scannet200: false

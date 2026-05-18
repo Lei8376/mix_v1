@@ -147,7 +147,31 @@ def _load_yaml(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
         return {}
     with open(path, "r") as f:
-        return yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f) or {}
+    data_cfg = cfg.get("DATA")
+    if isinstance(data_cfg, dict):
+        base_dir = data_cfg.get("data_base_dir") or data_cfg.get("base_dir")
+        if base_dir:
+            base_dir = os.path.expanduser(os.path.expandvars(str(base_dir)))
+            data_cfg["data_base_dir"] = base_dir
+        for key in (
+            "data_root",
+            "data_root_2d",
+            "data_root_lseg_feat",
+            "data_root_odise_feat",
+            "projection_dir",
+            "data_root_projection",
+        ):
+            value = data_cfg.get(key)
+            if not value:
+                continue
+            value = os.path.expanduser(os.path.expandvars(str(value)))
+            if base_dir:
+                value = value.replace("${data_base_dir}", base_dir)
+                if not os.path.isabs(value):
+                    value = os.path.join(base_dir, value)
+            data_cfg[key] = value
+    return cfg
 
 
 def _cached_load_pth(pth_path: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

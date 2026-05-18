@@ -50,6 +50,32 @@ def _resolve_repo_path(value: str | None) -> str | None:
     return str(path)
 
 
+def _expand_data_paths(data_cfg: dict) -> dict:
+    data_cfg = dict(data_cfg or {})
+    base_dir = data_cfg.get("data_base_dir") or data_cfg.get("base_dir")
+    if base_dir:
+        base_dir = os.path.expanduser(os.path.expandvars(str(base_dir)))
+        data_cfg["data_base_dir"] = base_dir
+    for key in (
+        "data_root",
+        "data_root_2d",
+        "data_root_lseg_feat",
+        "data_root_odise_feat",
+        "projection_dir",
+        "data_root_projection",
+    ):
+        value = data_cfg.get(key)
+        if not value:
+            continue
+        value = os.path.expanduser(os.path.expandvars(str(value)))
+        if base_dir:
+            value = value.replace("${data_base_dir}", base_dir)
+            if not os.path.isabs(value):
+                value = os.path.join(base_dir, value)
+        data_cfg[key] = value
+    return data_cfg
+
+
 def _load_model_state(model: torch.nn.Module, checkpoint_path: str, device: str):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
@@ -100,8 +126,13 @@ def main():
     data_config_path = _resolve_repo_path(
         dataset_cfg.get("data_config_path", "config/data_scannet_3d.yaml")
     )
+    data_path_cfg = _expand_data_paths((_load_yaml(Path(data_config_path)).get("DATA") or {}))
     precomputed_dir = _resolve_repo_path(dataset_cfg.get("precomputed_dir"))
+    if not precomputed_dir:
+        precomputed_dir = data_path_cfg.get("data_root_lseg_feat")
     projection_dir = _resolve_repo_path(dataset_cfg.get("projection_dir"))
+    if not projection_dir:
+        projection_dir = data_path_cfg.get("projection_dir") or data_path_cfg.get("data_root_projection")
 
     val_config = OpenVocabDatasetV2Config(
         data_config_path=data_config_path,
@@ -159,10 +190,27 @@ def main():
         semantic_init_lseg_weight=float(model_cfg.get("semantic_init_lseg_weight", 0.5)),
         semantic_proj_path=semantic_proj_path,
         freeze_semantic_proj=bool(model_cfg.get("freeze_semantic_proj", True)),
+        use_source_reliability_gate=bool(model_cfg.get("use_source_reliability_gate", False)),
+        source_gate_input_dim=int(model_cfg.get("source_gate_input_dim", 6)),
+        source_gate_hidden_dim=int(model_cfg.get("source_gate_hidden_dim", 64)),
+        source_gate_dropout=float(model_cfg.get("source_gate_dropout", 0.1)),
+        source_gate_init_bias=float(model_cfg.get("source_gate_init_bias", -0.85)),
+        dual_branch_probe=bool(model_cfg.get("dual_branch_probe", False)),
+        dual_branch_lseg_match_dim=int(model_cfg.get("dual_branch_lseg_match_dim", 512)),
+        dual_branch_odise_match_dim=int(model_cfg.get("dual_branch_odise_match_dim", 256)),
+        use_point_semantic_gate=bool(model_cfg.get("use_point_semantic_gate", False)),
+        point_sem_gate_hidden_dim=int(model_cfg.get("point_sem_gate_hidden_dim", 128)),
+        point_sem_gate_init_bias=float(model_cfg.get("point_sem_gate_init_bias", 0.85)),
+        use_region_reliability_gate=bool(model_cfg.get("use_region_reliability_gate", False)),
+        region_gate_hidden_dim=int(model_cfg.get("region_gate_hidden_dim", 128)),
+        region_gate_init_bias=float(model_cfg.get("region_gate_init_bias", 0.85)),
+        region_gate_signal_dim=int(model_cfg.get("region_gate_signal_dim", 11)),
+        alignment_query_mode=str(model_cfg.get("alignment_query_mode", "fused")),
     )
     model = OpenVocab3DFusionModelV2(model_config).to(device)
-    checkpoint, missing, unexpected = _load_model_state(model, args.checkpoint, device)
-    print(f"[eval] checkpoint={args.checkpoint}")
+    checkpoint_path = _resolve_repo_path(args.checkpoint)
+    checkpoint, missing, unexpected = _load_model_state(model, checkpoint_path, device)
+    print(f"[eval] checkpoint={checkpoint_path}")
     print(f"[eval] checkpoint_epoch={checkpoint.get('epoch', 'unknown')}")
     print(f"[eval] val_samples={len(val_dataset)} batch_size={batch_size} split={args.split}")
     if missing:
@@ -192,6 +240,55 @@ def main():
         "dual_space_conf_max": trainer_cfg.get("dual_space_conf_max", 0.7),
         "best_monitor": trainer_cfg.get("best_monitor", "semantic_miou_dual_space_fixed"),
         "validation_log_every_batches": trainer_cfg.get("validation_log_every_batches", 25),
+        "lambda_align": trainer_cfg.get("lambda_align", trainer_cfg.get("mask_distill_weight", 1.0)),
+        "semantic_readout_mode": trainer_cfg.get("semantic_readout_mode", "learned_region_gate"),
+        "eval_only": True,
+        "fast_val": trainer_cfg.get("fast_val", False),
+        "fast_val_only_main_metric": trainer_cfg.get("fast_val_only_main_metric", True),
+        "use_lseg_semantic_loss": trainer_cfg.get("use_lseg_semantic_loss", False),
+        "use_odise_semantic_loss": trainer_cfg.get("use_odise_semantic_loss", False),
+        "enable_verbose_legacy_probes": trainer_cfg.get("enable_verbose_legacy_probes", False),
+        "enable_legacy_source_gate_logs": trainer_cfg.get("enable_legacy_source_gate_logs", False),
+        "enable_size_aware_ablation": trainer_cfg.get("enable_size_aware_ablation", True),
+        "enable_projected_size_gate_ablation": trainer_cfg.get("enable_projected_size_gate_ablation", True),
+        "allow_gt_ce_upper_bound": trainer_cfg.get("allow_gt_ce_upper_bound", False),
+        "alignment_query_mode": trainer_cfg.get("alignment_query_mode", model_cfg.get("alignment_query_mode", "fused")),
+        "semantic_readout_ablation": trainer_cfg.get("semantic_readout_ablation", False),
+        "semantic_size_aware": trainer_cfg.get("semantic_size_aware", True),
+        "semantic_small_area_thr": trainer_cfg.get("semantic_small_area_thr", 0.01),
+        "semantic_medium_area_thr": trainer_cfg.get("semantic_medium_area_thr", 0.10),
+        "semantic_small_lseg_weight": trainer_cfg.get("semantic_small_lseg_weight", 0.45),
+        "semantic_medium_lseg_weight": trainer_cfg.get("semantic_medium_lseg_weight", 0.65),
+        "semantic_large_lseg_weight": trainer_cfg.get("semantic_large_lseg_weight", 0.80),
+        "semantic_projected_gate": trainer_cfg.get("semantic_projected_gate", True),
+        "semantic_projected_gate_scale": trainer_cfg.get("semantic_projected_gate_scale", 10.0),
+        "semantic_projected_gate_min": trainer_cfg.get("semantic_projected_gate_min", 0.45),
+        "semantic_projected_gate_max": trainer_cfg.get("semantic_projected_gate_max", 0.85),
+        "semantic_projected_gate_default": trainer_cfg.get("semantic_projected_gate_default", 0.70),
+        "semantic_projected_size_gate": trainer_cfg.get("semantic_projected_size_gate", True),
+        "semantic_projected_size_base": trainer_cfg.get("semantic_projected_size_base", 0.65),
+        "semantic_projected_size_beta": trainer_cfg.get("semantic_projected_size_beta", 1.0),
+        "semantic_projected_size_gamma": trainer_cfg.get("semantic_projected_size_gamma", 0.20),
+        "semantic_projected_size_min": trainer_cfg.get("semantic_projected_size_min", 0.35),
+        "semantic_projected_size_max": trainer_cfg.get("semantic_projected_size_max", 0.85),
+        "use_region_gate_loss": trainer_cfg.get("use_region_gate_loss", False),
+        "lambda_region_gate": trainer_cfg.get("lambda_region_gate", 0.05),
+        "region_gate_input_mode": trainer_cfg.get("region_gate_input_mode", "fused_plus_all_no_text_signals"),
+        "region_gate_target_mode": trainer_cfg.get("region_gate_target_mode", "mv_plus_sharp"),
+        "region_gate_mv_weight": trainer_cfg.get("region_gate_mv_weight", 1.0),
+        "region_gate_sharp_weight": trainer_cfg.get("region_gate_sharp_weight", 0.5),
+        "region_gate_target_scale": trainer_cfg.get("region_gate_target_scale", 5.0),
+        "region_gate_target_min": trainer_cfg.get("region_gate_target_min", 0.35),
+        "region_gate_target_max": trainer_cfg.get("region_gate_target_max", 0.85),
+        "region_gate_target_default": trainer_cfg.get("region_gate_target_default", 0.70),
+        "region_gate_mv_iou_thr": trainer_cfg.get("region_gate_mv_iou_thr", 0.05),
+        "region_gate_max_pairs_per_mask": trainer_cfg.get("region_gate_max_pairs_per_mask", 10),
+        "region_gate_min_lifted_points": trainer_cfg.get("region_gate_min_lifted_points", 5),
+        "region_gate_loss_type": trainer_cfg.get("region_gate_loss_type", "mse"),
+        "region_gate_detach_target": trainer_cfg.get("region_gate_detach_target", True),
+        "multiview_batch": dataloader_cfg.get("multiview_batch", False),
+        "scenes_per_batch": dataloader_cfg.get("scenes_per_batch", 1),
+        "views_per_scene": dataloader_cfg.get("views_per_scene", 4),
     }
     trainer_config_fields = {field.name for field in dataclasses.fields(MaskDistillTrainerConfig)}
     trainer_config = MaskDistillTrainerConfig(

@@ -11,9 +11,9 @@ dataloader:
   drop_last: true
 
 dataset:
-  data_config_path: config/data_scannet_3d.yaml
-  precomputed_dir: /home/sunl/work/mix/data/pixel_pooled
-  projection_dir: /home/sunl/work/mix/data/scannet_projections
+  data_config_path: config/local_data_paths.yaml
+  precomputed_dir: null
+  projection_dir: null
   split: train
   aug: true
   max_samples_ratio: 1
@@ -52,6 +52,7 @@ trainer:
   checkpoint_dir: checkpoints/diff2scene_fused_query_projected_gate_final_v2
   log_dir: runs/diff2scene_fused_query_projected_gate_final_v2
   log_every_steps: 20
+  validation_log_every_batches: 25
   grad_clip_norm: 1.0
   early_stopping_patience: 10000
   use_amp: true
