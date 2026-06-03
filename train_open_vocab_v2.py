@@ -44,6 +44,17 @@ from trainer.open_vocab_trainer_v2 import (
     OpenVocabTrainerV2Config,
 )
 
+try:
+    from experiment_mask_distill.trainer_mask_distill import (
+        MaskDistillTrainer,
+        MaskDistillTrainerConfig,
+    )
+    _MASK_DISTILL_AVAILABLE = True
+except ImportError:
+    MaskDistillTrainer = None
+    MaskDistillTrainerConfig = None
+    _MASK_DISTILL_AVAILABLE = False
+
 
 @dataclass
 class DataLoaderConfig:
@@ -213,6 +224,7 @@ def main() -> None:
     parser.add_argument("--resume", type=str, default="", help="Resume from checkpoint")
     parser.add_argument("--save-every-epochs", type=int, default=5, help="Save checkpoint interval")
     parser.add_argument("--val-every-epochs", type=int, default=1, help="Validation interval")  # 🔥 修复
+    parser.add_argument("--use-mask-distill", action="store_true", help="Use mask-level cosine distillation trainer")
 
     # AMP and early stopping
     parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision")
@@ -320,6 +332,18 @@ def main() -> None:
         lseg_ckpt_path=lseg_ckpt_path if lseg_ckpt_path and os.path.exists(lseg_ckpt_path) else None,
         odise_model_config_path=odise_config_path,
         pc_arch=_model.get("pc_arch", "MinkUNet34C"),
+        pixel_embedding_dim=int(_model.get("pixel_embedding_dim", 512)),
+        mask_embedding_dim=int(_model.get("mask_embedding_dim", 256)),
+        fused_embedding_dim=int(_model.get("fused_embedding_dim", 768)),
+        pc_last_dim=int(_model.get("pc_last_dim", 256)),
+        use_transnet_context=bool(_model.get("use_transnet_context", False)),
+        transnet_heads=int(_model.get("transnet_heads", 4)),
+        transnet_layers=int(_model.get("transnet_layers", 1)),
+        transnet_dropout=float(_model.get("transnet_dropout", 0.0)),
+        transnet_max_context_masks=int(_model.get("transnet_max_context_masks", 64)),
+        residual_scale=float(_model.get("residual_scale", 0.3)),
+        use_mask_geom=bool(_model.get("use_mask_geom", False)),
+        mask_geom_dim=int(_model.get("mask_geom_dim", 0)),
     )
 
     # Trainer config
@@ -330,7 +354,7 @@ def main() -> None:
     if resume_checkpoint and not os.path.exists(resume_checkpoint):
         resume_checkpoint = None
 
-    trainer_config = OpenVocabTrainerV2Config(
+    common_trainer_kwargs = dict(
         num_epochs=_trainer.get("num_epochs", args.num_epochs),
         base_lr=_trainer.get("base_lr", args.base_lr),
         weight_decay=_trainer.get("weight_decay", args.weight_decay),
@@ -352,6 +376,25 @@ def main() -> None:
         use_model_half=_trainer.get("use_model_half", args.model_half),
         gradient_accumulation_steps=_trainer.get("gradient_accumulation_steps", 1),  # 🔥 梯度累积
     )
+    use_mask_distill = args.use_mask_distill or _trainer.get("use_mask_distill", False)
+    if use_mask_distill:
+        if not _MASK_DISTILL_AVAILABLE:
+            raise ImportError("experiment_mask_distill not found; cannot use mask distill")
+        trainer_config = MaskDistillTrainerConfig(
+            **common_trainer_kwargs,
+            mask_distill_weight=float(_trainer.get("mask_distill_weight", 1.0)),
+            bce_weight=float(_trainer.get("bce_weight", 0.0)),
+            dice_weight=float(_trainer.get("dice_weight", 0.0)),
+            relation_weight=float(_trainer.get("relation_weight", 0.0)),
+            relation_topk=int(_trainer.get("relation_topk", 5)),
+            relation_temperature=float(_trainer.get("relation_temperature", 0.1)),
+            odise_nce_weight=float(_trainer.get("odise_nce_weight", 0.0)),
+            odise_nce_temperature=float(_trainer.get("odise_nce_temperature", 0.07)),
+            res_weight=float(_trainer.get("res_weight", 0.0)),
+            context_warmup_ratio=float(_trainer.get("context_warmup_ratio", 0.0)),
+        )
+    else:
+        trainer_config = OpenVocabTrainerV2Config(**common_trainer_kwargs)
 
     # Validate configuration
     if not os.path.exists(dataset_config.data_config_path):
@@ -403,15 +446,32 @@ def main() -> None:
 
     # Create model (smaller backbone via config model.pc_arch, e.g. MinkUNet18A, reduces VRAM)
     model = OpenVocab3DFusionModelV2(model_config)
+    model = model.to(device)
+
+    freeze_2d_fusion = bool(_model.get("freeze_2d_fusion", False))
+    if freeze_2d_fusion:
+        for param in model.fuse_embed.parameters():
+            param.requires_grad = False
+        model.logit_scale.requires_grad = False
+        print("[Freeze] 2D fusion/token module is frozen; training 3D student only.")
 
     # Create trainer and run
-    trainer = OpenVocabTrainerV2(
-        model=model,
-        train_loader=train_loader,
-        config=trainer_config,
-        device=device,
-        val_loader=val_loader,
-    )
+    if use_mask_distill:
+        trainer = MaskDistillTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            config=trainer_config,
+            device=device,
+        )
+    else:
+        trainer = OpenVocabTrainerV2(
+            model=model,
+            train_loader=train_loader,
+            config=trainer_config,
+            device=device,
+            val_loader=val_loader,
+        )
 
     results = trainer.train()
     print(f"Training finished: {results}")
@@ -419,4 +479,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

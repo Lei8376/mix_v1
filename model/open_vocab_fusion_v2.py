@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from model.pc_net import PC_Processor
 from model.modeling import ODISEPixelMaskFusionNet, pad_mask_embeddings, pad_mask_tensors
+from model.transnet_semantic_context import TransNetSemanticContext
 
 
 DEFAULT_LOGIT_SCALE = 1.0 / 0.07
@@ -36,6 +37,15 @@ class OpenVocabFusionModelV2Config:
     # Architecture
     pc_arch: str = "MinkUNet34C"
     pc_last_dim: int = 256
+    # TransNet semantic-context branch.
+    use_transnet_context: bool = False
+    transnet_heads: int = 4
+    transnet_layers: int = 1
+    transnet_dropout: float = 0.0
+    transnet_max_context_masks: int = 64
+    residual_scale: float = 0.3
+    use_mask_geom: bool = False
+    mask_geom_dim: int = 0
 
 
 class OpenVocab3DFusionModelV2(nn.Module):
@@ -70,6 +80,20 @@ class OpenVocab3DFusionModelV2(nn.Module):
         self.logit_scale = nn.Parameter(
             torch.ones([]) * np.log(DEFAULT_LOGIT_SCALE)
         )
+
+        if config.use_transnet_context:
+            self.transnet_context = TransNetSemanticContext(
+                point_dim=config.fused_embedding_dim,
+                odise_dim=config.mask_embedding_dim,
+                geom_dim=config.mask_geom_dim,
+                num_heads=config.transnet_heads,
+                num_layers=config.transnet_layers,
+                dropout=config.transnet_dropout,
+                max_context_masks=config.transnet_max_context_masks,
+                use_geom=config.use_mask_geom,
+            )
+        else:
+            self.transnet_context = None
 
         # Optional: online extractors (lazy initialization)
         self._pix_extractor = None
@@ -173,7 +197,8 @@ class OpenVocab3DFusionModelV2(nn.Module):
         )
 
         if use_precomputed:
-            # 确保数据类型一致性，避免 AMP 训练中的类型问题
+            # 训练时通常走这条路径：直接读取预计算的 ODISE masks +
+            # 每个 mask 对应的 LSeg pooled 向量，再交给融合网络映射到 768 维空间。
             mask_tensors = batch_input["masks"].float()
             mask_embeddings = batch_input["mask_embeddings"].float()
             mask_valid = batch_input.get("mask_valid", None)
@@ -215,27 +240,30 @@ class OpenVocab3DFusionModelV2(nn.Module):
                 f"{mask_embeddings.shape[-1]} != {self.config.mask_embedding_dim}"
             )
 
-        # Fuse 2D features
-        fused_embeddings = self.fuse_embed(
-            pixel_embeddings, mask_embeddings, mask_tensors, mask_valid
+        mix_factor = batch_input.get("mix_factor", 1.0)
+        # 为每个 2D mask slot 生成一个 768 维 teacher token。
+        fusion_outputs = self.fuse_embed(
+            pixel_embeddings,
+            mask_embeddings,
+            mask_tensors,
+            mask_valid,
+            mix_factor=mix_factor,
+            return_details=True,
         )
+        fused_embeddings = fusion_outputs["fused_embeddings"]
 
         # Process 3D points（MinkowskiEngine 体素化后输出点数 M 可能 < 输入点数 N）
         # 🔥 关键修复：正确映射每个输入点到其对应的体素特征
         implicit_condition, pred_3d_voxel, _ = self.pc_processor(batch_input["sinput"])
         sinput = batch_input["sinput"]
         
-        # 输入坐标 (N_total, 4): [batch, x, y, z]
-        # 体素坐标 (M_voxels, 4): [batch, x_quantized, y_quantized, z_quantized]
         # 目标：为每个输入点找到其量化后对应的体素索引
         
         input_coords = batch_input["coords_3d"].int().to(sinput.device)  # (N_total, 4)
         voxel_coords = sinput.C  # (M_voxels, 4)
         
-        # 使用向量化哈希映射（比 for 循环 + cpu().tolist() 
-        # 将 4D 坐标编码为单个整数，然后用 searchsorted 查找
+        # 使用向量化哈希映射
         def _encode_coords(coords_4d):
-            """将 (N, 4) 坐标编码为 (N,) 整数，用于快速匹配"""
             c = coords_4d.long() + 20000  # 偏移确保非负
             BASE = 40001  # 大于最大坐标范围
             return c[:, 0] * (BASE ** 3) + c[:, 1] * (BASE ** 2) + c[:, 2] * BASE + c[:, 3]
@@ -255,7 +283,7 @@ class OpenVocab3DFusionModelV2(nn.Module):
         matched = sorted_voxel_hash[pos] == input_hash
         point_to_voxel_idx = sort_idx[pos]
         
-        # 🔥 关键检查：验证 point→voxel 映射是否 100% 匹配
+        # 验证 point→voxel 映射是否匹配
         matched_ratio = matched.float().mean().item()
         if matched_ratio < 0.999:
             print(f'[FATAL] point→voxel matched_ratio={matched_ratio:.6f}')
@@ -277,9 +305,29 @@ class OpenVocab3DFusionModelV2(nn.Module):
         
         # 用正确的映射索引体素特征：每个点 → 其体素索引 → 体素特征
         pred_3d = pred_3d_voxel[point_to_voxel_idx, :].float()
+        pred_3d_raw = pred_3d
 
-        # Compute per-point, per-mask similarity
+        # 在共享 token 空间里计算点到 mask 的相似度。
+        # 对 3D backbone 来说，它看到的 2D teacher 信号基本就是这些 token。
+        # 如果上游 token 已经丢了开放词汇语义，这里仍然可以学到区域匹配，
+        # 但语义空间会一起退化。
         batch_indices = batch_input["ori_coords_3d"][:, 0].long()
+        context_feat = None
+        if self.transnet_context is not None:
+            context_feat = self.transnet_context(
+                point_feat=pred_3d_raw,
+                mask_embeddings=mask_embeddings,
+                mask_valid=mask_valid,
+                batch_indices=batch_indices,
+                mask_geom=batch_input.get("mask_geom", None),
+            )
+            pred_3d_for_logits = F.normalize(
+                pred_3d_raw + self.config.residual_scale * context_feat,
+                dim=-1,
+            )
+        else:
+            pred_3d_for_logits = pred_3d_raw
+
         outputs = [[] for _ in range(batch_size)]
 
         logit_scale = self.logit_scale.exp().clamp(max=100.0)
@@ -300,12 +348,16 @@ class OpenVocab3DFusionModelV2(nn.Module):
                 print(f"Warning: Empty mask_tokens for batch {b}, skipping")
                 continue
 
-            # Normalize and compute similarity
-            point_features = F.normalize(pred_3d[point_mask], dim=-1)
-            mask_tokens = F.normalize(mask_tokens, dim=-1)
+            # CLIP 风格归一化相似度：
+            #   1. point feature 归一化
+            #   2. mask token 归一化
+            #   3. 乘以可学习温度
+            # 这能稳定训练，但并不能保证 fused_embeddings 一直保留原始 teacher 语义。
+            point_features = F.normalize(pred_3d_for_logits[point_mask].float(), dim=-1)
+            mask_tokens = F.normalize(mask_tokens.float(), dim=-1)
             logits = logit_scale * (point_features @ mask_tokens.t())
 
-            # Expand to full mask count（AMP 下 logits 可能为 float16，与 full_logits 一致再赋值）
+            # Expand to full mask count
             if mask_valid is not None:
                 num_masks = fused_embeddings.shape[1]
                 full_logits = pred_3d.new_full(
@@ -323,7 +375,18 @@ class OpenVocab3DFusionModelV2(nn.Module):
             "mask_masks": mask_tensors,
             "batch_indices": batch_indices,
             "fused_embeddings": fused_embeddings,
-            "pred_3d": pred_3d,
+            "mask_tokens": fusion_outputs["mask_tokens"],
+            "pixel_tokens": fusion_outputs["pixel_tokens"],
+            "pixel_pooled_raw": fusion_outputs["pixel_pooled_raw"],
+            "fusion_gate": fusion_outputs["fusion_gate"],
+            "base_fused": fusion_outputs["base_fused"],
+            "refine_delta": fusion_outputs["refine_delta"],
+            "mix_factor": fusion_outputs["mix_factor"],
+            "pred_3d": pred_3d_for_logits,
+            "pred_3d_raw": pred_3d_raw,
+            "context_feat": context_feat,
+            "raw_mask_embeddings": mask_embeddings,
+            "mask_valid": mask_valid,
         }
 
     def freeze_extractors(self):
@@ -334,4 +397,3 @@ class OpenVocab3DFusionModelV2(nn.Module):
         if self._mask_extractor is not None:
             for param in self._mask_extractor.model.parameters():
                 param.requires_grad = False
-

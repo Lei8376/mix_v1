@@ -1,0 +1,68 @@
+seed: 1342
+device: cuda
+gpu_ids: [0]
+
+dataset:
+  data_config_path: config/data_scannet_3d.yaml
+  precomputed_dir: data/pixel_pooled
+  projection_dir: data/scannet_projections
+  split: train
+  scannet200: false
+  voxel_size: 0.05
+  aug: true
+  max_samples: null
+  max_samples_ratio: null
+
+dataloader:
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+
+model:
+  pc_arch: MinkUNet34C
+  pixel_embedding_dim: 512
+  mask_embedding_dim: 256
+  fused_embedding_dim: 256
+  pc_last_dim: 256
+
+  use_transnet_context: true
+  transnet_heads: 4
+  transnet_layers: 1
+  transnet_dropout: 0.0
+  transnet_max_context_masks: 64
+  residual_scale: 0.3
+
+  use_mask_geom: false
+  mask_geom_dim: 0
+
+trainer:
+  use_mask_distill: true
+  num_epochs: 50
+  base_lr: 0.0001
+  weight_decay: 0.0004
+  grad_clip_norm: 1.0
+  warmup_epochs: 1
+  scheduler_type: cosine
+
+  mask_distill_weight: 1.0
+  bce_weight: 0.0
+  dice_weight: 0.0
+  min_points_per_mask: 10
+
+  relation_weight: 0.05
+  relation_topk: 5
+  relation_temperature: 0.1
+  odise_nce_weight: 0.03
+  odise_nce_temperature: 0.07
+  res_weight: 0.0001
+  context_warmup_ratio: 0.2
+
+  log_dir: runs/online_scd_transnet_full
+  checkpoint_dir: checkpoints/online_scd_transnet_full
+  save_every_epochs: 5
+  val_every_epochs: 1
+  early_stopping_patience: 10
+  gradient_accumulation_steps: 2
+  use_model_half: false
+  resume:

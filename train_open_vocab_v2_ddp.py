@@ -388,6 +388,18 @@ def main() -> None:
         lseg_ckpt_path=lseg_ckpt_path if lseg_ckpt_path and os.path.exists(lseg_ckpt_path) else None,
         odise_model_config_path=odise_config_path,
         pc_arch=_model.get("pc_arch", "MinkUNet34C"),
+        pixel_embedding_dim=int(_model.get("pixel_embedding_dim", 512)),
+        mask_embedding_dim=int(_model.get("mask_embedding_dim", 256)),
+        fused_embedding_dim=int(_model.get("fused_embedding_dim", 768)),
+        pc_last_dim=int(_model.get("pc_last_dim", 256)),
+        use_transnet_context=bool(_model.get("use_transnet_context", False)),
+        transnet_heads=int(_model.get("transnet_heads", 4)),
+        transnet_layers=int(_model.get("transnet_layers", 1)),
+        transnet_dropout=float(_model.get("transnet_dropout", 0.0)),
+        transnet_max_context_masks=int(_model.get("transnet_max_context_masks", 64)),
+        residual_scale=float(_model.get("residual_scale", 0.3)),
+        use_mask_geom=bool(_model.get("use_mask_geom", False)),
+        mask_geom_dim=int(_model.get("mask_geom_dim", 0)),
     )
 
     # Trainer config
@@ -438,11 +450,21 @@ def main() -> None:
             mask_distill_weight=_trainer.get("mask_distill_weight", 1.0),
             bce_weight=_trainer.get("bce_weight", 0.0),
             dice_weight=_trainer.get("dice_weight", 0.0),
+            relation_weight=float(_trainer.get("relation_weight", 0.0)),
+            relation_topk=int(_trainer.get("relation_topk", 5)),
+            relation_temperature=float(_trainer.get("relation_temperature", 0.1)),
+            odise_nce_weight=float(_trainer.get("odise_nce_weight", 0.0)),
+            odise_nce_temperature=float(_trainer.get("odise_nce_temperature", 0.07)),
+            res_weight=float(_trainer.get("res_weight", 0.0)),
+            context_warmup_ratio=float(_trainer.get("context_warmup_ratio", 0.0)),
         )
         if is_main_process():
             print(f"[MaskDistill] mask_distill_weight={trainer_config.mask_distill_weight}  "
                   f"bce_weight={trainer_config.bce_weight}  "
-                  f"dice_weight={trainer_config.dice_weight}")
+                  f"dice_weight={trainer_config.dice_weight}  "
+                  f"relation_weight={trainer_config.relation_weight}  "
+                  f"odise_nce_weight={trainer_config.odise_nce_weight}  "
+                  f"res_weight={trainer_config.res_weight}")
     elif use_distill:
         if not _DISTILL_AVAILABLE:
             raise ImportError("experiment_distill not found; cannot use --use-distill")
@@ -502,6 +524,14 @@ def main() -> None:
     # Create model
     model = OpenVocab3DFusionModelV2(model_config)
     model = model.to(device)
+
+    freeze_2d_fusion = bool(_model.get("freeze_2d_fusion", False))
+    if freeze_2d_fusion:
+        for param in model.fuse_embed.parameters():
+            param.requires_grad = False
+        model.logit_scale.requires_grad = False
+        if is_main_process():
+            print("[Freeze] 2D fusion/token module is frozen; training 3D student only.")
 
     # Wrap model with DDP if distributed
     if use_distributed:

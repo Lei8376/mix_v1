@@ -134,6 +134,12 @@ class MaskDistillCriteria(nn.Module):
         min_points_per_mask: int   = 10,
         threshold:           float = 0.5,
         use_pos_weight:      bool  = True,
+        relation_weight:     float = 0.0,
+        relation_topk:       int   = 5,
+        relation_temperature: float = 0.1,
+        odise_nce_weight:    float = 0.0,
+        odise_nce_temperature: float = 0.07,
+        res_weight:          float = 0.0,
     ):
         super().__init__()
 
@@ -143,6 +149,12 @@ class MaskDistillCriteria(nn.Module):
         self.min_points_per_mask = min_points_per_mask
         self.threshold           = threshold
         self.use_pos_weight      = use_pos_weight
+        self.relation_weight     = float(relation_weight)
+        self.relation_topk       = int(relation_topk)
+        self.relation_temperature = float(relation_temperature)
+        self.odise_nce_weight    = float(odise_nce_weight)
+        self.odise_nce_temperature = float(odise_nce_temperature)
+        self.res_weight          = float(res_weight)
 
         # 从 results 取模型输出
         self.outputs               = results["outputs"]
@@ -151,10 +163,68 @@ class MaskDistillCriteria(nn.Module):
         self.batch_indices         = results["batch_indices"]           # (N_total,)
         self.fused_embeddings      = results["fused_embeddings"]        # (B, K_max, C)
         self.pred_3d               = results["pred_3d"]                 # (N_total, C)
+        self.raw_mask_embeddings   = results.get("raw_mask_embeddings", None)
+        self.context_feat          = results.get("context_feat", None)
 
         # 从 batch_input 取投影坐标
         self.x_label = batch_input["x_label"]   # (N_total,)
         self.y_label = batch_input["y_label"]    # (N_total,)
+
+    def _zero_loss(self):
+        return torch.tensor(0.0, device=self.pred_3d.device, requires_grad=False)
+
+    def _collect_region_pairs(self):
+        """
+        Pool refined 3D point features into mask-level region features using the
+        same lifted-mask validity chain as the main mask loss.
+
+        Returns a list of (region_feat, odise_feat), one tuple per batch item.
+        """
+        if self.raw_mask_embeddings is None:
+            return []
+
+        lifted, lifted_valid = build_lifted_3d_masks(
+            masks=self.mask_masks,
+            mask_valid=self.mask_valid_from_masks,
+            x_label=self.x_label,
+            y_label=self.y_label,
+            batch_indices=self.batch_indices,
+        )
+
+        pairs = []
+        B = len(self.outputs)
+        for b in range(B):
+            valid_k = self.mask_valid_from_masks[b]
+            if valid_k is None or not valid_k.any():
+                continue
+
+            pt_mask = self.batch_indices == b
+            if not pt_mask.any():
+                continue
+
+            pt_valid = lifted_valid[pt_mask]
+            if not pt_valid.any():
+                continue
+
+            feat_b = self.pred_3d[pt_mask][pt_valid].float()
+            lifted_b = lifted[pt_mask][pt_valid][:, valid_k].float()
+            odise_b = self.raw_mask_embeddings[b][valid_k].float()
+            if feat_b.numel() == 0 or lifted_b.numel() == 0 or odise_b.numel() == 0:
+                continue
+
+            pos_cnt = (lifted_b > self.threshold).float().sum(dim=0)
+            keep = pos_cnt >= self.min_points_per_mask
+            if keep.sum() < 2:
+                continue
+
+            weights = lifted_b[:, keep].clamp_min(0.0)
+            denom = weights.sum(dim=0).clamp_min(1e-6)
+            region_feat = weights.t() @ feat_b
+            region_feat = region_feat / denom.unsqueeze(-1)
+            odise_keep = odise_b[keep]
+            pairs.append((region_feat, odise_keep))
+
+        return pairs
 
     # ----------------------------------------------------------
     # 主损失：mask-level cosine distillation
@@ -337,6 +407,91 @@ class MaskDistillCriteria(nn.Module):
         if not losses:
             return torch.tensor(0.0, device=self.pred_3d.device, requires_grad=True)
         return torch.stack(losses).mean()
+        # return torch.stack(losses).sum()
+
+    def _relation_loss(self):
+        """
+        ODISE relation/context distillation.
+
+        It aligns mask-mask relation structure of pooled 3D region features to
+        ODISE mask embedding relation. This is auxiliary only; the mask cosine
+        distillation above remains the main training objective.
+        """
+        if self.relation_weight <= 0.0:
+            return self._zero_loss()
+        if self.raw_mask_embeddings is None:
+            return self._zero_loss()
+
+        losses = []
+        for region_feat, odise_feat in self._collect_region_pairs():
+            if region_feat.shape[0] < 2:
+                continue
+            region_feat = F.normalize(region_feat.float(), dim=-1, eps=1e-8)
+            odise_feat = F.normalize(odise_feat.float(), dim=-1, eps=1e-8)
+
+            R_3d = region_feat @ region_feat.t()
+            R_odise = odise_feat @ odise_feat.t()
+            K = R_3d.shape[0]
+            topk = min(self.relation_topk, K - 1)
+            if topk <= 0:
+                continue
+
+            eye = torch.eye(K, device=R_3d.device, dtype=torch.bool)
+            R_odise_no_self = R_odise.masked_fill(eye, -1e4)
+            nn_idx = torch.topk(R_odise_no_self, k=topk, dim=1).indices
+            row_idx = torch.arange(K, device=R_3d.device).unsqueeze(1).expand(-1, topk)
+
+            odise_selected = R_odise[row_idx, nn_idx]
+            pred_selected = R_3d[row_idx, nn_idx]
+            temperature = max(self.relation_temperature, 1e-6)
+            target_prob = F.softmax(odise_selected / temperature, dim=1).detach()
+            pred_log_prob = F.log_softmax(pred_selected / temperature, dim=1)
+            losses.append(F.kl_div(pred_log_prob, target_prob, reduction="batchmean"))
+
+        if not losses:
+            return self._zero_loss()
+        return torch.stack(losses).mean()
+
+    def _odise_nce_loss(self):
+        """
+        Optional ODISE semantic contrastive loss on mask-pooled 3D features.
+
+        Current mix configuration uses fused_embedding_dim == odise_dim == 256,
+        so no extra trainable projector is needed here. If dimensions differ,
+        fail clearly instead of silently creating an unoptimized projector inside
+        the criterion.
+        """
+        if self.odise_nce_weight <= 0.0:
+            return self._zero_loss()
+        if self.raw_mask_embeddings is None:
+            return self._zero_loss()
+
+        losses = []
+        for region_feat, odise_feat in self._collect_region_pairs():
+            if region_feat.shape[0] < 2:
+                continue
+            if region_feat.shape[-1] != odise_feat.shape[-1]:
+                raise ValueError(
+                    "ODISE NCE requires region feature dim to match ODISE dim. "
+                    f"Got region_feat={region_feat.shape[-1]}, odise={odise_feat.shape[-1]}. "
+                    "Set odise_nce_weight=0 or use fused_embedding_dim=mask_embedding_dim."
+                )
+
+            q = F.normalize(region_feat.float(), dim=-1, eps=1e-8)
+            k = F.normalize(odise_feat.float(), dim=-1, eps=1e-8)
+            logits = q @ k.t()
+            logits = logits / max(self.odise_nce_temperature, 1e-6)
+            target = torch.arange(logits.shape[0], device=logits.device)
+            losses.append(F.cross_entropy(logits, target))
+
+        if not losses:
+            return self._zero_loss()
+        return torch.stack(losses).mean()
+
+    def _res_loss(self):
+        if self.res_weight <= 0.0 or self.context_feat is None:
+            return self._zero_loss()
+        return torch.norm(self.context_feat.float(), dim=-1).mean()
 
     # ----------------------------------------------------------
     # 对外接口
@@ -352,12 +507,27 @@ class MaskDistillCriteria(nn.Module):
         """
         l_mask_distill = self._mask_distill_loss()
         l_aux          = self._aux_loss()
+        l_relation     = self._relation_loss()
+        l_odise_nce    = self._odise_nce_loss()
+        l_res          = self._res_loss()
 
-        total = self.mask_distill_weight * l_mask_distill + l_aux
+        total = (
+            self.mask_distill_weight * l_mask_distill
+            + l_aux
+            + self.relation_weight * l_relation
+            + self.odise_nce_weight * l_odise_nce
+            + self.res_weight * l_res
+        )
 
         loss_dict = {
             "loss_mask_distill": l_mask_distill.item(),
             "loss_aux":          l_aux.item() if isinstance(l_aux, torch.Tensor) else float(l_aux),
+            "loss_relation":     l_relation.item() if isinstance(l_relation, torch.Tensor) else float(l_relation),
+            "loss_odise_nce":    l_odise_nce.item() if isinstance(l_odise_nce, torch.Tensor) else float(l_odise_nce),
+            "loss_res":          l_res.item() if isinstance(l_res, torch.Tensor) else float(l_res),
+            "current_relation_weight": self.relation_weight,
+            "current_odise_nce_weight": self.odise_nce_weight,
+            "current_res_weight": self.res_weight,
             "loss_total":        total.item(),
         }
         return total, loss_dict
